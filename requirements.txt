@@ -1,0 +1,5 @@
+deepagents
+langchain
+langchain-openai
+openpyxl
+python-dotenv

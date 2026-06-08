@@ -1,0 +1,22 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg
+
+RUN useradd --create-home --uid 1000 analyst
+
+RUN pip install --no-cache-dir \
+    arviz \
+    matplotlib \
+    numpy \
+    openpyxl \
+    pandas \
+    pymc \
+    scikit-learn \
+    scipy \
+    statsmodels \
+    tabulate
+
+USER analyst
+WORKDIR /workspace

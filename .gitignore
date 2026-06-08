@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+
+work/
+
+outputs/*
+!outputs/Containerfile.python-data-sandbox
+!outputs/generic_parent_runner.py
+!outputs/generic_parent_runner_usage.md
+!outputs/podman_sandbox_backend.py
+!outputs/podman_sandbox_backend_notes.md
+!outputs/setup_wsl_podman_runtime.sh
