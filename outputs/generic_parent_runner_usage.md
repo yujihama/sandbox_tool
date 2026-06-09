@@ -11,6 +11,8 @@ The runner does:
 - Ask the parent agent to call `run_deep_agent_task`.
 - Run the Deep Agent in the Podman sandbox.
 - Give the Deep Agent a `request_parent_review` HITL tool.
+- Require the Deep Agent to create and run task-specific self-check artifacts
+  before requesting parent review.
 - Give the parent generic file-inspection tools for `/input` and `/outputs`.
 - Let the parent inspect artifacts after the Deep Agent requests review.
 - Let the parent request bounded repair attempts from the Deep Agent until
@@ -30,11 +32,19 @@ The runner does not:
 - Contain task-specific acceptance criteria.
 
 The Deep Agent is instructed to call `request_parent_review` after it has produced
-or updated the expected artifacts. The parent then inspects generic file facts such
-as text previews, CSV previews, JSON structure, and workbook sheet previews. It
-decides whether the artifact still materially fails the user task and, if so,
-sends corrective instructions back to the Deep Agent. The parent is still not
-allowed to edit files directly.
+or updated the expected artifacts and completed self-check. The required
+self-check artifacts are:
+
+- `/outputs/self_check_plan.md`
+- `/outputs/self_check.py`, `/outputs/self_check.js`, or another `self_check.*`
+  executable/check script
+- `/outputs/self_check_report.md`
+
+The Deep Agent designs these checks itself for the task. The parent then inspects
+generic file facts such as text previews, CSV previews, JSON structure, workbook
+sheet previews, and the self-check report. It decides whether the artifact still
+materially fails the user task and, if so, sends corrective instructions back to
+the Deep Agent. The parent is still not allowed to edit files directly.
 
 ## Command Shape
 

@@ -660,6 +660,47 @@ def inspect_expected_artifacts(max_rows: int = 20, max_cols: int = 12) -> dict[s
 
 
 @tool
+def inspect_self_check_artifacts(max_chars: int = 16000) -> dict[str, Any]:
+    """Inspect Deep Agent-generated self-check plan, script candidates, and report."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+
+    output_dir = CONFIG.output_dir
+    script_candidates = sorted(
+        [
+            path
+            for path in output_dir.glob("self_check.*")
+            if path.name not in {"self_check_plan.md", "self_check_report.md"}
+            and path.is_file()
+        ],
+        key=lambda path: path.name.lower(),
+    )
+    paths = [
+        "/outputs/self_check_plan.md",
+        *[
+            "/outputs/" + path.relative_to(output_dir).as_posix()
+            for path in script_candidates[:10]
+        ],
+        "/outputs/self_check_report.md",
+    ]
+    inspections = [
+        inspect_sandbox_file.invoke(
+            {"path": path, "max_chars": max_chars, "max_rows": 30, "max_cols": 20}
+        )
+        for path in paths
+    ]
+    plan_exists = (output_dir / "self_check_plan.md").exists()
+    report_exists = (output_dir / "self_check_report.md").exists()
+    return {
+        "ok": plan_exists and report_exists and bool(script_candidates),
+        "plan_exists": plan_exists,
+        "report_exists": report_exists,
+        "script_candidates": [path.name for path in script_candidates],
+        "inspections": inspections,
+    }
+
+
+@tool
 def request_parent_review(
     artifacts: list[str],
     summary: str,
@@ -747,13 +788,29 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
                 "Read inputs only from /input and write final artifacts under /outputs. "
                 "Save larger scripts under /outputs before executing them. "
                 "Do not use the network. Use installed local libraries when helpful. "
+                "Before requesting parent review, you must perform an autonomous self-check. "
+                "This self-check is task-specific and you must design it yourself; do not "
+                "wait for a prebuilt validator. Required self-check artifacts: "
+                "`/outputs/self_check_plan.md`, one executable check script such as "
+                "`/outputs/self_check.py` or `/outputs/self_check.js`, and "
+                "`/outputs/self_check_report.md`. The plan must explain what you will verify "
+                "against the user task. The script must inspect the generated artifacts and, "
+                "when relevant, execute code, parse files, load workbooks, validate CSV/JSON, "
+                "or run smoke tests using available local tools. If a headless browser is "
+                "available for HTML tasks, use it; otherwise run the strongest available "
+                "syntax/reference checks and state the limitation. Execute the self-check "
+                "script with the `execute` tool. If it fails, fix the artifact and rerun the "
+                "self-check before requesting review. The report must include command(s) run, "
+                "pass/fail status, checked files, limitations, and remaining known issues. "
                 "When you believe the expected artifacts are ready for review, you must "
                 "call request_parent_review with the artifact paths, a concise summary of "
-                "what you produced, and any known issues. Call it after creating or updating "
-                "the artifacts, not before. After the review request tool returns, stop work "
+                "what you produced, and any known issues. Include the self-check artifact "
+                "paths in the review request artifacts list. Call it after creating or updating "
+                "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
                 "for this attempt and respond concisely with the paths awaiting review. "
                 "If this invocation contains parent correction feedback from a previous "
-                "review, fix the issues first, then call request_parent_review again."
+                "review, fix the issues first, rerun self-check, then call "
+                "request_parent_review again."
             ),
         )
         deep_result = deep_agent.invoke(
@@ -804,6 +861,14 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     artifact_check = check_expected_artifacts(CONFIG.expected_artifacts)
     cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
     attempt_review_requests = DEEP_REVIEW_REQUESTS[review_start:]
+    self_check_scripts = sorted(
+        [
+            path.name
+            for path in CONFIG.output_dir.glob("self_check.*")
+            if path.name not in {"self_check_plan.md", "self_check_report.md"}
+            and path.is_file()
+        ]
+    )
     evaluation = {
         "attempt": attempt,
         "max_review_rounds": CONFIG.max_review_rounds,
@@ -821,6 +886,11 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
         "cleanup": cleanup,
         "review_requested": bool(attempt_review_requests),
         "review_requests": attempt_review_requests,
+        "self_check": {
+            "plan_exists": (CONFIG.output_dir / "self_check_plan.md").exists(),
+            "report_exists": (CONFIG.output_dir / "self_check_report.md").exists(),
+            "script_candidates": self_check_scripts,
+        },
         "deep_tool_calls": [
             name for item in DEEP_AGENT_TRACE for name in item.get("tool_calls", [])
         ],
@@ -855,7 +925,13 @@ def run_parent_agent() -> dict[str, Any]:
 
     parent_agent = create_agent(
         model=CONFIG.parent_model,
-        tools=[run_deep_agent_task, list_sandbox_files, inspect_sandbox_file, inspect_expected_artifacts],
+        tools=[
+            run_deep_agent_task,
+            list_sandbox_files,
+            inspect_sandbox_file,
+            inspect_expected_artifacts,
+            inspect_self_check_artifacts,
+        ],
         system_prompt=(
             "You are a parent HITL reviewer and orchestrator. The Deep Agent does the "
             "implementation and must explicitly request parent review by calling its "
@@ -863,18 +939,21 @@ def run_parent_agent() -> dict[str, Any]:
             "implementation yourself. Required workflow: (1) call run_deep_agent_task, "
             "(2) check whether its result has review_requested=true, (3) if review was "
             "requested, inspect the expected artifacts with inspect_expected_artifacts or "
-            "inspect_sandbox_file, (4) if you find material issues and at least one Deep "
-            "Agent attempt remains, call run_deep_agent_task again with concise correction "
-            "instructions that include your findings, (5) inspect again after every review "
+            "inspect_sandbox_file, and inspect the Deep Agent's self-check artifacts with "
+            "inspect_self_check_artifacts, (4) if self-check artifacts are missing, the "
+            "self-check did not execute, failures were ignored, or the inspected artifact "
+            "materially fails the user task, and at least one Deep Agent attempt remains, "
+            "call run_deep_agent_task again with concise correction instructions that include "
+            "your findings, (5) inspect again after every review "
             "request, and close only when no material issues remain or no attempts remain. "
             "If the Deep Agent does not request review, treat that as a material protocol "
             "issue; if attempts remain, call run_deep_agent_task again instructing it to "
-            "produce/update artifacts and call request_parent_review. "
+            "produce/update artifacts, run self-check, and call request_parent_review. "
             f"The maximum Deep Agent attempts is {CONFIG.max_review_rounds}. Never call "
             "run_deep_agent_task after the tool reports max_review_rounds_exceeded. "
             "In the final response, report attempts used, files inspected, material findings, "
-            "remaining issues if any, whether the last Deep Agent attempt requested review, "
-            "and output paths. Keep claims tied to inspected evidence."
+            "self-check status, remaining issues if any, whether the last Deep Agent attempt "
+            "requested review, and output paths. Keep claims tied to inspected evidence."
         ),
     )
     parent_result = parent_agent.invoke(
