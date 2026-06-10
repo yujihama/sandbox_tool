@@ -9,8 +9,13 @@ work/
 
 outputs/*
 !outputs/Containerfile.python-data-sandbox
+!outputs/skills/
+!outputs/skills/**
 !outputs/generic_parent_runner.py
 !outputs/generic_parent_runner_usage.md
+!outputs/multi_deep_parent_runner.py
 !outputs/podman_sandbox_backend.py
 !outputs/podman_sandbox_backend_notes.md
 !outputs/setup_wsl_podman_runtime.sh
+outputs/skills/**/__pycache__/
+outputs/skills/**/*.py[cod]

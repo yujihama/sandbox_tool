@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
+import mimetypes
 import os
 import posixpath
 import shutil
@@ -17,6 +19,7 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool
+from openai import OpenAI
 
 from deepagents import create_deep_agent
 
@@ -47,6 +50,7 @@ class RunnerConfig:
     input_dir: Path
     input_mappings: list[InputMapping]
     expected_artifacts: list[str]
+    skill_sources: list[str]
     image: str
     wsl_distro: str
     parent_model: str
@@ -167,6 +171,28 @@ def stage_inputs(input_specs: list[str], staging_dir: Path) -> list[InputMapping
             )
         )
     return mappings
+
+
+def stage_skill_sources(skill_specs: list[str], input_dir: Path) -> list[str]:
+    """Stage host skill source directories into /input and return sandbox source paths."""
+    staged_sources: list[str] = []
+    for spec in skill_specs:
+        if "=" in spec:
+            host, target = spec.split("=", 1)
+        else:
+            host = spec
+            target = "skills"
+        host_path = Path(host).expanduser().resolve()
+        if not host_path.exists() or not host_path.is_dir():
+            raise FileNotFoundError(f"Skill source must be an existing directory: {host_path}")
+        rel = sandbox_input_relative(target)
+        destination = input_dir / rel
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(host_path, destination)
+        staged_sources.append("/input/" + rel)
+    return staged_sources
 
 
 def resolve_sandbox_path(path: str | Path) -> Path:
@@ -381,6 +407,12 @@ def build_parent_prompt() -> str:
         + "\n".join(f"- {item.sandbox_path}" for item in CONFIG.input_mappings)
         + "\n\nExpected artifacts:\n"
         + "\n".join(f"- {path}" for path in CONFIG.expected_artifacts)
+        + (
+            "\n\nDeep Agent skill sources:\n"
+            + "\n".join(f"- {path}" for path in CONFIG.skill_sources)
+            if CONFIG.skill_sources
+            else ""
+        )
         + f"\n\nMaximum Deep Agent attempts allowed: {CONFIG.max_review_rounds}"
         + "\n\nUser task:\n"
         + CONFIG.prompt.strip()
@@ -442,6 +474,129 @@ def json_file_preview(path: Path, max_chars: int) -> dict[str, Any]:
     else:
         preview["json_type"] = type(parsed).__name__
     return preview
+
+
+def image_file_preview(path: Path) -> dict[str, Any]:
+    mime = image_mime_type(path)
+    info: dict[str, Any] = {
+        "kind": "image",
+        "bytes": path.stat().st_size,
+        "mime": mime,
+        "semantic_read_supported": mime.startswith("image/"),
+        "semantic_read_tool": "read_sandbox_file(question=...) or inspect_sandbox_image",
+    }
+    try:
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover - depends on local environment
+        info["metadata_error"] = f"pillow_unavailable: {exc.__class__.__name__}: {exc}"
+        return info
+
+    try:
+        with Image.open(path) as image:
+            info.update(
+                {
+                    "format": image.format,
+                    "width": image.width,
+                    "height": image.height,
+                    "mode": image.mode,
+                    "frames": getattr(image, "n_frames", 1),
+                    "has_alpha": image.mode in {"RGBA", "LA"}
+                    or ("transparency" in image.info),
+                }
+            )
+    except Exception as exc:
+        info["metadata_error"] = f"{exc.__class__.__name__}: {exc}"
+    return info
+
+
+def pdf_file_preview(path: Path, max_chars: int, max_pages: int) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "kind": "pdf",
+        "bytes": path.stat().st_size,
+        "text_extraction": "pypdf",
+    }
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:  # pragma: no cover - depends on local environment
+        info["error"] = f"pypdf_unavailable: {exc.__class__.__name__}: {exc}"
+        return info
+
+    try:
+        reader = PdfReader(str(path))
+        info["page_count"] = len(reader.pages)
+        if reader.metadata:
+            info["metadata"] = {
+                str(key).lstrip("/"): str(value)
+                for key, value in reader.metadata.items()
+                if value is not None
+            }
+
+        remaining_chars = max_chars
+        page_previews: list[dict[str, Any]] = []
+        pages_to_scan = min(max_pages, len(reader.pages))
+        for page_index in range(pages_to_scan):
+            if remaining_chars <= 0:
+                break
+            try:
+                text = reader.pages[page_index].extract_text() or ""
+            except Exception as exc:
+                page_previews.append(
+                    {
+                        "page": page_index + 1,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    }
+                )
+                continue
+            if len(text) > remaining_chars:
+                text = text[:remaining_chars]
+            remaining_chars -= len(text)
+            page_previews.append(
+                {
+                    "page": page_index + 1,
+                    "chars_returned": len(text),
+                    "text_preview": text,
+                }
+            )
+
+        info.update(
+            {
+                "pages_scanned": pages_to_scan,
+                "preview_pages": page_previews,
+                "truncated": len(reader.pages) > pages_to_scan or remaining_chars <= 0,
+            }
+        )
+        if not any(page.get("text_preview") for page in page_previews):
+            info["note"] = (
+                "No extractable text was found in the scanned preview pages. "
+                "For scanned PDFs, render pages to images inside the sandbox and "
+                "call read_sandbox_file with a visual question on those images."
+            )
+    except Exception as exc:
+        info["error"] = f"{exc.__class__.__name__}: {exc}"
+    return info
+
+
+def media_file_preview(path: Path) -> dict[str, Any]:
+    mime, _ = mimetypes.guess_type(path.name)
+    kind = "binary_or_unsupported"
+    if mime:
+        if mime.startswith("audio/"):
+            kind = "audio"
+        elif mime.startswith("video/"):
+            kind = "video"
+        elif mime.startswith("application/"):
+            kind = "application_binary"
+    return {
+        "kind": kind,
+        "bytes": path.stat().st_size,
+        "mime": mime or "application/octet-stream",
+        "semantic_read_supported": False,
+        "note": (
+            "This runner reports metadata for this file type. If semantic reading is "
+            "needed, create a task-specific extractor inside the sandbox and save a "
+            "text/JSON artifact for review."
+        ),
+    }
 
 
 def xlsx_file_preview(path: Path, max_rows: int, max_cols: int) -> dict[str, Any]:
@@ -523,7 +678,13 @@ def xlsx_file_preview(path: Path, max_rows: int, max_cols: int) -> dict[str, Any
     }
 
 
-def inspect_file_by_type(path: Path, max_chars: int, max_rows: int, max_cols: int) -> dict[str, Any]:
+def inspect_file_by_type(
+    path: Path,
+    max_chars: int,
+    max_rows: int,
+    max_cols: int,
+    max_pages: int = 5,
+) -> dict[str, Any]:
     if not path.exists():
         return {"exists": False}
     info: dict[str, Any] = {
@@ -547,7 +708,11 @@ def inspect_file_by_type(path: Path, max_chars: int, max_rows: int, max_cols: in
         return info
 
     suffix = path.suffix.lower()
-    if suffix in {".xlsx", ".xlsm"}:
+    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+        info.update(image_file_preview(path))
+    elif suffix == ".pdf":
+        info.update(pdf_file_preview(path, max_chars=max_chars, max_pages=max_pages))
+    elif suffix in {".xlsx", ".xlsm"}:
         info.update(xlsx_file_preview(path, max_rows=max_rows, max_cols=max_cols))
     elif suffix in {".csv", ".tsv"}:
         info.update(csv_file_preview(path, max_rows=max_rows, max_cols=max_cols))
@@ -568,7 +733,7 @@ def inspect_file_by_type(path: Path, max_chars: int, max_rows: int, max_cols: in
     }:
         info.update(text_file_preview(path, max_chars=max_chars))
     else:
-        info.update({"kind": "binary_or_unsupported", "bytes": path.stat().st_size})
+        info.update(media_file_preview(path))
     return info
 
 
@@ -619,8 +784,9 @@ def inspect_sandbox_file(
     max_chars: int = 12000,
     max_rows: int = 20,
     max_cols: int = 12,
+    max_pages: int = 5,
 ) -> dict[str, Any]:
-    """Inspect a file under /input or /outputs, including text/csv/json/xlsx previews."""
+    """Inspect a file under /input or /outputs, including text/csv/json/xlsx/pdf/image previews."""
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     try:
@@ -628,16 +794,165 @@ def inspect_sandbox_file(
         max_chars = max(1000, min(max_chars, 50000))
         max_rows = max(1, min(max_rows, 100))
         max_cols = max(1, min(max_cols, 50))
+        max_pages = max(1, min(max_pages, 20))
         info = inspect_file_by_type(
             host_path,
             max_chars=max_chars,
             max_rows=max_rows,
             max_cols=max_cols,
+            max_pages=max_pages,
         )
-        info.update({"ok": True, "path": normalized, "host_path": str(host_path)})
+        info.update(
+            {
+                "ok": bool(info.get("exists", True)),
+                "path": normalized,
+                "host_path": str(host_path),
+            }
+        )
         return info
     except Exception as exc:
         return {"ok": False, "path": path, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
+def openai_model_name(model: str) -> str:
+    if model.startswith("openai:"):
+        return model.split(":", 1)[1]
+    return model
+
+
+def image_mime_type(path: Path) -> str:
+    guessed, _ = mimetypes.guess_type(path.name)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    return "application/octet-stream"
+
+
+@tool
+def inspect_sandbox_image(
+    path: str,
+    question: str,
+    max_output_tokens: int = 1200,
+) -> dict[str, Any]:
+    """Inspect an image under /input or /outputs using a vision-capable OpenAI model."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        normalized, host_path = resolve_readable_virtual_path(path)
+        if not host_path.is_file():
+            return {"ok": False, "path": normalized, "error": "not_a_file"}
+        if host_path.stat().st_size > 20 * 1024 * 1024:
+            return {
+                "ok": False,
+                "path": normalized,
+                "error": "image_too_large",
+                "bytes": host_path.stat().st_size,
+            }
+        mime = image_mime_type(host_path)
+        if not mime.startswith("image/"):
+            return {"ok": False, "path": normalized, "error": f"unsupported_mime:{mime}"}
+
+        max_output_tokens = max(200, min(max_output_tokens, 4000))
+        data_url = (
+            f"data:{mime};base64,"
+            + base64.b64encode(host_path.read_bytes()).decode("ascii")
+        )
+        client = OpenAI()
+        response = client.responses.create(
+            model=openai_model_name(CONFIG.deep_model),
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Inspect this image carefully and answer the question. "
+                                "If the image is ambiguous, say so and provide ranked candidates "
+                                "with visual evidence instead of overclaiming.\n\n"
+                                f"Question: {question}"
+                            ),
+                        },
+                        {"type": "input_image", "image_url": data_url},
+                    ],
+                }
+            ],
+            max_output_tokens=max_output_tokens,
+        )
+        text = getattr(response, "output_text", "") or ""
+        return {
+            "ok": True,
+            "path": normalized,
+            "mime": mime,
+            "bytes": host_path.stat().st_size,
+            "model": openai_model_name(CONFIG.deep_model),
+            "answer": text,
+        }
+    except Exception as exc:
+        return {"ok": False, "path": path, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
+@tool
+def read_sandbox_file(
+    path: str,
+    question: str = "",
+    max_chars: int = 12000,
+    max_rows: int = 20,
+    max_cols: int = 12,
+    max_pages: int = 5,
+    max_output_tokens: int = 1200,
+) -> dict[str, Any]:
+    """
+    Read a sandbox file under /input or /outputs with type-aware handling.
+
+    Text, CSV, JSON, Excel, and PDF files return structured previews. Image files
+    return metadata, and when `question` is supplied the tool also performs a
+    vision read. Audio/video and other binaries return metadata only.
+    """
+    file_info = inspect_sandbox_file.invoke(
+        {
+            "path": path,
+            "max_chars": max_chars,
+            "max_rows": max_rows,
+            "max_cols": max_cols,
+            "max_pages": max_pages,
+        }
+    )
+    if not file_info.get("ok"):
+        return file_info
+
+    kind = file_info.get("kind")
+    result: dict[str, Any] = {
+        "ok": True,
+        "path": file_info.get("path", path),
+        "kind": kind,
+        "read_mode": "typed_preview",
+        "file": file_info,
+    }
+    if kind == "image" and question.strip():
+        vision = inspect_sandbox_image.invoke(
+            {
+                "path": path,
+                "question": question,
+                "max_output_tokens": max_output_tokens,
+            }
+        )
+        result["read_mode"] = "image_vision"
+        result["vision"] = vision
+        result["ok"] = bool(vision.get("ok"))
+    elif question.strip():
+        result["question_note"] = (
+            "The file content was returned as structured preview data. Answer the "
+            "question from the preview, or generate a task-specific extractor inside "
+            "the sandbox if the preview is insufficient."
+        )
+    return result
 
 
 @tool
@@ -646,7 +961,7 @@ def inspect_expected_artifacts(max_rows: int = 20, max_cols: int = 12) -> dict[s
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     inspections = [
-        inspect_sandbox_file.invoke(
+        read_sandbox_file.invoke(
             {"path": path, "max_rows": max_rows, "max_cols": max_cols}
         )
         for path in CONFIG.expected_artifacts
@@ -684,7 +999,7 @@ def inspect_self_check_artifacts(max_chars: int = 16000) -> dict[str, Any]:
         "/outputs/self_check_report.md",
     ]
     inspections = [
-        inspect_sandbox_file.invoke(
+        read_sandbox_file.invoke(
             {"path": path, "max_chars": max_chars, "max_rows": 30, "max_cols": 20}
         )
         for path in paths
@@ -781,13 +1096,20 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     try:
         deep_agent = create_deep_agent(
             model=CONFIG.deep_model,
-            tools=[request_parent_review],
+            tools=[request_parent_review, read_sandbox_file, inspect_sandbox_image],
             backend=backend,
+            skills=CONFIG.skill_sources or None,
             system_prompt=(
                 "You are a task execution agent running in a Podman sandbox. "
                 "Read inputs only from /input and write final artifacts under /outputs. "
                 "Save larger scripts under /outputs before executing them. "
-                "Do not use the network. Use installed local libraries when helpful. "
+                "Do not use the network from the sandbox. Use installed local libraries when helpful. "
+                "Use read_sandbox_file when you need a type-aware read of /input or "
+                "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
+                "metadata, and can perform a vision read of images when you pass a "
+                "question. You may still call inspect_sandbox_image directly for focused "
+                "visual review after creating crops, contact sheets, plots, or screenshots. "
+                "Cite inspected file paths and any uncertainty in your artifacts. "
                 "Before requesting parent review, you must perform an autonomous self-check. "
                 "This self-check is task-specific and you must design it yourself; do not "
                 "wait for a prebuilt validator. Required self-check artifacts: "
@@ -928,7 +1250,9 @@ def run_parent_agent() -> dict[str, Any]:
         tools=[
             run_deep_agent_task,
             list_sandbox_files,
+            read_sandbox_file,
             inspect_sandbox_file,
+            inspect_sandbox_image,
             inspect_expected_artifacts,
             inspect_self_check_artifacts,
         ],
@@ -939,8 +1263,10 @@ def run_parent_agent() -> dict[str, Any]:
             "implementation yourself. Required workflow: (1) call run_deep_agent_task, "
             "(2) check whether its result has review_requested=true, (3) if review was "
             "requested, inspect the expected artifacts with inspect_expected_artifacts or "
-            "inspect_sandbox_file, and inspect the Deep Agent's self-check artifacts with "
-            "inspect_self_check_artifacts, (4) if self-check artifacts are missing, the "
+            "read_sandbox_file. Use read_sandbox_file with a question, or "
+            "inspect_sandbox_image, for semantic review of image artifacts when the user "
+            "task depends on visual content, and inspect the Deep "
+            "Agent's self-check artifacts with inspect_self_check_artifacts, (4) if self-check artifacts are missing, the "
             "self-check did not execute, failures were ignored, or the inspected artifact "
             "materially fails the user task, and at least one Deep Agent attempt remains, "
             "call run_deep_agent_task again with concise correction instructions that include "
@@ -1050,6 +1376,16 @@ def parse_args() -> argparse.Namespace:
         help="Expected output path under /outputs. Repeat for multiple artifacts.",
     )
     parser.add_argument(
+        "--skill-source",
+        action="append",
+        default=[],
+        help=(
+            "Skill source directory to expose to Deep Agent. Use HOST_DIR=/input/skills "
+            "or just HOST_DIR to stage it at /input/skills. The source should contain "
+            "skill-name/SKILL.md directories."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
         help="Host output directory under this workspace's outputs/ directory.",
@@ -1122,6 +1458,7 @@ def main() -> None:
     staging_root.mkdir(parents=True, exist_ok=True)
     input_dir = Path(tempfile.mkdtemp(prefix="input-", dir=staging_root)).resolve()
     input_mappings = stage_inputs(args.input, input_dir)
+    skill_sources = stage_skill_sources(args.skill_source, input_dir)
     expected_artifacts = [
         normalize_expected_artifact(path) for path in args.expected_artifact
     ]
@@ -1133,6 +1470,7 @@ def main() -> None:
         input_dir=input_dir,
         input_mappings=input_mappings,
         expected_artifacts=expected_artifacts,
+        skill_sources=skill_sources,
         image=args.image,
         wsl_distro=args.wsl_distro,
         parent_model=args.parent_model,

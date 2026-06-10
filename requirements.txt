@@ -2,4 +2,6 @@ deepagents
 langchain
 langchain-openai
 openpyxl
+pillow
+pypdf
 python-dotenv

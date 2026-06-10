@@ -14,6 +14,11 @@ The runner does:
 - Require the Deep Agent to create and run task-specific self-check artifacts
   before requesting parent review.
 - Give the parent generic file-inspection tools for `/input` and `/outputs`.
+- Give the parent and Deep Agent a `read_sandbox_file` tool that uses one
+  entrypoint for text, CSV, JSON, Excel, PDF, image metadata, and optional
+  image vision reads.
+- Give the parent and Deep Agent a generic `inspect_sandbox_image` tool for
+  focused vision review of images under `/input` and `/outputs`.
 - Let the parent inspect artifacts after the Deep Agent requests review.
 - Let the parent request bounded repair attempts from the Deep Agent until
   findings are resolved or the attempt limit is reached.
@@ -40,11 +45,18 @@ self-check artifacts are:
   executable/check script
 - `/outputs/self_check_report.md`
 
-The Deep Agent designs these checks itself for the task. The parent then inspects
-generic file facts such as text previews, CSV previews, JSON structure, workbook
-sheet previews, and the self-check report. It decides whether the artifact still
+The Deep Agent designs these checks itself for the task. The parent then reads
+generic file facts through `read_sandbox_file`, such as text previews, CSV
+previews, JSON structure, workbook sheet previews, PDF page text previews, image
+metadata, and the self-check report. It decides whether the artifact still
 materially fails the user task and, if so, sends corrective instructions back to
 the Deep Agent. The parent is still not allowed to edit files directly.
+
+For image-understanding tasks, the Deep Agent can call `read_sandbox_file` with
+a `question` on an image path, or call `inspect_sandbox_image` directly after it
+creates crops, contact sheets, plots, or screenshots. This keeps file processing
+inside the sandbox while making visual reading explicit and traceable as a tool
+call. The parent can use the same tools during review.
 
 ## Command Shape
 
@@ -53,6 +65,7 @@ python outputs/generic_parent_runner.py `
   --host-os windows `
   --prompt-file work/task_prompt.txt `
   --input "C:\path\source.pdf=/input/source.pdf" `
+  --skill-source outputs/skills=/input/skills `
   --expected-artifact /outputs/result.xlsx `
   --output-dir outputs/my_generic_run `
   --max-review-rounds 2 `
@@ -68,6 +81,7 @@ python outputs/generic_parent_runner.py \
   --selinux-relabel \
   --prompt-file work/task_prompt.txt \
   --input /path/source.pdf=/input/source.pdf \
+  --skill-source outputs/skills=/input/skills \
   --expected-artifact /outputs/result.xlsx \
   --output-dir outputs/my_generic_run \
   --max-review-rounds 2 \
@@ -78,6 +92,10 @@ python outputs/generic_parent_runner.py \
 
 - `--prompt-file` or `--prompt`: task instruction passed to the parent agent.
 - `--input`: repeatable host-to-sandbox mapping. Use `HOST_PATH=/input/name`.
+- `--skill-source`: repeatable host-to-sandbox mapping for Deep Agent skills.
+  The host directory should contain `skill-name/SKILL.md` directories. Example:
+  `--skill-source outputs/skills=/input/skills`, then the Deep Agent is created
+  with `skills=["/input/skills"]`.
 - `--expected-artifact`: repeatable expected artifact path under `/outputs`.
 - `--output-dir`: host output directory under this workspace's `outputs/`.
 - `--host-os`: `auto`, `windows`, or `linux`. `windows` uses WSL Podman;
@@ -106,3 +124,34 @@ ok =
 The parent final response now includes a separate evidence-based review summary
 based on the generic file inspections. That review is model judgment, not a
 hard-coded domain validator.
+
+## Skill Example
+
+The included seal-reading skill lives at:
+
+```text
+outputs/skills/seal-surname-identification/SKILL.md
+```
+
+Use it for Japanese red seal / hanko / inkan surname identification:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+python outputs/generic_parent_runner.py `
+  --host-os auto `
+  --prompt-file work/generic_runner_prompts/seal_surname_identification.txt `
+  --input "C:\Users\nyham\Downloads\test01.png=/input/test01.png" `
+  --input "C:\Users\nyham\Downloads\test02.png=/input/test02.png" `
+  --input "C:\Users\nyham\Downloads\test03.png=/input/test03.png" `
+  --skill-source outputs/skills=/input/skills `
+  --expected-artifact /outputs/seal_surname_identification_report.md `
+  --expected-artifact /outputs/seal_surname_identification_summary.json `
+  --expected-artifact /outputs/seal_surname_identification_contact_sheet.png `
+  --output-dir outputs/seal_surname_identification_with_skill `
+  --max-review-rounds 2
+```
+
+Deep Agents loads only the skill metadata at startup. When the task mentions
+`印鑑`, `はんこ`, `判子`, `印影`, `hanko`, `inkan`, or red seal images, it should
+read `/input/skills/seal-surname-identification/SKILL.md` and can execute the
+helper script under `/input/skills/seal-surname-identification/scripts/`.
