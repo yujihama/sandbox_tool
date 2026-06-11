@@ -8,7 +8,8 @@ The runner does:
 
 - Stage host input files under sandbox `/input`.
 - Pass the prompt to a parent agent.
-- Ask the parent agent to call `run_deep_agent_task`.
+- Ask the parent agent to call `run_deep_agent_task`, or the most appropriate
+  profile-specific Deep Agent tool when profiles are configured.
 - Run the Deep Agent in the Podman sandbox.
 - Give the Deep Agent a `request_parent_review` HITL tool.
 - Require the Deep Agent to create and run task-specific self-check artifacts
@@ -79,6 +80,7 @@ python outputs/generic_parent_runner.py `
   --prompt-file work/task_prompt.txt `
   --input "C:\path\source.pdf=/input/source.pdf" `
   --skill-source outputs/skills=/input/skills `
+  --deep-agent-profile-dir outputs/deep_agent_profiles `
   --expected-artifact /outputs/result.xlsx `
   --output-dir outputs/my_generic_run `
   --max-review-rounds 2 `
@@ -97,6 +99,7 @@ python outputs/generic_parent_runner.py \
   --prompt-file work/task_prompt.txt \
   --input /path/source.pdf=/input/source.pdf \
   --skill-source outputs/skills=/input/skills \
+  --deep-agent-profile-dir outputs/deep_agent_profiles \
   --expected-artifact /outputs/result.xlsx \
   --output-dir outputs/my_generic_run \
   --max-review-rounds 2 \
@@ -127,6 +130,11 @@ docker compose --env-file .env.local exec agent-app \
   The host directory should contain `skill-name/SKILL.md` directories. Example:
   `--skill-source outputs/skills=/input/skills`, then the Deep Agent is created
   with `skills=["/input/skills"]`.
+- `--deep-agent-profile`: repeatable YAML/JSON profile file. When any profile is
+  supplied, the parent receives one Deep Agent tool per profile instead of the
+  default `run_deep_agent_task`.
+- `--deep-agent-profile-dir`: repeatable directory containing `.json`, `.yaml`,
+  or `.yml` profile files. Files are loaded in sorted order.
 - `--expected-artifact`: repeatable expected artifact path under `/outputs`.
 - `--output-dir`: host output directory under this workspace's `outputs/`.
   This is now the run root; raw output is stored in `raw_outputs/`, clean output
@@ -168,6 +176,49 @@ ok =
 The parent final response now includes a separate evidence-based review summary
 based on the generic file inspections. That review is model judgment, not a
 hard-coded domain validator.
+
+## Deep Agent Profiles
+
+Profiles are a generic way to expose multiple Deep Agent tools with different
+capabilities without copying the runner. The parent still decides which tool to
+call, and all tools use the same sandbox, HITL review, output gate, cleanup, and
+trace/evaluation machinery.
+
+Example profile:
+
+```yaml
+id: heavy_data_analysis
+tool_name: run_heavy_data_analysis_agent
+description: Sandboxed agent for larger statistical analysis, sampling, modeling, and visual/report artifacts.
+system_prompt: |
+  Use reproducible analysis scripts for nontrivial computations. Explain
+  methods, assumptions, uncertainty, and limitations in the final report.
+skill_sources:
+  - ../skills=/input/skills
+include_global_skills: false
+image: localhost/python-data-sandbox:latest
+deep_model: openai:gpt-5.2
+deep_recursion_limit: 120
+max_review_rounds: 2
+```
+
+Field behavior:
+
+- `tool_name` is the name exposed to the parent agent.
+- `description` is the routing hint the parent sees.
+- `system_prompt` and `system_prompt_file` add worker-only instructions.
+- `skill_sources` stage profile-specific skills; relative host paths are
+  resolved from the profile file directory.
+- `include_global_skills: true` also passes global `--skill-source` entries to
+  that profile.
+- `image`, `deep_model`, `deep_recursion_limit`, and `max_review_rounds`
+  override the runner defaults only for that profile.
+
+The bundled examples live under:
+
+```text
+outputs/deep_agent_profiles/
+```
 
 ## Skill Example
 

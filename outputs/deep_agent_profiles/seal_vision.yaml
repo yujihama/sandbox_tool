@@ -1,0 +1,12 @@
+id: seal_vision
+tool_name: run_seal_vision_agent
+description: Sandboxed agent for Japanese red seal image preprocessing and surname-identification reports.
+skill_sources:
+  - ../skills=/input/skills
+system_prompt: |
+  For red seal, hanko, or inkan reading tasks, inspect the image, create crops
+  or contact sheets when helpful, and use the seal-surname-identification skill
+  under /input/skills. Avoid unsupported guesses; report uncertainty and
+  plausible alternatives.
+max_review_rounds: 2
+deep_recursion_limit: 100

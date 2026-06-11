@@ -6,6 +6,7 @@ Generic parent-agent runner with a sandboxed Deep Agent worker and a determinist
 
 - `outputs/generic_parent_runner.py`: parent agent runner with tool-mediated HITL review.
 - `outputs/multi_deep_parent_runner.py`: parent runner that decomposes a vague task into multiple Deep Agent calls.
+- `outputs/deep_agent_profiles/`: optional Deep Agent profile YAML files that expose multiple worker tools to the parent agent.
 - `outputs/podman_sandbox_backend.py`: short-lived Podman container backend for Deep Agents.
 - `outputs/Containerfile.python-data-sandbox`: Python data-analysis sandbox image.
 - `sandbox_tool/output_gate.py`: allowlist gate that validates and sanitizes final artifacts before the parent reads them.
@@ -116,6 +117,36 @@ called with `--xlsx-dangerous-formula-action stringify`.
 
 For `.csv`, formula-like cells are apostrophe-prefixed, while valid numeric
 literals such as `-100`, `+25.5`, and `-1.25e3` are preserved.
+
+## Deep Agent Profiles
+
+By default the parent receives one worker tool, `run_deep_agent_task`, which
+uses the global `--image`, `--deep-model`, `--deep-recursion-limit`,
+`--max-review-rounds`, and `--skill-source` settings.
+
+You can expose multiple worker tools by passing profile files:
+
+```bash
+python outputs/generic_parent_runner.py \
+  --deep-agent-profile-dir outputs/deep_agent_profiles \
+  --prompt-file work/task_prompt.txt \
+  --input /path/source.csv=/input/source.csv \
+  --expected-artifact /outputs/report.md \
+  --output-dir outputs/run1
+```
+
+Each profile can define:
+
+- `tool_name`: the tool name visible to the parent agent.
+- `description`: when the parent should choose this tool.
+- `system_prompt` or `system_prompt_file`: profile-specific worker instructions.
+- `skill_sources`: profile-only skill directories staged under `/input`.
+- `include_global_skills`: also pass global `--skill-source` entries.
+- `image`, `deep_model`, `deep_recursion_limit`, `max_review_rounds`: optional
+  overrides for that worker profile.
+
+The included examples cover quick checks, heavier statistical analysis,
+document/artifact generation, and seal-image reading.
 
 ## Linux / RedHat
 
