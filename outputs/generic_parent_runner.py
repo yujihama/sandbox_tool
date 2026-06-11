@@ -398,21 +398,30 @@ def stage_skill_sources(
             host, target = spec.split("=", 1)
         else:
             host = spec
-            target = "skills"
+            target = ""
         host_path = Path(host).expanduser()
         if not host_path.is_absolute() and base_dir is not None:
             host_path = base_dir / host_path
         host_path = host_path.resolve()
         if not host_path.exists() or not host_path.is_dir():
             raise FileNotFoundError(f"Skill source must be an existing directory: {host_path}")
+        is_single_skill = (host_path / "SKILL.md").is_file()
+        if not target:
+            target = f"skills/{host_path.name}" if is_single_skill else "skills"
         rel = sandbox_input_relative(target)
         destination = input_dir / rel
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
             shutil.rmtree(destination)
         shutil.copytree(host_path, destination)
-        staged_sources.append("/input/" + rel)
-    return staged_sources
+        source_rel = posixpath.dirname(rel) if is_single_skill else rel
+        if source_rel in {"", "."}:
+            raise ValueError(
+                "Single skill sources must be staged below a source directory, "
+                f"for example {host_path}=skills/{host_path.name}"
+            )
+        staged_sources.append("/input/" + source_rel)
+    return list(dict.fromkeys(staged_sources))
 
 
 def stage_profile_skill_sources(profile: DeepAgentProfile, input_dir: Path) -> list[str]:

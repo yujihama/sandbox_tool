@@ -179,6 +179,11 @@ payload-like values. The tool does not implement file upload actions. Results
 are saved under `/outputs/_playwright/<run_id>/` for later inspection by the
 Deep Agent and parent reviewer.
 
+Only `browser_research` currently receives the
+`houjin-bangou-browser-search` skill. That skill packages the browser workflow
+for Japan's Corporate Number Publication Site while still using the generic
+guarded Playwright tool rather than exposing a site-specific lookup tool.
+
 ## Linux / RedHat
 
 Direct native Podman mode remains available outside Compose:

@@ -81,6 +81,24 @@ class DeepAgentProfileTests(unittest.TestCase):
                 (input_dir / "profile-skills" / "demo-skill" / "SKILL.md").exists()
             )
 
+    def test_single_skill_source_is_staged_under_parent_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            skill_dir = root / "skills" / "demo-skill"
+            input_dir = root / "run" / "input"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# Demo Skill\n", encoding="utf-8")
+
+            staged = runner.stage_skill_sources(
+                [f"{skill_dir}=/input/browser-skills/demo-skill"],
+                input_dir,
+            )
+
+            self.assertEqual(staged, ["/input/browser-skills"])
+            self.assertTrue(
+                (input_dir / "browser-skills" / "demo-skill" / "SKILL.md").exists()
+            )
+
     def test_profile_tool_uses_declared_name_and_description(self) -> None:
         profile = runner.DeepAgentProfile(
             id="analysis",
@@ -127,6 +145,34 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertIn("run_playwright_task", by_id["browser_research"].system_prompt)
         self.assertNotIn("run_browser_use_task", by_id["browser_research"].system_prompt)
         self.assertIn("egress guarded", by_id["browser_research"].system_prompt)
+        self.assertEqual(
+            by_id["browser_research"].skill_source_specs,
+            [
+                "../skills/houjin-bangou-browser-search=/input/browser-skills/houjin-bangou-browser-search"
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            input_dir = Path(temp) / "input"
+            materialized_profiles = runner.load_deep_agent_profiles(
+                [],
+                [str(ROOT / "outputs" / "deep_agent_profiles")],
+            )
+            runner.materialize_deep_agent_profiles(materialized_profiles, input_dir, [])
+            materialized = {profile.id: profile for profile in materialized_profiles}
+            self.assertEqual(
+                materialized["browser_research"].skill_sources,
+                ["/input/browser-skills"],
+            )
+            self.assertTrue(
+                (
+                    input_dir
+                    / "browser-skills"
+                    / "houjin-bangou-browser-search"
+                    / "SKILL.md"
+                ).exists()
+            )
+            self.assertEqual(materialized["site_research"].skill_sources, [])
 
     def test_browser_use_domain_validation_requires_public_allowlist(self) -> None:
         self.assertEqual(
