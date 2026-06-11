@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import posixpath
 import re
 import shutil
@@ -15,7 +16,7 @@ from typing import Any
 
 
 POLICY_VERSION = "output-gate-v1"
-ALLOWED_EXTENSIONS = {".md", ".csv", ".xlsx", ".html"}
+ALLOWED_EXTENSIONS = {".md", ".csv", ".xlsx", ".html", ".json", ".yaml", ".yml"}
 MAX_TEXT_BYTES = 10 * 1024 * 1024
 MAX_XLSX_BYTES = 100 * 1024 * 1024
 MAX_ZIP_ENTRIES = 20_000
@@ -23,6 +24,15 @@ MAX_ZIP_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
 MAX_ZIP_COMPRESSION_RATIO = 100
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 CSV_ESCAPE_POLICY = "apostrophe-prefix"
+YAML_ALLOWED_TAGS = {
+    "tag:yaml.org,2002:map",
+    "tag:yaml.org,2002:seq",
+    "tag:yaml.org,2002:str",
+    "tag:yaml.org,2002:int",
+    "tag:yaml.org,2002:float",
+    "tag:yaml.org,2002:bool",
+    "tag:yaml.org,2002:null",
+}
 HTML_ACTIVE_PATTERNS = [
     (re.compile(r"<\s*script\b", re.IGNORECASE), "script_tag"),
     (re.compile(r"<\s*iframe\b", re.IGNORECASE), "iframe_tag"),
@@ -275,6 +285,232 @@ def sanitize_csv(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]]
     return findings, actions
 
 
+def reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant is not allowed: {value}")
+
+
+def json_compatible_findings(value: Any, *, path: str = "$") -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                findings.append(
+                    finding(
+                        "non_string_mapping_key",
+                        "mapping keys must be strings for exported structured data",
+                        path=path,
+                        key_type=type(key).__name__,
+                    )
+                )
+                continue
+            findings.extend(json_compatible_findings(item, path=f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            findings.extend(json_compatible_findings(item, path=f"{path}[{index}]"))
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            findings.append(
+                finding(
+                    "non_finite_number",
+                    "NaN and Infinity are not allowed in exported structured data",
+                    path=path,
+                )
+            )
+    elif value is None or isinstance(value, (str, int, bool)):
+        pass
+    else:
+        findings.append(
+            finding(
+                "non_json_type",
+                "structured output contains a value outside the JSON-safe subset",
+                path=path,
+                value_type=type(value).__name__,
+            )
+        )
+    return findings
+
+
+def sanitize_json(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    text = read_text_strict(raw_path)
+    try:
+        data = json.loads(text, parse_constant=reject_json_constant)
+    except Exception as exc:
+        raise GateReject(
+            [
+                finding(
+                    "json_parse_error",
+                    f"JSON parsing failed: {exc.__class__.__name__}: {exc}",
+                )
+            ]
+        ) from exc
+
+    findings = json_compatible_findings(data)
+    if findings:
+        raise GateReject(findings)
+
+    clean_text = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    clean_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_path.write_text(clean_text, encoding="utf-8", newline="\n")
+    actions = ["canonicalized_json"] if clean_text != text else []
+    return [], actions
+
+
+def yaml_node_findings(node: Any, *, path: str = "$") -> list[dict[str, Any]]:
+    try:
+        from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+    except Exception as exc:  # pragma: no cover
+        return [finding("pyyaml_unavailable", f"PyYAML unavailable: {exc.__class__.__name__}: {exc}")]
+
+    findings: list[dict[str, Any]] = []
+    if node.tag not in YAML_ALLOWED_TAGS:
+        findings.append(
+            finding(
+                "yaml_tag_not_allowed",
+                "YAML tag is outside the allowed JSON-compatible subset",
+                path=path,
+                tag=node.tag,
+            )
+        )
+
+    if isinstance(node, MappingNode):
+        seen_keys: dict[str, str] = {}
+        for key_node, value_node in node.value:
+            if not isinstance(key_node, ScalarNode):
+                findings.append(
+                    finding(
+                        "yaml_complex_key_not_allowed",
+                        "YAML mapping keys must be scalar strings",
+                        path=path,
+                    )
+                )
+                continue
+            if key_node.tag != "tag:yaml.org,2002:str":
+                findings.append(
+                    finding(
+                        "yaml_non_string_key_not_allowed",
+                        "YAML mapping keys must be strings",
+                        path=path,
+                        key=key_node.value,
+                        tag=key_node.tag,
+                    )
+                )
+                continue
+            key = key_node.value
+            key_path = f"{path}.{key}"
+            if key in seen_keys:
+                findings.append(
+                    finding(
+                        "yaml_duplicate_key",
+                        "duplicate YAML mapping key detected",
+                        path=path,
+                        key=key,
+                        first_path=seen_keys[key],
+                    )
+                )
+            else:
+                seen_keys[key] = key_path
+            findings.extend(yaml_node_findings(value_node, path=key_path))
+    elif isinstance(node, SequenceNode):
+        for index, item_node in enumerate(node.value):
+            findings.extend(yaml_node_findings(item_node, path=f"{path}[{index}]"))
+    elif not isinstance(node, ScalarNode):
+        findings.append(
+            finding(
+                "yaml_node_type_not_allowed",
+                "YAML node type is outside the allowed subset",
+                path=path,
+                node_type=type(node).__name__,
+            )
+        )
+    return findings
+
+
+def yaml_token_findings(text: str) -> list[dict[str, Any]]:
+    try:
+        import yaml
+        from yaml.tokens import AliasToken, AnchorToken
+    except Exception as exc:  # pragma: no cover
+        return [finding("pyyaml_unavailable", f"PyYAML unavailable: {exc.__class__.__name__}: {exc}")]
+
+    findings: list[dict[str, Any]] = []
+    try:
+        for token in yaml.scan(text):
+            if isinstance(token, AnchorToken):
+                findings.append(
+                    finding(
+                        "yaml_anchor_not_allowed",
+                        "YAML anchors are not allowed in exported structured data",
+                        line=token.start_mark.line + 1,
+                        column=token.start_mark.column + 1,
+                    )
+                )
+            elif isinstance(token, AliasToken):
+                findings.append(
+                    finding(
+                        "yaml_alias_not_allowed",
+                        "YAML aliases are not allowed in exported structured data",
+                        line=token.start_mark.line + 1,
+                        column=token.start_mark.column + 1,
+                    )
+                )
+    except Exception as exc:
+        findings.append(
+            finding(
+                "yaml_parse_error",
+                f"YAML tokenization failed: {exc.__class__.__name__}: {exc}",
+            )
+        )
+    return findings
+
+
+def sanitize_yaml(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    text = read_text_strict(raw_path)
+    token_findings = yaml_token_findings(text)
+    if token_findings:
+        raise GateReject(token_findings)
+
+    try:
+        import yaml
+    except Exception as exc:  # pragma: no cover
+        raise GateReject(
+            [finding("pyyaml_unavailable", f"PyYAML unavailable: {exc.__class__.__name__}: {exc}")]
+        ) from exc
+
+    try:
+        node = yaml.compose(text, Loader=yaml.SafeLoader)
+    except Exception as exc:
+        raise GateReject(
+            [finding("yaml_parse_error", f"YAML parsing failed: {exc.__class__.__name__}: {exc}")]
+        ) from exc
+    if node is not None:
+        node_findings = yaml_node_findings(node)
+        if node_findings:
+            raise GateReject(node_findings)
+
+    try:
+        data = yaml.safe_load(text)
+    except Exception as exc:
+        raise GateReject(
+            [finding("yaml_parse_error", f"YAML loading failed: {exc.__class__.__name__}: {exc}")]
+        ) from exc
+
+    findings = json_compatible_findings(data)
+    if findings:
+        raise GateReject(findings)
+
+    clean_text = yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        default_flow_style=False,
+        explicit_end=False,
+        sort_keys=True,
+    )
+    clean_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_path.write_text(clean_text, encoding="utf-8", newline="\n")
+    actions = ["canonicalized_yaml"] if clean_text != text else []
+    return [], actions
+
+
 class GateReject(Exception):
     def __init__(self, findings: list[dict[str, Any]]):
         super().__init__("gate rejected artifact")
@@ -515,6 +751,10 @@ def process_artifact(
             findings, actions = sanitize_csv(raw_path, clean_path)
         elif suffix == ".html":
             findings, actions = sanitize_html(raw_path, clean_path)
+        elif suffix == ".json":
+            findings, actions = sanitize_json(raw_path, clean_path)
+        elif suffix in {".yaml", ".yml"}:
+            findings, actions = sanitize_yaml(raw_path, clean_path)
         elif suffix == ".xlsx":
             findings, actions = sanitize_xlsx(
                 raw_path,
