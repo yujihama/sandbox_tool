@@ -1396,11 +1396,11 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     """Run one sandboxed Deep Agent attempt for allowed /outputs artifacts.
 
     expected_artifacts must be files under /outputs using only output-gate
-    allowed extensions: .csv, .html, .md, .xlsx. For the generic runner, pass
-    the configured final artifacts exactly. For multi-step runs, intermediate
-    expected artifacts may be under /outputs/subtasks/. Do not request .py,
-    .js, .json, .png, .pdf, .docx, .pptx, .xlsm, or directory artifacts as
-    review/export artifacts.
+    allowed extensions: .csv, .html, .json, .md, .xlsx, .yaml, .yml. For the
+    generic runner, pass the configured final artifacts exactly. For multi-step
+    runs, intermediate expected artifacts may be under /outputs/subtasks/. Do
+    not request .py, .js, .png, .pdf, .docx, .pptx, .xlsm, or directory
+    artifacts as review/export artifacts.
     """
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
@@ -1439,9 +1439,9 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
         + "\n".join(f"- {path}" for path in effective_expected_artifacts)
         + "\n\nAllowed review/export extensions: "
         + ALLOWED_EXPORT_EXTENSIONS_TEXT
-        + "\nDo not pass helper scripts, images, PDFs, JSON, or other non-allowed files "
+        + "\nDo not pass helper scripts, images, PDFs, or other non-allowed files "
         "to request_parent_review. If structured data is needed as a reviewed artifact, "
-        "write CSV/XLSX or embed JSON in a Markdown report.\n\n"
+        "write CSV/XLSX/JSON/YAML or include it in a Markdown report.\n\n"
         "Task instructions:\n"
         + task
     )
