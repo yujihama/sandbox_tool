@@ -6,5 +6,6 @@ langchain-openai
 openpyxl
 pillow
 pypdf
+PyYAML
 python-dotenv
 uvicorn[standard]

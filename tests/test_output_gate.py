@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import openpyxl
+import yaml
 
 from sandbox_tool.output_gate import run_output_gate
 
@@ -65,6 +67,61 @@ class OutputGateTests(unittest.TestCase):
         with (self.clean_root / "data.csv").open(newline="", encoding="utf-8") as handle:
             rows = list(csv.reader(handle))
         self.assertEqual(rows[2][1], "'=1+1")
+
+    def test_json_is_canonicalized(self) -> None:
+        (self.raw_root / "summary.json").write_text(
+            '{"b": 2, "a": {"ok": true}}\n',
+            encoding="utf-8",
+        )
+
+        manifest = self.gate("/outputs/summary.json")
+
+        self.assertEqual(manifest["overall_status"], "pass")
+        artifact = manifest["artifacts"][0]
+        self.assertEqual(artifact["status"], "sanitized")
+        self.assertIn("canonicalized_json", artifact["actions"])
+        parsed = json.loads((self.clean_root / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(parsed, {"a": {"ok": True}, "b": 2})
+
+    def test_invalid_json_is_rejected(self) -> None:
+        (self.raw_root / "summary.json").write_text('{"missing": true', encoding="utf-8")
+
+        manifest = self.gate("/outputs/summary.json")
+
+        self.assertEqual(manifest["overall_status"], "fail")
+        artifact = manifest["artifacts"][0]
+        self.assertEqual(artifact["status"], "rejected")
+        self.assertEqual(artifact["findings"][0]["code"], "json_parse_error")
+        self.assertTrue((self.quarantine_root / "summary.json").exists())
+
+    def test_yaml_is_canonicalized(self) -> None:
+        (self.raw_root / "summary.yaml").write_text(
+            "b: 2\na:\n  ok: true\n",
+            encoding="utf-8",
+        )
+
+        manifest = self.gate("/outputs/summary.yaml")
+
+        self.assertEqual(manifest["overall_status"], "pass")
+        artifact = manifest["artifacts"][0]
+        self.assertEqual(artifact["status"], "sanitized")
+        self.assertIn("canonicalized_yaml", artifact["actions"])
+        parsed = yaml.safe_load((self.clean_root / "summary.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(parsed, {"a": {"ok": True}, "b": 2})
+
+    def test_yml_alias_is_rejected(self) -> None:
+        (self.raw_root / "summary.yml").write_text(
+            "defaults: &defaults\n  ok: true\nitem:\n  <<: *defaults\n",
+            encoding="utf-8",
+        )
+
+        manifest = self.gate("/outputs/summary.yml")
+
+        self.assertEqual(manifest["overall_status"], "fail")
+        artifact = manifest["artifacts"][0]
+        self.assertEqual(artifact["status"], "rejected")
+        self.assertEqual(artifact["findings"][0]["code"], "yaml_anchor_not_allowed")
+        self.assertTrue((self.quarantine_root / "summary.yml").exists())
 
     def test_xlsx_preserves_safe_formulas(self) -> None:
         workbook = openpyxl.Workbook()
