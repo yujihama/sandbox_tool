@@ -14,6 +14,8 @@ outputs/*.xlsx
 outputs/*.csv
 outputs/*.html
 !outputs/Containerfile.python-data-sandbox
+!outputs/deep_agent_profiles/
+!outputs/deep_agent_profiles/**
 !outputs/skills/
 !outputs/skills/**
 !outputs/generic_parent_runner.py
