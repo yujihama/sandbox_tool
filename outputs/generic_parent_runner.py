@@ -10,7 +10,8 @@ import posixpath
 import shutil
 import subprocess
 import sys
-import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,11 +30,17 @@ ROOT = THIS_FILE.parents[1]
 WORK_DIR = ROOT / "work"
 OUTPUTS_ROOT = ROOT / "outputs"
 
-for import_dir in (THIS_FILE.parent, WORK_DIR):
+for import_dir in (ROOT, THIS_FILE.parent, WORK_DIR):
     if str(import_dir) not in sys.path:
         sys.path.insert(0, str(import_dir))
 
 from podman_sandbox_backend import PodmanRunLimits, PodmanSandboxBackend  # noqa: E402
+from sandbox_tool.controller_sandbox_backend import ControllerSandboxBackend  # noqa: E402
+from sandbox_tool.output_gate import (  # noqa: E402
+    ALLOWED_EXTENSIONS,
+    run_output_gate as run_output_gate_artifacts,
+    sha256_file,
+)
 
 
 @dataclass
@@ -46,8 +53,14 @@ class InputMapping:
 @dataclass
 class RunnerConfig:
     prompt: str
+    run_root: Path
     output_dir: Path
+    clean_export_dir: Path
+    quarantine_dir: Path
+    gate_log_dir: Path
+    runner_log_dir: Path
     input_dir: Path
+    workspace_dir: Path
     input_mappings: list[InputMapping]
     expected_artifacts: list[str]
     skill_sources: list[str]
@@ -64,12 +77,18 @@ class RunnerConfig:
     selinux_relabel: bool
     clear_output: bool
     keep_staged_input: bool
+    allow_raw_parent_inspection: bool
+    sandbox_backend: str
+    sandbox_controller_url: str
+    sandbox_controller_token: str
+    xlsx_dangerous_formula_action: str
 
 
 CONFIG: RunnerConfig | None = None
 DEEP_AGENT_TRACE: list[dict[str, Any]] = []
 DEEP_AGENT_EVALUATIONS: list[dict[str, Any]] = []
 DEEP_REVIEW_REQUESTS: list[dict[str, Any]] = []
+ALLOWED_EXPORT_EXTENSIONS_TEXT = ", ".join(sorted(ALLOWED_EXTENSIONS))
 
 
 def load_env_local(path: Path) -> None:
@@ -91,15 +110,35 @@ def is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def require_safe_output_dir(output_dir: Path) -> Path:
+def require_safe_output_dir(output_dir: Path, *, sandbox_backend: str = "podman") -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved = output_dir.resolve()
-    outputs_root = OUTPUTS_ROOT.resolve()
+    outputs_root = (
+        Path(os.getenv("RUNS_ROOT", "/srv/sandbox-tool/runs")).resolve()
+        if sandbox_backend == "controller"
+        else OUTPUTS_ROOT.resolve()
+    )
     if resolved == outputs_root:
-        raise ValueError("Refusing to use the outputs root itself as --output-dir.")
+        raise ValueError(f"Refusing to use the run root itself as --output-dir: {outputs_root}")
     if not is_relative_to(resolved, outputs_root):
         raise ValueError(f"--output-dir must be under {outputs_root}: {resolved}")
     return resolved
+
+
+def prepare_run_directories(run_root: Path) -> dict[str, Path]:
+    dirs = {
+        "run_root": run_root,
+        "input_dir": run_root / "input",
+        "workspace_dir": run_root / "workspace",
+        "raw_output_dir": run_root / "raw_outputs",
+        "clean_export_dir": run_root / "clean_exports",
+        "quarantine_dir": run_root / "quarantine",
+        "gate_log_dir": run_root / "gate_logs",
+        "runner_log_dir": run_root / "runner_logs",
+    }
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return {name: path.resolve() for name, path in dirs.items()}
 
 
 def clear_directory_contents(directory: Path) -> None:
@@ -121,6 +160,32 @@ def normalize_expected_artifact(path: str) -> str:
     normalized = posixpath.normpath(raw)
     if normalized == "/outputs" or normalized.startswith("/outputs/../"):
         raise ValueError(f"Invalid expected artifact path: {path}")
+    suffix = posixpath.splitext(normalized)[1].lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise ValueError(
+            "Expected/review artifacts must use an output-gate allowed extension "
+            f"({ALLOWED_EXPORT_EXTENSIONS_TEXT}): {path}"
+        )
+    return normalized
+
+
+def normalize_tool_expected_artifacts(paths: list[str]) -> list[str]:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    normalized = [normalize_expected_artifact(path) for path in paths]
+    if not normalized:
+        raise ValueError("expected_artifacts must include at least one artifact")
+    allowed_final = set(CONFIG.expected_artifacts)
+    invalid = [
+        path
+        for path in normalized
+        if path not in allowed_final and not path.startswith("/outputs/subtasks/")
+    ]
+    if invalid:
+        raise ValueError(
+            "Expected artifacts passed to the Deep Agent tool must be either the "
+            f"configured final artifacts or intermediate /outputs/subtasks/* artifacts: {invalid}"
+        )
     return normalized
 
 
@@ -203,6 +268,10 @@ def resolve_sandbox_path(path: str | Path) -> Path:
         return CONFIG.output_dir
     if raw.startswith("/outputs/"):
         return CONFIG.output_dir / raw.removeprefix("/outputs/")
+    if raw == "/exports":
+        return CONFIG.clean_export_dir
+    if raw.startswith("/exports/"):
+        return CONFIG.clean_export_dir / raw.removeprefix("/exports/")
     if raw == "/input":
         return CONFIG.input_dir
     if raw.startswith("/input/"):
@@ -213,11 +282,15 @@ def resolve_sandbox_path(path: str | Path) -> Path:
 def normalize_readable_virtual_path(path: str | Path) -> str:
     raw = str(path).replace("\\", "/")
     normalized = posixpath.normpath(raw)
-    if normalized in {"/outputs", "/input"}:
+    if normalized in {"/outputs", "/exports", "/input"}:
         return normalized
-    if normalized.startswith("/outputs/") or normalized.startswith("/input/"):
+    if (
+        normalized.startswith("/outputs/")
+        or normalized.startswith("/exports/")
+        or normalized.startswith("/input/")
+    ):
         return normalized
-    raise ValueError(f"Path must be under /input or /outputs: {path}")
+    raise ValueError(f"Path must be under /input, /outputs, or /exports: {path}")
 
 
 def resolve_readable_virtual_path(path: str | Path) -> tuple[str, Path]:
@@ -225,7 +298,11 @@ def resolve_readable_virtual_path(path: str | Path) -> tuple[str, Path]:
     host_path = resolve_sandbox_path(normalized).resolve()
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
-    allowed_roots = [CONFIG.output_dir.resolve(), CONFIG.input_dir.resolve()]
+    allowed_roots = [
+        CONFIG.output_dir.resolve(),
+        CONFIG.clean_export_dir.resolve(),
+        CONFIG.input_dir.resolve(),
+    ]
     if not any(host_path == root or is_relative_to(host_path, root) for root in allowed_roots):
         raise ValueError(f"Resolved path escaped /input or /outputs: {path}")
     return normalized, host_path
@@ -299,14 +376,32 @@ def resolve_host_os(host_os: str) -> str:
 def configured_image_available() -> bool:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
+    if CONFIG.sandbox_backend == "controller":
+        return True
     if CONFIG.host_os == "windows":
         return wsl_podman_image_available(CONFIG.image, CONFIG.wsl_distro)
     return native_podman_image_available(CONFIG.image, CONFIG.podman_bin)
 
 
-def create_configured_backend() -> PodmanSandboxBackend:
+def create_configured_backend() -> Any:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
+
+    if CONFIG.sandbox_backend == "controller":
+        if not CONFIG.sandbox_controller_url:
+            raise RuntimeError("sandbox_controller_url is required for controller backend")
+        CONFIG.workspace_dir.mkdir(parents=True, exist_ok=True)
+        return ControllerSandboxBackend(
+            image=CONFIG.image,
+            controller_url=CONFIG.sandbox_controller_url,
+            run_id=CONFIG.run_root.name,
+            input_dir=CONFIG.input_dir,
+            output_dir=CONFIG.output_dir,
+            workspace_dir=CONFIG.workspace_dir,
+            token=CONFIG.sandbox_controller_token,
+            timeout_seconds=300,
+            max_output_bytes=450_000,
+        )
 
     limits = PodmanRunLimits(
         enforce_cgroups=CONFIG.host_os != "windows",
@@ -407,6 +502,11 @@ def build_parent_prompt() -> str:
         + "\n".join(f"- {item.sandbox_path}" for item in CONFIG.input_mappings)
         + "\n\nExpected artifacts:\n"
         + "\n".join(f"- {path}" for path in CONFIG.expected_artifacts)
+        + "\n\nOutput-gate allowed review/export extensions:\n"
+        + ALLOWED_EXPORT_EXTENSIONS_TEXT
+        + "\nDo not ask the Deep Agent to create final or review artifacts with any "
+        "other extension. Helper scripts or working files may exist under /outputs, "
+        "but they must not be passed as expected_artifacts or request_parent_review artifacts."
         + (
             "\n\nDeep Agent skill sources:\n"
             + "\n".join(f"- {path}" for path in CONFIG.skill_sources)
@@ -955,6 +1055,234 @@ def read_sandbox_file(
     return result
 
 
+def normalize_export_path(path: str | Path) -> tuple[str, Path]:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    raw = str(path).replace("\\", "/")
+    normalized = posixpath.normpath(raw)
+    if normalized.startswith("/outputs/"):
+        rel = normalized.removeprefix("/outputs/")
+    elif normalized.startswith("/exports/"):
+        rel = normalized.removeprefix("/exports/")
+    else:
+        raise ValueError(f"Exported artifact path must be under /outputs or /exports: {path}")
+    if rel in {"", "."} or rel == ".." or rel.startswith("../"):
+        raise ValueError(f"Invalid exported artifact path: {path}")
+    host_path = (CONFIG.clean_export_dir / rel).resolve()
+    clean_root = CONFIG.clean_export_dir.resolve()
+    if not (host_path == clean_root or is_relative_to(host_path, clean_root)):
+        raise ValueError(f"Resolved export path escaped clean export root: {path}")
+    return "/exports/" + rel, host_path
+
+
+def call_controller_gate(artifacts: list[str]) -> dict[str, Any]:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    payload = {
+        "artifacts": artifacts,
+        "xlsx_dangerous_formula_action": CONFIG.xlsx_dangerous_formula_action,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if CONFIG.sandbox_controller_token:
+        headers["Authorization"] = f"Bearer {CONFIG.sandbox_controller_token}"
+    url = (
+        CONFIG.sandbox_controller_url.rstrip("/")
+        + f"/runs/{CONFIG.run_root.name}/gate"
+    )
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"controller gate failed with HTTP {exc.code}: {detail}") from exc
+    result = json.loads(body) if body else {}
+    manifest = result.get("manifest")
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"controller gate returned no manifest: {result}")
+    return manifest
+
+
+@tool
+def run_output_gate(export_artifacts: list[str] | None = None) -> dict[str, Any]:
+    """Run the deterministic output allowlist gate for declared /outputs artifacts."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    if export_artifacts is None or not export_artifacts:
+        if not DEEP_REVIEW_REQUESTS:
+            return {"ok": False, "error": "no_review_request_to_export"}
+        export_artifacts = list(DEEP_REVIEW_REQUESTS[-1].get("artifacts", []))
+    normalized: list[str] = []
+    errors: list[str] = []
+    for artifact in export_artifacts:
+        try:
+            normalized.append(normalize_expected_artifact(artifact))
+        except Exception as exc:
+            errors.append(f"{artifact}: {exc}")
+    if errors:
+        return {"ok": False, "error": "invalid_export_artifacts", "details": errors}
+    try:
+        if CONFIG.sandbox_backend == "controller" and CONFIG.sandbox_controller_url:
+            manifest = call_controller_gate(normalized)
+        else:
+            manifest = run_output_gate_artifacts(
+                raw_root=CONFIG.output_dir,
+                clean_root=CONFIG.clean_export_dir,
+                quarantine_root=CONFIG.quarantine_dir,
+                log_root=CONFIG.gate_log_dir,
+                artifacts=normalized,
+                run_id=CONFIG.run_root.name,
+                xlsx_dangerous_formula_action=CONFIG.xlsx_dangerous_formula_action,
+            )
+    except Exception as exc:
+        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+    latest_manifest = CONFIG.runner_log_dir / "latest_gate_manifest.json"
+    latest_manifest.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "ok": manifest.get("overall_status") == "pass",
+        "overall_status": manifest.get("overall_status"),
+        "manifest_path": "/gate_logs/gate_manifest.json",
+        "clean_export_root": str(CONFIG.clean_export_dir),
+        "quarantine_root": str(CONFIG.quarantine_dir),
+        "artifacts": manifest.get("artifacts", []),
+    }
+
+
+@tool
+def inspect_gate_manifest() -> dict[str, Any]:
+    """Read the latest output-gate manifest."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    path = CONFIG.gate_log_dir / "gate_manifest.json"
+    if not path.exists():
+        return {"ok": False, "exists": False, "path": str(path)}
+    try:
+        return {"ok": True, "exists": True, "manifest": json.loads(path.read_text(encoding="utf-8"))}
+    except Exception as exc:
+        return {"ok": False, "exists": True, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
+@tool
+def list_exported_files(root: str = "/exports", max_entries: int = 100) -> dict[str, Any]:
+    """List files under the clean export area after output-gate processing."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        normalized, host_root = normalize_export_path(root) if root != "/exports" else ("/exports", CONFIG.clean_export_dir)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    max_entries = max(1, min(max_entries, 500))
+    if not host_root.exists():
+        return {"ok": False, "root": normalized, "exists": False, "files": []}
+    files: list[dict[str, Any]] = []
+    clean_root = host_root.resolve()
+    for child in sorted(host_root.rglob("*"), key=lambda item: str(item).lower()):
+        if len(files) >= max_entries:
+            break
+        resolved = child.resolve()
+        if not is_relative_to(resolved, clean_root):
+            continue
+        rel = child.relative_to(host_root).as_posix()
+        files.append(
+            {
+                "path": normalized.rstrip("/") + "/" + rel,
+                "is_file": child.is_file(),
+                "is_dir": child.is_dir(),
+                "bytes": child.stat().st_size if child.is_file() else None,
+                "mtime": timestamp_iso(child),
+            }
+        )
+    return {
+        "ok": True,
+        "root": normalized,
+        "entries_returned": len(files),
+        "truncated": len(files) >= max_entries,
+        "files": files,
+    }
+
+
+@tool
+def read_exported_file(
+    path: str,
+    max_chars: int = 12000,
+    max_rows: int = 20,
+    max_cols: int = 12,
+    max_pages: int = 5,
+) -> dict[str, Any]:
+    """Inspect a clean exported file after output-gate processing."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        normalized, host_path = normalize_export_path(path)
+        max_chars = max(1000, min(max_chars, 50000))
+        max_rows = max(1, min(max_rows, 100))
+        max_cols = max(1, min(max_cols, 50))
+        max_pages = max(1, min(max_pages, 20))
+        info = inspect_file_by_type(
+            host_path,
+            max_chars=max_chars,
+            max_rows=max_rows,
+            max_cols=max_cols,
+            max_pages=max_pages,
+        )
+        info.update({"ok": bool(info.get("exists", True)), "path": normalized, "host_path": str(host_path)})
+        return info
+    except Exception as exc:
+        return {"ok": False, "path": path, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
+@tool
+def inspect_exported_artifacts(max_rows: int = 20, max_cols: int = 12) -> dict[str, Any]:
+    """Inspect configured expected artifacts from the clean export area."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    inspections = [
+        read_exported_file.invoke(
+            {"path": path, "max_rows": max_rows, "max_cols": max_cols}
+        )
+        for path in CONFIG.expected_artifacts
+    ]
+    return {
+        "ok": all(item.get("ok") for item in inspections),
+        "inspections": inspections,
+    }
+
+
+@tool
+def list_quarantine_metadata() -> dict[str, Any]:
+    """List quarantined raw artifacts and output-gate findings."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    manifest_path = CONFIG.gate_log_dir / "gate_manifest.json"
+    manifest = None
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    quarantined = []
+    for path in sorted(CONFIG.quarantine_dir.rglob("*"), key=lambda item: str(item).lower()):
+        if path.is_file():
+            quarantined.append(
+                {
+                    "path": str(path),
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256_file(path) if path.exists() else None,
+                }
+            )
+    return {
+        "ok": True,
+        "quarantine_root": str(CONFIG.quarantine_dir),
+        "quarantined_files": quarantined,
+        "manifest_rejections": [
+            item
+            for item in (manifest or {}).get("artifacts", [])
+            if item.get("status") == "rejected"
+        ],
+    }
+
+
 @tool
 def inspect_expected_artifacts(max_rows: int = 20, max_cols: int = 12) -> dict[str, Any]:
     """Inspect every configured expected artifact for parent review."""
@@ -1021,12 +1349,32 @@ def request_parent_review(
     summary: str,
     known_issues: str = "",
 ) -> dict[str, Any]:
-    """Ask the parent agent to review produced artifacts before final closure."""
+    """Ask the parent agent to review output-gate allowed artifacts before final closure."""
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
+    normalized_artifacts: list[str] = []
+    errors: list[str] = []
+    for artifact in artifacts:
+        try:
+            normalized_artifacts.append(normalize_expected_artifact(artifact))
+        except Exception as exc:
+            errors.append(f"{artifact}: {exc}")
+    if errors:
+        return {
+            "ok": False,
+            "review_requested": False,
+            "error": "invalid_review_artifacts",
+            "details": errors,
+            "allowed_extensions": sorted(ALLOWED_EXTENSIONS),
+            "message": (
+                "Review artifacts must be under /outputs and use only output-gate "
+                "allowed extensions. Do not include executable self-check scripts, "
+                "images, PDFs, or other helper files in request_parent_review."
+            ),
+        }
     request = {
         "attempt": len(DEEP_AGENT_EVALUATIONS) + 1,
-        "artifacts": artifacts,
+        "artifacts": normalized_artifacts,
         "summary": summary,
         "known_issues": known_issues,
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
@@ -1045,9 +1393,26 @@ def request_parent_review(
 
 @tool
 def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, Any]:
-    """Run a Deep Agent in the configured Podman sandbox and check expected artifacts."""
+    """Run one sandboxed Deep Agent attempt for allowed /outputs artifacts.
+
+    expected_artifacts must be files under /outputs using only output-gate
+    allowed extensions: .csv, .html, .md, .xlsx. For the generic runner, pass
+    the configured final artifacts exactly. For multi-step runs, intermediate
+    expected artifacts may be under /outputs/subtasks/. Do not request .py,
+    .js, .json, .png, .pdf, .docx, .pptx, .xlsm, or directory artifacts as
+    review/export artifacts.
+    """
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
+    try:
+        effective_expected_artifacts = normalize_tool_expected_artifacts(expected_artifacts)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "invalid_expected_artifacts",
+            "message": str(exc),
+            "allowed_extensions": sorted(ALLOWED_EXTENSIONS),
+        }
 
     attempt = len(DEEP_AGENT_EVALUATIONS) + 1
     review_start = len(DEEP_REVIEW_REQUESTS)
@@ -1059,23 +1424,37 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
             "max_review_rounds": CONFIG.max_review_rounds,
         }
 
-    deep_prompt_path = CONFIG.output_dir / f"deep_agent_prompt_round_{attempt}.txt"
-    deep_trace_path = CONFIG.output_dir / f"deep_agent_trace_round_{attempt}.json"
-    cleanup_path = CONFIG.output_dir / f"cleanup_report_round_{attempt}.json"
-    evaluation_path = CONFIG.output_dir / f"parent_tool_evaluation_round_{attempt}.json"
-    latest_deep_prompt_path = CONFIG.output_dir / "deep_agent_prompt.txt"
-    latest_deep_trace_path = CONFIG.output_dir / "deep_agent_trace.json"
-    latest_cleanup_path = CONFIG.output_dir / "cleanup_report.json"
-    latest_evaluation_path = CONFIG.output_dir / "parent_tool_evaluation.json"
+    log_dir = CONFIG.runner_log_dir
+    deep_prompt_path = log_dir / f"deep_agent_prompt_round_{attempt}.txt"
+    deep_trace_path = log_dir / f"deep_agent_trace_round_{attempt}.json"
+    cleanup_path = log_dir / f"cleanup_report_round_{attempt}.json"
+    evaluation_path = log_dir / f"parent_tool_evaluation_round_{attempt}.json"
+    latest_deep_prompt_path = log_dir / "deep_agent_prompt.txt"
+    latest_deep_trace_path = log_dir / "deep_agent_trace.json"
+    latest_cleanup_path = log_dir / "cleanup_report.json"
+    latest_evaluation_path = log_dir / "parent_tool_evaluation.json"
 
-    deep_prompt_path.write_text(task, encoding="utf-8")
-    latest_deep_prompt_path.write_text(task, encoding="utf-8")
+    task_with_contract = (
+        "Expected review/export artifacts for this invocation:\n"
+        + "\n".join(f"- {path}" for path in effective_expected_artifacts)
+        + "\n\nAllowed review/export extensions: "
+        + ALLOWED_EXPORT_EXTENSIONS_TEXT
+        + "\nDo not pass helper scripts, images, PDFs, JSON, or other non-allowed files "
+        "to request_parent_review. If structured data is needed as a reviewed artifact, "
+        "write CSV/XLSX or embed JSON in a Markdown report.\n\n"
+        "Task instructions:\n"
+        + task
+    )
+
+    deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
+    latest_deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
 
     if not configured_image_available():
         evaluation = {
             "ok": False,
             "attempt": attempt,
-            "error": "podman_image_missing",
+            "error": "sandbox_image_missing",
+            "sandbox_backend": CONFIG.sandbox_backend,
             "image": CONFIG.image,
             "host_os": CONFIG.host_os,
         }
@@ -1100,8 +1479,11 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
             backend=backend,
             skills=CONFIG.skill_sources or None,
             system_prompt=(
-                "You are a task execution agent running in a Podman sandbox. "
+                "You are a task execution agent running in an isolated sandbox. "
                 "Read inputs only from /input and write final artifacts under /outputs. "
+                f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
+                "Do not include helper scripts, JSON files, images, PDFs, or other non-allowed "
+                "files in request_parent_review. "
                 "Save larger scripts under /outputs before executing them. "
                 "Do not use the network from the sandbox. Use installed local libraries when helpful. "
                 "Use read_sandbox_file when you need a type-aware read of /input or "
@@ -1125,9 +1507,11 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
                 "self-check before requesting review. The report must include command(s) run, "
                 "pass/fail status, checked files, limitations, and remaining known issues. "
                 "When you believe the expected artifacts are ready for review, you must "
-                "call request_parent_review with the artifact paths, a concise summary of "
-                "what you produced, and any known issues. Include the self-check artifact "
-                "paths in the review request artifacts list. Call it after creating or updating "
+                "call request_parent_review with the final artifact paths, a concise summary of "
+                "what you produced, and any known issues. Include `/outputs/self_check_plan.md` "
+                "and `/outputs/self_check_report.md` in the review request artifacts list, but "
+                "do not include the executable self-check script because code is not an allowed "
+                "export format. Call review after creating or updating "
                 "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
                 "for this attempt and respond concisely with the paths awaiting review. "
                 "If this invocation contains parent correction feedback from a previous "
@@ -1136,7 +1520,7 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
             ),
         )
         deep_result = deep_agent.invoke(
-            {"messages": [{"role": "user", "content": task}]},
+            {"messages": [{"role": "user", "content": task_with_contract}]},
             config={
                 "configurable": {"thread_id": "deep-agent-generic-task"},
                 "recursion_limit": CONFIG.deep_recursion_limit,
@@ -1166,10 +1550,18 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     finally:
         workspace_dir = backend.workspace_dir
         backend.cleanup()
+        workspace_exists = workspace_dir.exists()
+        cleanup_ok = (
+            not workspace_exists
+            if CONFIG.sandbox_backend == "podman"
+            else True
+        )
         cleanup_payload = {
             "sandbox_id": backend.id,
             "workspace_dir": str(workspace_dir),
-            "workspace_exists_after_cleanup": workspace_dir.exists(),
+            "workspace_exists_after_cleanup": workspace_exists,
+            "cleanup_policy": CONFIG.sandbox_backend,
+            "cleanup_ok": cleanup_ok,
         }
         cleanup_path.write_text(
             json.dumps(cleanup_payload, ensure_ascii=False, indent=2),
@@ -1180,7 +1572,7 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
             encoding="utf-8",
         )
 
-    artifact_check = check_expected_artifacts(CONFIG.expected_artifacts)
+    artifact_check = check_expected_artifacts(effective_expected_artifacts)
     cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
     attempt_review_requests = DEEP_REVIEW_REQUESTS[review_start:]
     self_check_scripts = sorted(
@@ -1196,12 +1588,14 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
         "max_review_rounds": CONFIG.max_review_rounds,
         "runtime": {
             "host_os": CONFIG.host_os,
+            "sandbox_backend": CONFIG.sandbox_backend,
             "image": CONFIG.image,
             "podman_bin": CONFIG.podman_bin,
             "wsl_distro": CONFIG.wsl_distro if CONFIG.host_os == "windows" else None,
             "selinux_relabel": CONFIG.selinux_relabel,
         },
-        "expected_artifacts": CONFIG.expected_artifacts,
+        "expected_artifacts": effective_expected_artifacts,
+        "configured_final_artifacts": CONFIG.expected_artifacts,
         "parent_provided_expected_artifacts": expected_artifacts,
         "artifact_check": artifact_check,
         "deep_error": deep_error,
@@ -1220,7 +1614,7 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     evaluation["ok"] = (
         artifact_check["ok"]
         and deep_error is None
-        and cleanup.get("workspace_exists_after_cleanup") is False
+        and cleanup.get("cleanup_ok") is True
     )
     evaluation_path.write_text(
         json.dumps(evaluation, ensure_ascii=False, indent=2),
@@ -1239,38 +1633,54 @@ def run_parent_agent() -> dict[str, Any]:
         raise RuntimeError("Runner config is not initialized.")
 
     parent_prompt = build_parent_prompt()
-    (CONFIG.output_dir / "parent_prompt.txt").write_text(parent_prompt, encoding="utf-8")
-    (CONFIG.output_dir / "input_manifest.json").write_text(
+    (CONFIG.runner_log_dir / "parent_prompt.txt").write_text(parent_prompt, encoding="utf-8")
+    (CONFIG.runner_log_dir / "input_manifest.json").write_text(
         json.dumps(input_manifest(), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
+    parent_tools = [
+        run_deep_agent_task,
+        run_output_gate,
+        inspect_gate_manifest,
+        list_exported_files,
+        read_exported_file,
+        inspect_exported_artifacts,
+        list_quarantine_metadata,
+    ]
+    if CONFIG.allow_raw_parent_inspection:
+        parent_tools.extend(
+            [
+                list_sandbox_files,
+                read_sandbox_file,
+                inspect_sandbox_file,
+                inspect_sandbox_image,
+                inspect_expected_artifacts,
+                inspect_self_check_artifacts,
+            ]
+        )
+
     parent_agent = create_agent(
         model=CONFIG.parent_model,
-        tools=[
-            run_deep_agent_task,
-            list_sandbox_files,
-            read_sandbox_file,
-            inspect_sandbox_file,
-            inspect_sandbox_image,
-            inspect_expected_artifacts,
-            inspect_self_check_artifacts,
-        ],
+        tools=parent_tools,
         system_prompt=(
             "You are a parent HITL reviewer and orchestrator. The Deep Agent does the "
             "implementation and must explicitly request parent review by calling its "
             "request_parent_review tool. Do not edit files yourself and do not perform the "
             "implementation yourself. Required workflow: (1) call run_deep_agent_task, "
+            f"passing only output-gate allowed expected artifacts ({ALLOWED_EXPORT_EXTENSIONS_TEXT}), "
             "(2) check whether its result has review_requested=true, (3) if review was "
-            "requested, inspect the expected artifacts with inspect_expected_artifacts or "
-            "read_sandbox_file. Use read_sandbox_file with a question, or "
-            "inspect_sandbox_image, for semantic review of image artifacts when the user "
-            "task depends on visual content, and inspect the Deep "
-            "Agent's self-check artifacts with inspect_self_check_artifacts, (4) if self-check artifacts are missing, the "
-            "self-check did not execute, failures were ignored, or the inspected artifact "
-            "materially fails the user task, and at least one Deep Agent attempt remains, "
+            "requested, call run_output_gate for the declared review artifacts before "
+            "reading any produced files, (4) inspect the gate manifest and only read clean "
+            "exports with inspect_exported_artifacts, read_exported_file, or list_exported_files. "
+            "Do not read raw /outputs in production mode. If the gate rejects files, use "
+            "inspect_gate_manifest and list_quarantine_metadata to cite concrete findings, "
+            "then ask the Deep Agent to repair them. (5) If self-check report/plan are missing "
+            "from clean exports, the self-check did not execute, gate failures were ignored, "
+            "or the inspected clean artifact materially fails the user task, and at least one "
+            "Deep Agent attempt remains, "
             "call run_deep_agent_task again with concise correction instructions that include "
-            "your findings, (5) inspect again after every review "
+            "your findings, (6) run the output gate and inspect again after every review "
             "request, and close only when no material issues remain or no attempts remain. "
             "If the Deep Agent does not request review, treat that as a material protocol "
             "issue; if attempts remain, call run_deep_agent_task again instructing it to "
@@ -1278,8 +1688,9 @@ def run_parent_agent() -> dict[str, Any]:
             f"The maximum Deep Agent attempts is {CONFIG.max_review_rounds}. Never call "
             "run_deep_agent_task after the tool reports max_review_rounds_exceeded. "
             "In the final response, report attempts used, files inspected, material findings, "
-            "self-check status, remaining issues if any, whether the last Deep Agent attempt "
-            "requested review, and output paths. Keep claims tied to inspected evidence."
+            "gate status, self-check status, remaining issues if any, whether the last Deep "
+            "Agent attempt requested review, and clean export paths. Keep claims tied to "
+            "gate manifest and inspected clean-export evidence."
         ),
     )
     parent_result = parent_agent.invoke(
@@ -1291,14 +1702,14 @@ def run_parent_agent() -> dict[str, Any]:
     )
     messages = parent_result["messages"]
     parent_trace = trace_messages(messages, content_limit=2600)
-    (CONFIG.output_dir / "parent_agent_trace.json").write_text(
+    (CONFIG.runner_log_dir / "parent_agent_trace.json").write_text(
         json.dumps(parent_trace, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
     final_text = content_text(getattr(messages[-1], "content", ""))
     parent_tool_calls = [name for item in parent_trace for name in item.get("tool_calls", [])]
-    evaluation_path = CONFIG.output_dir / "parent_tool_evaluation.json"
+    evaluation_path = CONFIG.runner_log_dir / "parent_tool_evaluation.json"
     evaluation = json.loads(evaluation_path.read_text(encoding="utf-8")) if evaluation_path.exists() else {}
     review_rounds = list(DEEP_AGENT_EVALUATIONS)
     report = [
@@ -1339,7 +1750,7 @@ def run_parent_agent() -> dict[str, Any]:
         "```",
         "",
     ]
-    (CONFIG.output_dir / "parent_agent_report.md").write_text(
+    (CONFIG.runner_log_dir / "parent_agent_report.md").write_text(
         "\n".join(report),
         encoding="utf-8",
     )
@@ -1348,7 +1759,9 @@ def run_parent_agent() -> dict[str, Any]:
         "final_text": final_text,
         "evaluation": evaluation,
         "deep_agent_attempts": review_rounds,
-        "output_dir": str(CONFIG.output_dir),
+        "output_dir": str(CONFIG.run_root),
+        "raw_output_dir": str(CONFIG.output_dir),
+        "clean_export_dir": str(CONFIG.clean_export_dir),
     }
 
 
@@ -1392,6 +1805,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image", default="localhost/python-data-sandbox:latest")
     parser.add_argument(
+        "--sandbox-backend",
+        choices=["podman", "controller"],
+        default=os.getenv("SANDBOX_BACKEND", "podman"),
+        help="Sandbox backend. Use controller inside Docker Compose; use podman for direct host runs.",
+    )
+    parser.add_argument(
+        "--sandbox-controller-url",
+        default=os.getenv("SANDBOX_CONTROLLER_URL", ""),
+        help="sandbox-controller base URL for --sandbox-backend controller.",
+    )
+    parser.add_argument(
+        "--sandbox-controller-token",
+        default=os.getenv("SANDBOX_CONTROLLER_TOKEN", ""),
+        help="Bearer token for sandbox-controller, if configured.",
+    )
+    parser.add_argument(
         "--host-os",
         choices=["auto", "windows", "linux"],
         default="auto",
@@ -1433,6 +1862,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep the temporary staged input directory under work/ after the run.",
     )
+    parser.add_argument(
+        "--allow-raw-parent-inspection",
+        action="store_true",
+        help="Development-only: expose raw /outputs inspection tools to the parent agent.",
+    )
+    parser.add_argument(
+        "--xlsx-dangerous-formula-action",
+        choices=["reject", "stringify"],
+        default="reject",
+        help="Output-gate action for dangerous xlsx formulas. Default rejects for repair.",
+    )
     return parser.parse_args()
 
 
@@ -1450,13 +1890,21 @@ def main() -> None:
         if args.prompt_file
         else args.prompt
     )
-    output_dir = require_safe_output_dir((ROOT / args.output_dir).resolve() if not Path(args.output_dir).is_absolute() else Path(args.output_dir))
+    output_arg = Path(args.output_dir)
+    output_base = (
+        Path(os.getenv("RUNS_ROOT", "/srv/sandbox-tool/runs"))
+        if args.sandbox_backend == "controller"
+        else ROOT
+    )
+    run_root = require_safe_output_dir(
+        output_arg.resolve() if output_arg.is_absolute() else (output_base / output_arg).resolve(),
+        sandbox_backend=args.sandbox_backend,
+    )
     if not args.no_clear_output:
-        clear_directory_contents(output_dir)
+        clear_directory_contents(run_root)
+    run_dirs = prepare_run_directories(run_root)
 
-    staging_root = WORK_DIR / "generic_parent_runner_inputs"
-    staging_root.mkdir(parents=True, exist_ok=True)
-    input_dir = Path(tempfile.mkdtemp(prefix="input-", dir=staging_root)).resolve()
+    input_dir = run_dirs["input_dir"]
     input_mappings = stage_inputs(args.input, input_dir)
     skill_sources = stage_skill_sources(args.skill_source, input_dir)
     expected_artifacts = [
@@ -1466,8 +1914,14 @@ def main() -> None:
 
     CONFIG = RunnerConfig(
         prompt=prompt,
-        output_dir=output_dir,
+        run_root=run_dirs["run_root"],
+        output_dir=run_dirs["raw_output_dir"],
+        clean_export_dir=run_dirs["clean_export_dir"],
+        quarantine_dir=run_dirs["quarantine_dir"],
+        gate_log_dir=run_dirs["gate_log_dir"],
+        runner_log_dir=run_dirs["runner_log_dir"],
         input_dir=input_dir,
+        workspace_dir=run_dirs["workspace_dir"],
         input_mappings=input_mappings,
         expected_artifacts=expected_artifacts,
         skill_sources=skill_sources,
@@ -1484,6 +1938,11 @@ def main() -> None:
         selinux_relabel=args.selinux_relabel,
         clear_output=not args.no_clear_output,
         keep_staged_input=args.keep_staged_input,
+        allow_raw_parent_inspection=args.allow_raw_parent_inspection,
+        sandbox_backend=args.sandbox_backend,
+        sandbox_controller_url=args.sandbox_controller_url,
+        sandbox_controller_token=args.sandbox_controller_token,
+        xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
     )
 
     try:

@@ -1,7 +1,10 @@
 deepagents
+docker
+fastapi
 langchain
 langchain-openai
 openpyxl
 pillow
 pypdf
 python-dotenv
+uvicorn[standard]

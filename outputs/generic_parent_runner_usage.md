@@ -13,17 +13,22 @@ The runner does:
 - Give the Deep Agent a `request_parent_review` HITL tool.
 - Require the Deep Agent to create and run task-specific self-check artifacts
   before requesting parent review.
-- Give the parent generic file-inspection tools for `/input` and `/outputs`.
+- Give the parent output-gate tools for final artifacts and clean export
+  inspection.
+- Optionally give the parent raw file-inspection tools for `/input` and
+  `/outputs` when `--allow-raw-parent-inspection` is set.
 - Give the parent and Deep Agent a `read_sandbox_file` tool that uses one
   entrypoint for text, CSV, JSON, Excel, PDF, image metadata, and optional
   image vision reads.
 - Give the parent and Deep Agent a generic `inspect_sandbox_image` tool for
   focused vision review of images under `/input` and `/outputs`.
-- Let the parent inspect artifacts after the Deep Agent requests review.
+- Let the parent run the deterministic output gate after the Deep Agent requests
+  review, then inspect clean `/exports` artifacts.
 - Let the parent request bounded repair attempts from the Deep Agent until
   findings are resolved or the attempt limit is reached.
 - Check expected artifact existence.
-- Map `/outputs/...` sandbox paths to host output paths.
+- Map `/outputs/...` sandbox paths to `raw_outputs/` and `/exports/...` to
+  `clean_exports/` in the host run directory.
 - Confirm sandbox cleanup.
 - Save traces and evaluation JSON.
 
@@ -36,21 +41,29 @@ The runner does not:
 - Tune the prompt after looking at the result.
 - Contain task-specific acceptance criteria.
 
+The runner uses a three-zone artifact layout under `--output-dir`:
+
+- `input/`: staged input files.
+- `raw_outputs/`: raw Deep Agent output mapped from sandbox `/outputs`.
+- `clean_exports/`: files that passed or were sanitized by the output gate,
+  exposed to the parent as `/exports`.
+- `quarantine/`: rejected raw files.
+- `gate_logs/`: deterministic gate manifests.
+- `runner_logs/`: parent/deep traces and evaluation metadata.
+
 The Deep Agent is instructed to call `request_parent_review` after it has produced
 or updated the expected artifacts and completed self-check. The required
 self-check artifacts are:
 
 - `/outputs/self_check_plan.md`
-- `/outputs/self_check.py`, `/outputs/self_check.js`, or another `self_check.*`
-  executable/check script
 - `/outputs/self_check_report.md`
 
-The Deep Agent designs these checks itself for the task. The parent then reads
-generic file facts through `read_sandbox_file`, such as text previews, CSV
-previews, JSON structure, workbook sheet previews, PDF page text previews, image
-metadata, and the self-check report. It decides whether the artifact still
-materially fails the user task and, if so, sends corrective instructions back to
-the Deep Agent. The parent is still not allowed to edit files directly.
+The Deep Agent designs and executes checks itself for the task, but executable
+self-check scripts are not final export artifacts. The parent calls
+`run_output_gate` for declared final artifacts, then reads generic file facts
+from `/exports`. It decides whether the artifact still materially fails the user
+task and, if so, sends corrective instructions back to the Deep Agent. The
+parent is still not allowed to edit files directly.
 
 For image-understanding tasks, the Deep Agent can call `read_sandbox_file` with
 a `question` on an image path, or call `inspect_sandbox_image` directly after it
@@ -69,13 +82,15 @@ python outputs/generic_parent_runner.py `
   --expected-artifact /outputs/result.xlsx `
   --output-dir outputs/my_generic_run `
   --max-review-rounds 2 `
-  --parent-recursion-limit 12
+  --parent-recursion-limit 12 `
+  --xlsx-dangerous-formula-action reject
 ```
 
 Linux / RedHat native Podman:
 
 ```bash
 python outputs/generic_parent_runner.py \
+  --sandbox-backend podman \
   --host-os linux \
   --podman-bin podman \
   --selinux-relabel \
@@ -85,7 +100,23 @@ python outputs/generic_parent_runner.py \
   --expected-artifact /outputs/result.xlsx \
   --output-dir outputs/my_generic_run \
   --max-review-rounds 2 \
-  --parent-recursion-limit 12
+  --parent-recursion-limit 12 \
+  --xlsx-dangerous-formula-action reject
+```
+
+Docker Compose controller backend:
+
+```bash
+docker compose --env-file .env.local exec agent-app \
+  python outputs/generic_parent_runner.py \
+    --sandbox-backend controller \
+    --sandbox-controller-url http://sandbox-controller:8080 \
+    --prompt-file /inputs/task_prompt.txt \
+    --input /inputs/source.xlsx=/input/source.xlsx \
+    --expected-artifact /outputs/result.xlsx \
+    --output-dir run1 \
+    --max-review-rounds 2 \
+    --parent-recursion-limit 12
 ```
 
 ## Arguments
@@ -98,6 +129,13 @@ python outputs/generic_parent_runner.py \
   with `skills=["/input/skills"]`.
 - `--expected-artifact`: repeatable expected artifact path under `/outputs`.
 - `--output-dir`: host output directory under this workspace's `outputs/`.
+  This is now the run root; raw output is stored in `raw_outputs/`, clean output
+  in `clean_exports/`, and logs in `runner_logs/` and `gate_logs/`.
+- `--image`: sandbox image. Default is `localhost/python-data-sandbox:latest`.
+- `--sandbox-backend`: `podman` for direct host runs, `controller` for Docker
+  Compose runs where agent-app calls sandbox-controller over HTTP.
+- `--sandbox-controller-url`: controller base URL for `--sandbox-backend controller`.
+- `--sandbox-controller-token`: optional bearer token for controller API.
 - `--host-os`: `auto`, `windows`, or `linux`. `windows` uses WSL Podman;
   `linux` uses native Podman directly.
 - `--wsl-distro`: WSL distribution name for `--host-os windows`.
@@ -109,6 +147,12 @@ python outputs/generic_parent_runner.py \
 - `--parent-recursion-limit`: parent agent graph recursion limit. Use a small value
   such as `6` for generate+inspect+final only; use a larger value such as `10-12`
   if one repair round should fit.
+- `--allow-raw-parent-inspection`: expose raw `/input` and `/outputs` inspection
+  tools to the parent. Omit this for production-style runs where final artifacts
+  must pass through the output gate first.
+- `--xlsx-dangerous-formula-action`: `reject` keeps formulas but rejects
+  dangerous/external ones; `stringify` prefixes only dangerous formulas with an
+  apostrophe while preserving ordinary formulas.
 
 ## Evaluation Contract
 
@@ -118,7 +162,7 @@ The generic machine-readable pass/fail result is still intentionally narrow:
 ok =
   all expected artifacts exist
   and Deep Agent did not raise an exception
-  and sandbox workspace was cleaned up
+  and backend cleanup succeeded
 ```
 
 The parent final response now includes a separate evidence-based review summary
@@ -145,8 +189,7 @@ python outputs/generic_parent_runner.py `
   --input "C:\Users\nyham\Downloads\test03.png=/input/test03.png" `
   --skill-source outputs/skills=/input/skills `
   --expected-artifact /outputs/seal_surname_identification_report.md `
-  --expected-artifact /outputs/seal_surname_identification_summary.json `
-  --expected-artifact /outputs/seal_surname_identification_contact_sheet.png `
+  --expected-artifact /outputs/seal_surname_identification_summary.csv `
   --output-dir outputs/seal_surname_identification_with_skill `
   --max-review-rounds 2
 ```
@@ -155,3 +198,6 @@ Deep Agents loads only the skill metadata at startup. When the task mentions
 `印鑑`, `はんこ`, `判子`, `印影`, `hanko`, `inkan`, or red seal images, it should
 read `/input/skills/seal-surname-identification/SKILL.md` and can execute the
 helper script under `/input/skills/seal-surname-identification/scripts/`.
+Generated contact sheets or crops may still be helper files under `/outputs`,
+but they are not reviewed/exported artifacts unless raw parent inspection is
+explicitly enabled.
