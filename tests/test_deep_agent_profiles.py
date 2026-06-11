@@ -101,6 +101,8 @@ class DeepAgentProfileTests(unittest.TestCase):
         by_id = {profile.id: profile for profile in profiles}
 
         self.assertIn("browser_validation", by_id)
+        self.assertIn("browser_research", by_id)
+        self.assertIn("site_research", by_id)
         self.assertEqual(
             by_id["browser_validation"].image,
             "localhost/python-browser-sandbox:latest",
@@ -109,6 +111,125 @@ class DeepAgentProfileTests(unittest.TestCase):
             by_id["browser_validation"].tool_name,
             "run_browser_validation_agent",
         )
+        self.assertEqual(
+            by_id["site_research"].tool_name,
+            "run_site_research_agent",
+        )
+        self.assertEqual(
+            by_id["browser_research"].tool_name,
+            "run_browser_research_agent",
+        )
+        self.assertIn("crawl_allowed_site", by_id["site_research"].system_prompt)
+        self.assertNotIn(
+            "search_houjin_bangou_by_name",
+            by_id["site_research"].system_prompt,
+        )
+        self.assertIn("run_playwright_task", by_id["browser_research"].system_prompt)
+        self.assertNotIn("run_browser_use_task", by_id["browser_research"].system_prompt)
+        self.assertIn("egress guarded", by_id["browser_research"].system_prompt)
+
+    def test_browser_use_domain_validation_requires_public_allowlist(self) -> None:
+        self.assertEqual(
+            runner.validate_browser_use_allowed_domains(["houjin-bangou.nta.go.jp"]),
+            ["houjin-bangou.nta.go.jp"],
+        )
+        self.assertEqual(
+            runner.validate_browser_use_allowed_domains(["*.example.com"]),
+            ["*.example.com"],
+        )
+        with self.assertRaises(ValueError):
+            runner.validate_browser_use_allowed_domains([])
+        with self.assertRaises(ValueError):
+            runner.validate_browser_use_allowed_domains(["localhost"])
+        with self.assertRaises(ValueError):
+            runner.validate_browser_use_allowed_domains(["example.*"])
+
+    def test_browser_use_model_normalization_strips_provider_prefix(self) -> None:
+        self.assertEqual(runner.normalize_browser_use_model("openai:gpt-5.2"), "gpt-5.2")
+        self.assertEqual(runner.normalize_browser_use_model("gpt-5-mini"), "gpt-5-mini")
+
+    def test_playwright_url_allowlist_blocks_private_and_cross_domain(self) -> None:
+        domains = runner.validate_public_allowed_domains(
+            ["houjin-bangou.nta.go.jp", "*.example.com"],
+            tool_name="Playwright",
+        )
+        self.assertTrue(
+            runner.is_url_allowed_by_domains(
+                "https://www.example.com/path",
+                domains,
+            )
+        )
+        self.assertTrue(
+            runner.is_url_allowed_by_domains(
+                "https://houjin-bangou.nta.go.jp/",
+                domains,
+            )
+        )
+        self.assertFalse(
+            runner.is_url_allowed_by_domains(
+                "https://evil.example.net/",
+                domains,
+            )
+        )
+        with self.assertRaises(ValueError):
+            runner.validate_public_allowed_domains(["localhost"], tool_name="Playwright")
+
+    def test_playwright_egress_allows_short_search_values(self) -> None:
+        runner.validate_playwright_steps_egress(
+            [
+                {"action": "fill", "selector": "#corp_name", "value": "Toyota Motor Corporation"},
+                {"action": "fill", "selector": "#corp_name", "value": "トヨタ自動車"},
+                {"action": "goto", "url": "https://www.houjin-bangou.nta.go.jp/kensaku-kekka.html?selHouzinNo=9180001059935"},
+                {"action": "press", "selector": "#corp_name", "key": "Enter"},
+            ],
+            allowed_domains=["www.houjin-bangou.nta.go.jp"],
+        )
+
+    def test_playwright_egress_rejects_large_or_secret_fill_values(self) -> None:
+        with self.assertRaises(ValueError):
+            runner.validate_playwright_steps_egress(
+                [{"action": "fill", "selector": "textarea", "value": "x" * 121}],
+                allowed_domains=["example.com"],
+            )
+        with self.assertRaises(ValueError):
+            runner.validate_playwright_steps_egress(
+                [
+                    {
+                        "action": "fill",
+                        "selector": "input",
+                        "value": "OPENAI_API_KEY=sk-proj-" + "A" * 40,
+                    }
+                ],
+                allowed_domains=["example.com"],
+            )
+        with self.assertRaises(ValueError):
+            runner.validate_playwright_steps_egress(
+                [
+                    {
+                        "action": "fill",
+                        "selector": "input",
+                        "value": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/==",
+                    }
+                ],
+                allowed_domains=["example.com"],
+            )
+
+    def test_playwright_egress_rejects_long_query_and_unsafe_key(self) -> None:
+        with self.assertRaises(ValueError):
+            runner.validate_playwright_steps_egress(
+                [
+                    {
+                        "action": "goto",
+                        "url": "https://example.com/search?q=" + ("x" * 181),
+                    }
+                ],
+                allowed_domains=["example.com"],
+            )
+        with self.assertRaises(ValueError):
+            runner.validate_playwright_steps_egress(
+                [{"action": "press", "key": "Control+V"}],
+                allowed_domains=["example.com"],
+            )
 
 
 if __name__ == "__main__":

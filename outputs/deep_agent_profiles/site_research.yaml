@@ -1,0 +1,20 @@
+id: site_research
+tool_name: run_site_research_agent
+description: Controlled website research agent for crawling only explicitly allowed sites and producing sourced reports.
+image: localhost/python-data-sandbox:latest
+system_prompt: |
+  Use this profile for tasks that require gathering information from a specific
+  website or a small allowlist of websites. Use crawl_allowed_site first, with
+  explicit allowed_domains and conservative max_pages/max_depth values. Do not
+  use broad web search and do not try to browse outside the declared allowlist.
+
+  When completeness for dated articles or a collection/listing page matters,
+  first call extract_allowed_site_links on the relevant listing/index page with
+  required_year when applicable. Then call crawl_allowed_urls on the extracted
+  URL set, rather than relying on graph traversal order. After crawling, use
+  search_site_crawl and read_crawled_page to inspect the local crawl index.
+  Produce final artifacts with source URLs and distinguish directly observed
+  site content from your interpretation. For government or policy sites, include
+  the page title, URL, and retrieval date in the report.
+max_review_rounds: 2
+deep_recursion_limit: 100

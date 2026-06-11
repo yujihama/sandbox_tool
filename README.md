@@ -153,7 +153,31 @@ Each profile can define:
   overrides for that worker profile.
 
 The included examples cover quick checks, heavier statistical analysis,
-document/artifact generation, seal-image reading, and local browser validation.
+document/artifact generation, seal-image reading, local browser validation,
+controlled site-limited research, and interactive browser research.
+
+The `site_research` profile is for tasks such as "crawl this specific public
+website and summarize the relevant policy/support information." It does not
+provide broad web search. The Deep Agent receives controlled tools that enforce
+allowed domains, page/depth limits, response-size limits, and robots.txt before
+writing a local crawl index under `/outputs/_site_crawl/<crawl_id>/`. Use this
+profile when you want the agent to gather information from a specified site
+without relying on a search API or a metasearch engine.
+
+For listing pages, the agent can call `extract_allowed_site_links` before
+crawling. The extractor supports reusable filters for `required_year`,
+`required_month`, `date_from`, `date_to`, text/URL include/exclude regexes, CSS
+selectors, URL substrings, allowed extensions, and maximum link count. Use
+`crawl_allowed_urls` on that extracted explicit URL set when coverage matters.
+
+The `browser_research` profile is for rendered and interactive public sites
+that require JavaScript, form submission, clicks, or CSRF-managed browser flows.
+It exposes the generic deterministic `run_playwright_task` tool with an explicit
+`allowed_domains` allowlist and egress guard. The guard rejects long form/query
+values, secret/path-like strings, high-entropy encoded payloads, and structured
+payload-like values. The tool does not implement file upload actions. Results
+are saved under `/outputs/_playwright/<run_id>/` for later inspection by the
+Deep Agent and parent reviewer.
 
 ## Linux / RedHat
 

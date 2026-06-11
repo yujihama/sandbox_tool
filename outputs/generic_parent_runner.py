@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import json
+import math
 import mimetypes
 import os
 import posixpath
@@ -12,9 +14,10 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +44,22 @@ from sandbox_tool.output_gate import (  # noqa: E402
     ALLOWED_EXTENSIONS,
     run_output_gate as run_output_gate_artifacts,
     sha256_file,
+)
+from sandbox_tool.houjin_bangou import (  # noqa: E402
+    HoujinBangouSearchPolicy,
+    run_houjin_bangou_search,
+)
+from sandbox_tool.site_crawler import (  # noqa: E402
+    CrawlPolicy,
+    LinkExtractPolicy,
+    extract_links_from_listing,
+    is_private_or_local_host,
+    list_crawls as list_site_crawl_runs,
+    normalize_domain,
+    read_crawled_page as read_site_crawl_page,
+    run_site_crawl,
+    run_url_crawl,
+    search_crawl as search_site_crawl_index,
 )
 
 
@@ -720,7 +739,11 @@ def build_parent_prompt() -> str:
         + ALLOWED_EXPORT_EXTENSIONS_TEXT
         + "\nDo not ask the Deep Agent to create final or review artifacts with any "
         "other extension. Helper scripts or working files may exist under /outputs, "
-        "but they must not be passed as expected_artifacts or request_parent_review artifacts."
+        "but they must not be passed as expected_artifacts or request_parent_review artifacts. "
+        "When you call a Deep Agent profile tool, pass the configured final artifacts "
+        "exactly as expected_artifacts. If you ask for additional self-check plan/report "
+        "review artifacts, place them under /outputs/subtasks/ and include them in the "
+        "Deep Agent task text, not as root-level expected_artifacts."
         + deep_agent_profile_prompt_section()
         + f"\n\n{attempt_limit_text}"
         + "\n\nUser task:\n"
@@ -1264,6 +1287,1248 @@ def read_sandbox_file(
     return result
 
 
+@tool
+def crawl_allowed_site(
+    start_url: str,
+    allowed_domains: list[str] | None = None,
+    max_pages: int = 40,
+    max_depth: int = 2,
+    path_prefixes: list[str] | None = None,
+    exclude_url_patterns: list[str] | None = None,
+    request_delay_seconds: float = 0.25,
+    max_bytes_per_url: int = 2_000_000,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Crawl a specific public website within an explicit domain/path allowlist.
+
+    This is a controlled site-research tool, not a general web search tool.
+    It only fetches http(s) URLs whose final URL remains inside allowed_domains.
+    Private, loopback, and local hosts are rejected by default. Results are
+    stored under /outputs/_site_crawl/<crawl_id>/ for later search and reading.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        policy = CrawlPolicy(
+            start_url=start_url,
+            allowed_domains=allowed_domains or [],
+            max_pages=max_pages,
+            max_depth=max_depth,
+            path_prefixes=path_prefixes or [],
+            exclude_url_patterns=exclude_url_patterns or [],
+            request_delay_seconds=request_delay_seconds,
+            max_bytes_per_url=max_bytes_per_url,
+            respect_robots_txt=respect_robots_txt,
+        )
+        crawl = run_site_crawl(CONFIG.output_dir, policy)
+        manifest = crawl["manifest"]
+        crawl_id = manifest["crawl_id"]
+        virtual_root = f"/outputs/_site_crawl/{crawl_id}"
+        return {
+            "ok": True,
+            "crawl_id": crawl_id,
+            "pages_fetched": manifest["pages_fetched"],
+            "skipped_count": manifest["skipped_count"],
+            "allowed_domains": manifest["allowed_domains"],
+            "virtual_root": virtual_root,
+            "manifest_path": f"{virtual_root}/crawl_manifest.json",
+            "summary_path": f"{virtual_root}/crawl_summary.md",
+            "pages_jsonl_path": f"{virtual_root}/pages.jsonl",
+            "sqlite_index_path": f"{virtual_root}/site_index.sqlite",
+            "first_pages": crawl["records"][:10],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "start_url": start_url,
+        }
+
+
+@tool
+def extract_allowed_site_links(
+    list_url: str,
+    allowed_domains: list[str] | None = None,
+    path_prefixes: list[str] | None = None,
+    required_year: int | None = None,
+    required_month: int | None = None,
+    date_from: str = "",
+    date_to: str = "",
+    include_text_patterns: list[str] | None = None,
+    exclude_text_patterns: list[str] | None = None,
+    include_url_patterns: list[str] | None = None,
+    exclude_url_patterns: list[str] | None = None,
+    css_selector: str = "",
+    allowed_extensions: list[str] | None = None,
+    url_contains: str = "",
+    max_links: int = 300,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Extract allowed links from a listing/index page with structured filters.
+
+    Use this before crawling article collections when completeness matters. It
+    fetches only the listing URL, parses anchors, filters links by allowed
+    domain/path, date, text/URL regex, CSS selector, and extension rules, then
+    stores the extracted link set under
+    /outputs/_site_crawl/_link_extract/<extract_id>/links.json.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        policy = LinkExtractPolicy(
+            list_url=list_url,
+            allowed_domains=allowed_domains or [],
+            path_prefixes=path_prefixes or [],
+            required_year=required_year,
+            required_month=required_month,
+            date_from=date_from,
+            date_to=date_to,
+            include_text_patterns=include_text_patterns or [],
+            exclude_text_patterns=exclude_text_patterns or [],
+            include_url_patterns=include_url_patterns or [],
+            exclude_url_patterns=exclude_url_patterns or [],
+            css_selector=css_selector,
+            allowed_extensions=allowed_extensions or [],
+            url_contains=url_contains,
+            max_links=max_links,
+            respect_robots_txt=respect_robots_txt,
+        )
+        result = extract_links_from_listing(CONFIG.output_dir, policy)
+        manifest = result["manifest"]
+        extract_id = manifest["extract_id"]
+        virtual_root = f"/outputs/_site_crawl/_link_extract/{extract_id}"
+        return {
+            "ok": True,
+            "extract_id": extract_id,
+            "link_count": manifest["link_count"],
+            "list_url": manifest["list_url"],
+            "required_year": manifest["required_year"],
+            "required_month": manifest["required_month"],
+            "date_from": manifest["date_from"],
+            "date_to": manifest["date_to"],
+            "virtual_root": virtual_root,
+            "links_json_path": f"{virtual_root}/links.json",
+            "links": manifest["links"][: max(1, min(max_links, 300))],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "list_url": list_url,
+        }
+
+
+@tool
+def crawl_allowed_urls(
+    urls: list[str],
+    allowed_domains: list[str] | None = None,
+    path_prefixes: list[str] | None = None,
+    request_delay_seconds: float = 0.25,
+    max_bytes_per_url: int = 2_000_000,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Crawl an explicit list of allowed URLs and build a local site index.
+
+    Use this after extract_allowed_site_links when collection completeness
+    matters more than graph traversal order.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        policy = CrawlPolicy(
+            start_url=urls[0] if urls else "",
+            allowed_domains=allowed_domains or [],
+            max_pages=len(urls),
+            max_depth=0,
+            path_prefixes=path_prefixes or [],
+            request_delay_seconds=request_delay_seconds,
+            max_bytes_per_url=max_bytes_per_url,
+            respect_robots_txt=respect_robots_txt,
+        )
+        crawl = run_url_crawl(CONFIG.output_dir, urls, policy)
+        manifest = crawl["manifest"]
+        crawl_id = manifest["crawl_id"]
+        virtual_root = f"/outputs/_site_crawl/{crawl_id}"
+        return {
+            "ok": True,
+            "crawl_id": crawl_id,
+            "pages_fetched": manifest["pages_fetched"],
+            "skipped_count": manifest["skipped_count"],
+            "allowed_domains": manifest["allowed_domains"],
+            "virtual_root": virtual_root,
+            "manifest_path": f"{virtual_root}/crawl_manifest.json",
+            "summary_path": f"{virtual_root}/crawl_summary.md",
+            "pages_jsonl_path": f"{virtual_root}/pages.jsonl",
+            "sqlite_index_path": f"{virtual_root}/site_index.sqlite",
+            "first_pages": crawl["records"][:10],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "url_count": len(urls),
+        }
+
+
+@tool
+def search_houjin_bangou_by_name(
+    query: str,
+    match_type: str = "prefix",
+    include_closed: bool = True,
+    max_results: int = 20,
+    try_name_variants: bool = True,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Search Japan's official Corporate Number Publication Site by company name.
+
+    Use this for tasks that ask whether a Japanese corporation exists on the
+    National Tax Agency Corporate Number Publication Site. Prefer
+    match_type="prefix" for full legal names, and use "partial" for broader
+    candidate discovery. If try_name_variants is true and the exact query has
+    no hits, the tool may retry common normalized variants such as removing a
+    leading legal designator, while still judging exact_matches against the
+    original query. The result includes exact_matches, candidate rows, search
+    attempts, and saved audit artifacts under
+    /outputs/_official_search/houjin_bangou/.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        result = run_houjin_bangou_search(
+            CONFIG.output_dir,
+            HoujinBangouSearchPolicy(
+                query=query,
+                match_type=match_type,
+                include_closed=include_closed,
+                max_results=max_results,
+                try_name_variants=try_name_variants,
+                respect_robots_txt=respect_robots_txt,
+            ),
+        )
+        return result
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "query": query,
+            "match_type": match_type,
+        }
+
+
+def browser_use_run_id(task: str, allowed_domains: list[str]) -> str:
+    digest = hashlib.sha256(
+        (task + "|" + "|".join(sorted(allowed_domains))).encode("utf-8")
+    ).hexdigest()[:10]
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}_{digest}"
+
+
+def browser_tool_run_id(prefix: str, task: str, allowed_domains: list[str]) -> str:
+    digest = hashlib.sha256(
+        (task + "|" + "|".join(sorted(allowed_domains))).encode("utf-8")
+    ).hexdigest()[:10]
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_-]+", "_", prefix.strip() or "browser").strip("_")
+    return f"{safe_prefix}_{timestamp}_{digest}"
+
+
+def normalize_browser_use_model(model: str) -> str:
+    cleaned = (model or "").strip()
+    if cleaned.startswith("openai:"):
+        return cleaned.split(":", 1)[1]
+    return cleaned or "gpt-5.2"
+
+
+def validate_browser_use_allowed_domains(allowed_domains: list[str] | None) -> list[str]:
+    if not allowed_domains:
+        raise ValueError("allowed_domains is required for browser-use tasks.")
+    normalized: list[str] = []
+    for item in allowed_domains:
+        raw = (item or "").strip()
+        if not raw:
+            continue
+        if "*" in raw and not raw.startswith("*.") and not raw.startswith("http*://"):
+            raise ValueError(f"Unsupported allowed domain wildcard: {raw}")
+        domain_part = raw
+        if "://" in domain_part:
+            parsed = urllib.parse.urlsplit(domain_part.replace("http*://", "https://", 1))
+            domain_part = parsed.hostname or ""
+        elif domain_part.startswith("*."):
+            domain_part = domain_part[2:]
+        if not domain_part:
+            raise ValueError(f"Invalid allowed domain: {raw}")
+        normalized_domain = normalize_domain(domain_part)
+        if is_private_or_local_host(normalized_domain):
+            raise ValueError(f"Private/local domains are not allowed for browser-use: {raw}")
+        normalized.append(raw)
+    if not normalized:
+        raise ValueError("allowed_domains is empty after normalization.")
+    return normalized
+
+
+def validate_public_allowed_domains(
+    allowed_domains: list[str] | None,
+    *,
+    tool_name: str,
+) -> list[str]:
+    if not allowed_domains:
+        raise ValueError(f"allowed_domains is required for {tool_name} tasks.")
+    normalized: list[str] = []
+    for item in allowed_domains:
+        raw = (item or "").strip()
+        if not raw:
+            continue
+        if "*" in raw and not raw.startswith("*.") and not raw.startswith("http*://"):
+            raise ValueError(f"Unsupported allowed domain wildcard: {raw}")
+        domain_part = raw
+        if "://" in domain_part:
+            parsed = urllib.parse.urlsplit(domain_part.replace("http*://", "https://", 1))
+            domain_part = parsed.hostname or ""
+        elif domain_part.startswith("*."):
+            domain_part = domain_part[2:]
+        if not domain_part:
+            raise ValueError(f"Invalid allowed domain: {raw}")
+        normalized_domain = normalize_domain(domain_part)
+        if is_private_or_local_host(normalized_domain):
+            raise ValueError(f"Private/local domains are not allowed for {tool_name}: {raw}")
+        normalized.append(raw)
+    if not normalized:
+        raise ValueError("allowed_domains is empty after normalization.")
+    return normalized
+
+
+def allowed_domain_matches(hostname: str, allowed_domain: str) -> bool:
+    raw = allowed_domain.strip().lower()
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(raw.replace("http*://", "https://", 1))
+        raw = parsed.hostname or ""
+    wildcard = raw.startswith("*.")
+    if wildcard:
+        raw = raw[2:]
+    host = normalize_domain(hostname)
+    domain = normalize_domain(raw)
+    if wildcard:
+        return host == domain or host.endswith("." + domain)
+    return host == domain
+
+
+def is_url_allowed_by_domains(url: str, allowed_domains: list[str]) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    hostname = parsed.hostname or ""
+    if not hostname or is_private_or_local_host(normalize_domain(hostname)):
+        return False
+    return any(allowed_domain_matches(hostname, domain) for domain in allowed_domains)
+
+
+def normalize_playwright_start_url(start_url: str, allowed_domains: list[str]) -> str:
+    url = (start_url or "").strip()
+    if not url:
+        raise ValueError("start_url is required.")
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Only http/https URLs are supported: {start_url}")
+    if not is_url_allowed_by_domains(url, allowed_domains):
+        raise ValueError(f"start_url is outside allowed_domains: {start_url}")
+    return url
+
+
+def limited_jsonable(value: Any, *, max_items: int = 30, max_chars: int = 4000) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:max_chars]
+    if isinstance(value, (list, tuple)):
+        return [limited_jsonable(item, max_items=max_items, max_chars=max_chars) for item in value[:max_items]]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_items:
+                break
+            result[str(key)] = limited_jsonable(item, max_items=max_items, max_chars=max_chars)
+        return result
+    return str(value)[:max_chars]
+
+
+def call_history_method(history: Any, name: str) -> Any:
+    method = getattr(history, name, None)
+    if not callable(method):
+        return None
+    try:
+        return limited_jsonable(method())
+    except Exception as exc:
+        return f"{exc.__class__.__name__}: {exc}"
+
+
+def compact_text(value: str, *, max_chars: int = 12000) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()[:max_chars]
+
+
+PLAYWRIGHT_MAX_FILL_CHARS = 120
+PLAYWRIGHT_MAX_SELECT_CHARS = 120
+PLAYWRIGHT_MAX_URL_CHARS = 2000
+PLAYWRIGHT_MAX_URL_QUERY_CHARS = 600
+PLAYWRIGHT_MAX_URL_VALUE_CHARS = 180
+PLAYWRIGHT_MAX_POST_CHARS = 5000
+PLAYWRIGHT_SAFE_KEYS = {
+    "Enter",
+    "Tab",
+    "Escape",
+    "Backspace",
+    "Delete",
+    "Space",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    "ArrowUp",
+    "Home",
+    "End",
+    "PageDown",
+    "PageUp",
+}
+PLAYWRIGHT_SECRET_PATTERNS = [
+    re.compile(pattern, re.I)
+    for pattern in (
+        r"-----BEGIN [A-Z ]{0,40}(PRIVATE KEY|SECRET|TOKEN)",
+        r"\b(sk|sk-proj|ghp|github_pat|xox[baprs])-[-_A-Za-z0-9]{20,}",
+        r"\b(AKIA|ASIA)[A-Z0-9]{16}\b",
+        r"\b(openai|api|access|refresh|secret|private|password|passwd|token|credential)[-_ ]?(key|token|secret|password)?\b\s*[:=]",
+        r"\b(input|outputs|workspace)/[^ \t\r\n]+",
+        r"[A-Za-z]:\\[^ \t\r\n]+",
+    )
+]
+
+
+def shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    counts: dict[str, int] = {}
+    for char in value:
+        counts[char] = counts.get(char, 0) + 1
+    total = len(value)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def looks_like_encoded_secret(value: str) -> bool:
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) < 32:
+        return False
+    if re.fullmatch(r"[A-Fa-f0-9]{48,}", compact):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9+/_=-]{48,}", compact) and shannon_entropy(compact) >= 4.4:
+        return True
+    if len(compact) >= 48 and shannon_entropy(compact) >= 4.8:
+        return True
+    return False
+
+
+def validate_playwright_egress_text(
+    value: Any,
+    *,
+    context: str,
+    max_chars: int,
+    allow_multiline: bool = False,
+) -> str:
+    text = "" if value is None else str(value)
+    if len(text) > max_chars:
+        raise ValueError(
+            f"Egress guard rejected {context}: value length {len(text)} exceeds {max_chars}."
+        )
+    if not allow_multiline and ("\n" in text or "\r" in text):
+        raise ValueError(f"Egress guard rejected {context}: multiline values are not allowed.")
+    if any(ord(char) < 32 and char not in "\t\n\r" for char in text):
+        raise ValueError(f"Egress guard rejected {context}: control characters are not allowed.")
+    stripped = text.strip()
+    if len(stripped) > 40 and stripped[0:1] in {"{", "[", "<"}:
+        raise ValueError(f"Egress guard rejected {context}: structured payload-like value.")
+    for pattern in PLAYWRIGHT_SECRET_PATTERNS:
+        if pattern.search(text):
+            raise ValueError(f"Egress guard rejected {context}: secret/path-like value.")
+    if looks_like_encoded_secret(text):
+        raise ValueError(f"Egress guard rejected {context}: encoded/high-entropy value.")
+    return text
+
+
+def validate_playwright_url_egress(url: str, *, context: str) -> None:
+    if len(url) > PLAYWRIGHT_MAX_URL_CHARS:
+        raise ValueError(
+            f"Egress guard rejected {context}: URL length {len(url)} exceeds {PLAYWRIGHT_MAX_URL_CHARS}."
+        )
+    parsed = urllib.parse.urlsplit(url)
+    query = parsed.query or ""
+    fragment = parsed.fragment or ""
+    if len(query) > PLAYWRIGHT_MAX_URL_QUERY_CHARS:
+        raise ValueError(
+            f"Egress guard rejected {context}: query length {len(query)} exceeds {PLAYWRIGHT_MAX_URL_QUERY_CHARS}."
+        )
+    if len(fragment) > PLAYWRIGHT_MAX_URL_VALUE_CHARS:
+        raise ValueError(
+            f"Egress guard rejected {context}: fragment length {len(fragment)} exceeds {PLAYWRIGHT_MAX_URL_VALUE_CHARS}."
+        )
+    if fragment:
+        validate_playwright_egress_text(
+            fragment,
+            context=f"{context} fragment",
+            max_chars=PLAYWRIGHT_MAX_URL_VALUE_CHARS,
+        )
+    for segment in parsed.path.split("/"):
+        if not segment:
+            continue
+        validate_playwright_egress_text(
+            urllib.parse.unquote_plus(segment),
+            context=f"{context} path segment",
+            max_chars=PLAYWRIGHT_MAX_URL_VALUE_CHARS,
+        )
+    for key, value in urllib.parse.parse_qsl(query, keep_blank_values=True):
+        validate_playwright_egress_text(
+            key,
+            context=f"{context} query key",
+            max_chars=80,
+        )
+        validate_playwright_egress_text(
+            value,
+            context=f"{context} query value",
+            max_chars=PLAYWRIGHT_MAX_URL_VALUE_CHARS,
+        )
+
+
+def step_fill_value(step: dict[str, Any]) -> Any:
+    value_source = step.get("value")
+    if value_source is None and step.get("input_text") is not None:
+        value_source = step.get("input_text")
+    if value_source is None and any(
+        step.get(key_name)
+        for key_name in (
+            "selector",
+            "role",
+            "label",
+            "placeholder",
+            "alt_text",
+            "title",
+        )
+    ):
+        value_source = step.get("text")
+    return value_source
+
+
+def validate_playwright_step_egress(
+    step: dict[str, Any],
+    *,
+    allowed_domains: list[str],
+    step_index: int,
+) -> None:
+    action = str(step.get("action") or "").strip().lower()
+    if action == "goto":
+        url = normalize_playwright_start_url(str(step.get("url") or ""), allowed_domains)
+        validate_playwright_url_egress(url, context=f"step {step_index} goto")
+    elif action == "fill":
+        validate_playwright_egress_text(
+            step_fill_value(step),
+            context=f"step {step_index} fill",
+            max_chars=PLAYWRIGHT_MAX_FILL_CHARS,
+        )
+    elif action == "select":
+        for key in ("value", "option_label"):
+            if step.get(key) is not None:
+                validate_playwright_egress_text(
+                    step.get(key),
+                    context=f"step {step_index} select {key}",
+                    max_chars=PLAYWRIGHT_MAX_SELECT_CHARS,
+                )
+    elif action == "press":
+        key = str(step.get("key") or "").strip()
+        if key and key not in PLAYWRIGHT_SAFE_KEYS:
+            raise ValueError(f"Egress guard rejected step {step_index}: unsupported key {key!r}.")
+
+
+def validate_playwright_steps_egress(
+    steps: list[dict[str, Any]],
+    *,
+    allowed_domains: list[str],
+) -> None:
+    for index, step in enumerate(steps, start=1):
+        validate_playwright_step_egress(
+            dict(step or {}),
+            allowed_domains=allowed_domains,
+            step_index=index,
+        )
+
+
+def playwright_locator(page: Any, target: dict[str, Any]) -> Any:
+    selector = str(target.get("selector") or "").strip()
+    if selector:
+        return page.locator(selector).first
+    role = str(target.get("role") or "").strip()
+    name = str(target.get("name") or "").strip()
+    if role and name:
+        return page.get_by_role(role, name=name, exact=False).first
+    label = str(target.get("label") or "").strip()
+    if label:
+        return page.get_by_label(label, exact=False).first
+    placeholder = str(target.get("placeholder") or "").strip()
+    if placeholder:
+        return page.get_by_placeholder(placeholder, exact=False).first
+    text = str(target.get("text") or "").strip()
+    if text:
+        return page.get_by_text(text, exact=False).first
+    alt_text = str(target.get("alt_text") or "").strip()
+    if alt_text:
+        return page.get_by_alt_text(alt_text, exact=False).first
+    title = str(target.get("title") or "").strip()
+    if title:
+        return page.get_by_title(title, exact=False).first
+    raise ValueError("Action target requires selector, role+name, label, placeholder, text, alt_text, or title.")
+
+
+def playwright_extract_page_state(page: Any, *, max_text_chars: int = 12000) -> dict[str, Any]:
+    def eval_all(selector: str, script: str, *, timeout_ms: int = 3000) -> Any:
+        try:
+            page.locator(selector).first.wait_for(state="attached", timeout=timeout_ms)
+        except Exception:
+            pass
+        try:
+            return limited_jsonable(page.locator(selector).evaluate_all(script), max_items=100)
+        except Exception as exc:
+            return {"error": f"{exc.__class__.__name__}: {exc}"}
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=4000)
+    except Exception:
+        body_text = ""
+
+    return {
+        "url": page.url,
+        "title": page.title(),
+        "text_preview": compact_text(body_text, max_chars=max_text_chars),
+        "links": eval_all(
+            "a",
+            """
+            els => els.slice(0, 120).map(a => ({
+              text: (a.innerText || a.textContent || '').trim().slice(0, 180),
+              href: a.href || a.getAttribute('href') || '',
+              title: a.getAttribute('title') || ''
+            }))
+            """,
+        ),
+        "inputs": eval_all(
+            "input, textarea, select",
+            """
+            els => els.slice(0, 120).map(el => ({
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type') || '',
+              name: el.getAttribute('name') || '',
+              id: el.getAttribute('id') || '',
+              placeholder: el.getAttribute('placeholder') || '',
+              aria_label: el.getAttribute('aria-label') || '',
+              value: el.value || '',
+              label: (() => {
+                if (el.labels && el.labels.length) {
+                  return Array.from(el.labels).map(l => l.innerText || l.textContent || '').join(' ').trim();
+                }
+                return '';
+              })()
+            }))
+            """,
+        ),
+        "buttons": eval_all(
+            "button, input[type=button], input[type=submit], input[type=reset], a[role=button]",
+            """
+            els => els.slice(0, 80).map(el => ({
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type') || '',
+              name: el.getAttribute('name') || '',
+              id: el.getAttribute('id') || '',
+              text: (el.innerText || el.value || el.textContent || '').trim().slice(0, 180),
+              aria_label: el.getAttribute('aria-label') || ''
+            }))
+            """,
+        ),
+        "forms": eval_all(
+            "form",
+            """
+            els => els.slice(0, 20).map(form => ({
+              method: form.getAttribute('method') || 'get',
+              action: form.action || form.getAttribute('action') || '',
+              text: (form.innerText || form.textContent || '').trim().slice(0, 500),
+              inputs: Array.from(form.querySelectorAll('input, textarea, select')).slice(0, 60).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                type: el.getAttribute('type') || '',
+                name: el.getAttribute('name') || '',
+                id: el.getAttribute('id') || '',
+                placeholder: el.getAttribute('placeholder') || '',
+                value: el.value || ''
+              })),
+              buttons: Array.from(form.querySelectorAll('button, input[type=submit], input[type=button]')).slice(0, 30).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                type: el.getAttribute('type') || '',
+                text: (el.innerText || el.value || el.textContent || '').trim().slice(0, 180)
+              }))
+            }))
+            """,
+        ),
+        "tables": eval_all(
+            "table",
+            """
+            els => els.slice(0, 20).map(table => Array.from(table.querySelectorAll('tr')).slice(0, 12).map(row =>
+              Array.from(row.querySelectorAll('th,td')).slice(0, 12).map(cell =>
+                (cell.innerText || cell.textContent || '').trim().slice(0, 160)
+              )
+            ))
+            """,
+        ),
+    }
+
+
+def run_playwright_steps(
+    *,
+    start_url: str,
+    allowed_domains: list[str],
+    steps: list[dict[str, Any]],
+    output_dir: Path,
+    timeout_seconds: int,
+    capture_screenshot: bool,
+    max_text_chars: int,
+) -> dict[str, Any]:
+    import time
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError(
+            "playwright is not installed in the runner environment. "
+            "Install playwright and rebuild the agent image."
+        ) from exc
+
+    action_log: list[dict[str, Any]] = []
+    blocked_urls: list[str] = []
+    screenshots: list[str] = []
+    started = time.monotonic()
+    safe_timeout_ms = max(10, min(timeout_seconds, 240)) * 1000
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            viewport={"width": 1365, "height": 900},
+        )
+        page = context.new_page()
+        page.set_default_timeout(min(safe_timeout_ms, 30000))
+
+        def route_handler(route: Any) -> None:
+            request_url = route.request.url
+            if request_url.startswith(("data:", "blob:", "about:")):
+                route.continue_()
+                return
+            if is_url_allowed_by_domains(request_url, allowed_domains):
+                try:
+                    validate_playwright_url_egress(
+                        request_url,
+                        context=f"{route.request.method} request",
+                    )
+                    method = str(route.request.method or "GET").upper()
+                    if method not in {"GET", "HEAD", "OPTIONS"}:
+                        post_data = route.request.post_data or ""
+                        if len(post_data) > PLAYWRIGHT_MAX_POST_CHARS:
+                            raise ValueError(
+                                f"POST body length {len(post_data)} exceeds {PLAYWRIGHT_MAX_POST_CHARS}."
+                            )
+                except Exception as exc:
+                    blocked_urls.append(f"{request_url} [egress_guard: {exc}]")
+                    route.abort()
+                    return
+                route.continue_()
+                return
+            blocked_urls.append(request_url)
+            route.abort()
+
+        page.route("**/*", route_handler)
+
+        try:
+            page.goto(start_url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            action_log.append({"action": "goto", "url": start_url, "ok": True})
+
+            for index, raw_step in enumerate(steps[:20], start=1):
+                step = dict(raw_step or {})
+                action = str(step.get("action") or "").strip().lower()
+                if not action:
+                    raise ValueError(f"Step {index} missing action.")
+                log_item: dict[str, Any] = {"step": index, "action": action}
+                if action == "goto":
+                    url = normalize_playwright_start_url(str(step.get("url") or ""), allowed_domains)
+                    page.goto(url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
+                    log_item["url"] = url
+                elif action == "click":
+                    locator = playwright_locator(page, step)
+                    locator.click(timeout=min(safe_timeout_ms, 15000))
+                    log_item["target"] = limited_jsonable(step)
+                elif action == "fill":
+                    locator = playwright_locator(page, step)
+                    value = validate_playwright_egress_text(
+                        step_fill_value(step),
+                        context=f"step {index} fill",
+                        max_chars=PLAYWRIGHT_MAX_FILL_CHARS,
+                    )
+                    locator.fill(value, timeout=min(safe_timeout_ms, 15000))
+                    log_item["target"] = limited_jsonable({k: v for k, v in step.items() if k != "value"})
+                    log_item["value_length"] = len(value)
+                elif action == "press":
+                    key = str(step.get("key") or "").strip()
+                    if not key:
+                        raise ValueError(f"Step {index} press action requires key.")
+                    if any(step.get(key_name) for key_name in ("selector", "role", "label", "placeholder", "text", "alt_text", "title")):
+                        playwright_locator(page, step).press(key, timeout=min(safe_timeout_ms, 15000))
+                    else:
+                        page.keyboard.press(key)
+                    log_item["key"] = key
+                elif action == "select":
+                    locator = playwright_locator(page, step)
+                    value = step.get("value")
+                    label = step.get("option_label")
+                    index_value = step.get("option_index")
+                    if label is not None:
+                        selected = locator.select_option(label=str(label), timeout=min(safe_timeout_ms, 15000))
+                    elif index_value is not None:
+                        selected = locator.select_option(index=int(index_value), timeout=min(safe_timeout_ms, 15000))
+                    else:
+                        selected = locator.select_option(value=str(value), timeout=min(safe_timeout_ms, 15000))
+                    log_item["selected"] = limited_jsonable(selected)
+                elif action == "wait":
+                    milliseconds = int(step.get("milliseconds") or 1000)
+                    page.wait_for_timeout(max(0, min(milliseconds, 10000)))
+                    log_item["milliseconds"] = milliseconds
+                elif action == "wait_for_selector":
+                    selector = str(step.get("selector") or "").strip()
+                    if not selector:
+                        raise ValueError(f"Step {index} wait_for_selector requires selector.")
+                    page.locator(selector).first.wait_for(timeout=min(safe_timeout_ms, 15000))
+                    log_item["selector"] = selector
+                elif action == "wait_for_text":
+                    text = str(step.get("text") or "").strip()
+                    if not text:
+                        raise ValueError(f"Step {index} wait_for_text requires text.")
+                    page.get_by_text(text, exact=False).first.wait_for(timeout=min(safe_timeout_ms, 15000))
+                    log_item["text"] = text
+                elif action == "screenshot":
+                    screenshot_name = f"screenshot_{index:02d}.png"
+                    page.screenshot(path=str(output_dir / screenshot_name), full_page=bool(step.get("full_page", True)))
+                    screenshots.append(screenshot_name)
+                    log_item["screenshot"] = screenshot_name
+                elif action == "extract_text":
+                    if any(step.get(key_name) for key_name in ("selector", "role", "label", "placeholder", "text", "alt_text", "title")):
+                        extracted = playwright_locator(page, step).inner_text(timeout=min(safe_timeout_ms, 15000))
+                    else:
+                        extracted = page.locator("body").inner_text(timeout=min(safe_timeout_ms, 15000))
+                    log_item["text_preview"] = compact_text(extracted, max_chars=4000)
+                else:
+                    raise ValueError(f"Unsupported Playwright action: {action}")
+
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=3000)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                log_item["ok"] = True
+                log_item["url"] = page.url
+                action_log.append(log_item)
+
+            if capture_screenshot:
+                screenshot_name = "final.png"
+                page.screenshot(path=str(output_dir / screenshot_name), full_page=True)
+                screenshots.append(screenshot_name)
+
+            page_state = playwright_extract_page_state(page, max_text_chars=max_text_chars)
+        finally:
+            context.close()
+            browser.close()
+
+    return {
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "actions": action_log,
+        "blocked_urls": blocked_urls[:200],
+        "blocked_url_count": len(blocked_urls),
+        "screenshots": screenshots,
+        "page": page_state,
+    }
+
+
+@tool
+def run_playwright_task(
+    task: str,
+    start_url: str,
+    allowed_domains: list[str],
+    steps: list[dict[str, Any]] | None = None,
+    timeout_seconds: int = 120,
+    capture_screenshot: bool = False,
+    max_text_chars: int = 12000,
+) -> dict[str, Any]:
+    """Run a deterministic Playwright browser task with restricted actions.
+
+    Use this for interactive public sites. It is not arbitrary code execution
+    and it is not broad web search. Provide a start_url and explicit
+    allowed_domains. Optional steps may include:
+    goto, click, fill, press, select, wait, wait_for_selector, wait_for_text,
+    extract_text, and screenshot. Targets can use selector, role+name, label,
+    placeholder, text, alt_text, or title. For fill actions, pass value or
+    input_text; text is also accepted as the fill value when another target
+    field such as selector or placeholder is present. Egress guard rejects long
+    values, secret/path-like strings, high-entropy encoded payloads, structured
+    payload-like values, and long URL query/fragment values. File upload actions
+    are not supported. Results are saved under /outputs/_playwright/<run_id>/
+    result.json and summary.md.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    run_id = ""
+    try:
+        safe_domains = validate_public_allowed_domains(allowed_domains, tool_name="Playwright")
+        safe_start_url = normalize_playwright_start_url(start_url, safe_domains)
+        validate_playwright_url_egress(safe_start_url, context="start_url")
+        limited_steps = list(steps or [])[:20]
+        validate_playwright_steps_egress(limited_steps, allowed_domains=safe_domains)
+        run_id = browser_tool_run_id("playwright", task + "|" + safe_start_url, safe_domains)
+        playwright_dir = CONFIG.output_dir / "_playwright" / run_id
+        playwright_dir.mkdir(parents=True, exist_ok=True)
+        result = run_playwright_steps(
+            start_url=safe_start_url,
+            allowed_domains=safe_domains,
+            steps=limited_steps,
+            output_dir=playwright_dir,
+            timeout_seconds=timeout_seconds,
+            capture_screenshot=capture_screenshot,
+            max_text_chars=max(1000, min(max_text_chars, 30000)),
+        )
+        virtual_root = f"/outputs/_playwright/{run_id}"
+        saved_result: dict[str, Any] = {
+            "ok": True,
+            "run_id": run_id,
+            "task": task,
+            "start_url": safe_start_url,
+            "allowed_domains": safe_domains,
+            "timeout_seconds": timeout_seconds,
+            "capture_screenshot": capture_screenshot,
+            "virtual_root": virtual_root,
+            **result,
+        }
+        (playwright_dir / "result.json").write_text(
+            json.dumps(saved_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        page = saved_result.get("page") or {}
+        summary = [
+            "# Playwright Task Summary",
+            "",
+            f"- Run ID: {run_id}",
+            f"- Start URL: {safe_start_url}",
+            f"- Current URL: {page.get('url') or ''}",
+            f"- Title: {page.get('title') or ''}",
+            f"- Allowed domains: {', '.join(safe_domains)}",
+            f"- Elapsed seconds: {saved_result.get('elapsed_seconds')}",
+            f"- Actions: {len(saved_result.get('actions') or [])}",
+            f"- Blocked external requests: {saved_result.get('blocked_url_count')}",
+            "",
+            "## Text Preview",
+            "",
+            str(page.get("text_preview") or "")[:12000],
+        ]
+        (playwright_dir / "summary.md").write_text("\n".join(summary), encoding="utf-8")
+        return {
+            **saved_result,
+            "result_json_path": f"{virtual_root}/result.json",
+            "summary_path": f"{virtual_root}/summary.md",
+            "screenshot_paths": [
+                f"{virtual_root}/{name}" for name in saved_result.get("screenshots", [])
+            ],
+        }
+    except Exception as exc:
+        if CONFIG is not None and run_id:
+            error_dir = CONFIG.output_dir / "_playwright" / run_id
+            error_dir.mkdir(parents=True, exist_ok=True)
+            (error_dir / "error.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                        "task": task,
+                        "start_url": start_url,
+                        "allowed_domains": allowed_domains,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "task": task[:1000],
+            "start_url": start_url,
+            "allowed_domains": allowed_domains,
+        }
+
+
+async def run_browser_use_agent_async(
+    *,
+    task: str,
+    allowed_domains: list[str],
+    model: str,
+    max_steps: int,
+    timeout_seconds: int,
+    use_vision: bool,
+) -> dict[str, Any]:
+    import asyncio
+
+    try:
+        from browser_use import Agent, ChatOpenAI
+    except Exception as exc:
+        raise RuntimeError(
+            "browser-use is not installed in the runner environment. "
+            "Install browser-use[core] and rebuild the agent image."
+        ) from exc
+    try:
+        from browser_use import Browser
+    except Exception:
+        Browser = None  # type: ignore[assignment]
+    try:
+        from browser_use import BrowserSession
+    except Exception:
+        BrowserSession = None  # type: ignore[assignment]
+
+    llm = ChatOpenAI(model=normalize_browser_use_model(model))
+    browser_obj: Any | None = None
+    agent_kwargs: dict[str, Any] = {
+        "task": task,
+        "llm": llm,
+        "use_vision": use_vision,
+    }
+    try:
+        if Browser is None:
+            raise RuntimeError("Browser export unavailable")
+        browser_obj = Browser(headless=True, allowed_domains=allowed_domains)
+        agent_kwargs["browser"] = browser_obj
+    except Exception:
+        if BrowserSession is None:
+            raise RuntimeError("browser-use Browser/BrowserSession exports are unavailable")
+        browser_obj = BrowserSession(headless=True, allowed_domains=allowed_domains)
+        agent_kwargs["browser_session"] = browser_obj
+    agent = Agent(**agent_kwargs)
+    history = None
+    try:
+        history = await asyncio.wait_for(
+            agent.run(max_steps=max(1, min(max_steps, 60))),
+            timeout=max(30, min(timeout_seconds, 240)),
+        )
+    finally:
+        close_target = getattr(agent, "browser_session", None) or browser_obj
+        close_method = getattr(close_target, "close", None)
+        if callable(close_method):
+            try:
+                maybe_result = close_method()
+                if hasattr(maybe_result, "__await__"):
+                    await maybe_result
+            except Exception:
+                pass
+    return {
+        "final_result": call_history_method(history, "final_result") if history is not None else "",
+        "is_done": call_history_method(history, "is_done") if history is not None else None,
+        "is_successful": call_history_method(history, "is_successful") if history is not None else None,
+        "urls": call_history_method(history, "urls") if history is not None else [],
+        "action_names": call_history_method(history, "action_names") if history is not None else [],
+        "errors": call_history_method(history, "errors") if history is not None else [],
+        "extracted_content": call_history_method(history, "extracted_content") if history is not None else [],
+        "model_actions": call_history_method(history, "model_actions") if history is not None else [],
+        "model_outputs": call_history_method(history, "model_outputs") if history is not None else [],
+    }
+
+
+@tool
+def run_browser_use_task(
+    task: str,
+    allowed_domains: list[str],
+    max_steps: int = 10,
+    timeout_seconds: int = 180,
+    model: str = "",
+    use_vision: bool = False,
+) -> dict[str, Any]:
+    """Run a generic browser-use autonomous browser task with domain restrictions.
+
+    Use this for interactive public websites that require a rendered browser,
+    JavaScript, forms, CSRF tokens, clicks, or table extraction. This is not a
+    broad web search tool: allowed_domains is required and is passed to
+    browser-use as a navigation allowlist. The full run summary is saved under
+    /outputs/_browser_use/<run_id>/result.json and summary.md.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    run_id = ""
+    try:
+        import asyncio
+        import time
+
+        safe_domains = validate_browser_use_allowed_domains(allowed_domains)
+        run_id = browser_use_run_id(task, safe_domains)
+        browser_dir = CONFIG.output_dir / "_browser_use" / run_id
+        browser_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        browser_result = asyncio.run(
+            run_browser_use_agent_async(
+                task=task,
+                allowed_domains=safe_domains,
+                model=model or CONFIG.deep_model,
+                max_steps=max_steps,
+                timeout_seconds=timeout_seconds,
+                use_vision=use_vision,
+            )
+        )
+        elapsed = time.monotonic() - started
+        result: dict[str, Any] = {
+            "ok": True,
+            "run_id": run_id,
+            "task": task,
+            "allowed_domains": safe_domains,
+            "model": normalize_browser_use_model(model or CONFIG.deep_model),
+            "max_steps": max_steps,
+            "timeout_seconds": timeout_seconds,
+            "use_vision": use_vision,
+            "elapsed_seconds": round(elapsed, 3),
+            **browser_result,
+        }
+        (browser_dir / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary = [
+            "# Browser Use Task Summary",
+            "",
+            f"- Run ID: {run_id}",
+            f"- Allowed domains: {', '.join(safe_domains)}",
+            f"- Model: {result['model']}",
+            f"- Elapsed seconds: {result['elapsed_seconds']}",
+            f"- Successful: {result.get('is_successful')}",
+            "",
+            "## Final Result",
+            "",
+            str(result.get("final_result") or "")[:12000],
+            "",
+            "## URLs",
+            "",
+        ]
+        for url in result.get("urls") or []:
+            summary.append(f"- {url}")
+        (browser_dir / "summary.md").write_text("\n".join(summary), encoding="utf-8")
+        virtual_root = f"/outputs/_browser_use/{run_id}"
+        return {
+            **result,
+            "virtual_root": virtual_root,
+            "result_json_path": f"{virtual_root}/result.json",
+            "summary_path": f"{virtual_root}/summary.md",
+        }
+    except Exception as exc:
+        if CONFIG is not None and run_id:
+            error_dir = CONFIG.output_dir / "_browser_use" / run_id
+            error_dir.mkdir(parents=True, exist_ok=True)
+            (error_dir / "error.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                        "task": task,
+                        "allowed_domains": allowed_domains,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "task": task[:1000],
+            "allowed_domains": allowed_domains,
+        }
+
+
+@tool
+def search_site_crawl(
+    query: str,
+    crawl_id: str = "",
+    max_results: int = 8,
+) -> dict[str, Any]:
+    """Search a previously created site crawl by keyword and return sourced snippets."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        result = search_site_crawl_index(
+            CONFIG.output_dir,
+            query=query,
+            crawl_id=crawl_id or None,
+            max_results=max_results,
+        )
+        for item in result["results"]:
+            item["virtual_path"] = f"/outputs/_site_crawl/{result['crawl_id']}/{item['text_path']}"
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "query": query,
+            "crawl_id": crawl_id,
+        }
+
+
+@tool
+def read_crawled_page(
+    page: str,
+    crawl_id: str = "",
+    max_chars: int = 12000,
+) -> dict[str, Any]:
+    """Read one page from a site crawl by page_id or URL."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        result = read_site_crawl_page(
+            CONFIG.output_dir,
+            page=page,
+            crawl_id=crawl_id or None,
+            max_chars=max(1000, min(max_chars, 50000)),
+        )
+        result["virtual_path"] = (
+            f"/outputs/_site_crawl/{result['crawl_id']}/{result['page']['text_path']}"
+        )
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "page": page,
+            "crawl_id": crawl_id,
+        }
+
+
+@tool
+def list_site_crawls(max_crawls: int = 10) -> dict[str, Any]:
+    """List site crawls created during this run."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        result = list_site_crawl_runs(CONFIG.output_dir, max_crawls=max_crawls)
+        for item in result["crawls"]:
+            item["virtual_root"] = f"/outputs/_site_crawl/{item['crawl_id']}"
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
 def normalize_export_path(path: str | Path) -> tuple[str, Path]:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
@@ -1633,6 +2898,20 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
         "files in request_parent_review. "
         "Save larger scripts under /outputs before executing them. "
         "Do not use the network from the sandbox. Use installed local libraries when helpful. "
+        "For website research, do not use arbitrary search or network access from the "
+        "sandbox. Instead, use the controlled site tools: crawl_allowed_site, "
+        "extract_allowed_site_links, crawl_allowed_urls, search_site_crawl, "
+        "read_crawled_page, list_site_crawls, and "
+        "run_playwright_task for deterministic rendered browser tasks. These tools "
+        "enforce allowed domains, page/depth limits, response-size limits, and "
+        "robots.txt before writing a local crawl index under /outputs/_site_crawl. "
+        "When completeness for dated articles or collection pages matters, extract "
+        "the listing links first, then crawl that explicit URL set. "
+        "For interactive sites that require JavaScript, rendered forms, clicks, "
+        "or CSRF-managed browser flows, use run_playwright_task with explicit "
+        "allowed_domains. Browser tasks include an egress guard: keep inputs "
+        "short, search-like, and task-relevant; do not send file contents, "
+        "secrets, or structured payloads through browser fields or URLs. "
         "Use read_sandbox_file when you need a type-aware read of /input or "
         "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
         "metadata, and can perform a vision read of images when you pass a "
@@ -1769,7 +3048,18 @@ def execute_deep_agent_task(
     try:
         deep_agent = create_deep_agent(
             model=effective_model,
-            tools=[request_parent_review, read_sandbox_file, inspect_sandbox_image],
+            tools=[
+                request_parent_review,
+                read_sandbox_file,
+                inspect_sandbox_image,
+                crawl_allowed_site,
+                extract_allowed_site_links,
+                crawl_allowed_urls,
+                run_playwright_task,
+                search_site_crawl,
+                read_crawled_page,
+                list_site_crawls,
+            ],
             backend=backend,
             skills=effective_skill_sources or None,
             system_prompt=build_deep_agent_system_prompt(profile),
@@ -1987,6 +3277,12 @@ def run_parent_agent() -> dict[str, Any]:
                 inspect_sandbox_image,
                 inspect_expected_artifacts,
                 inspect_self_check_artifacts,
+                crawl_allowed_site,
+                extract_allowed_site_links,
+                crawl_allowed_urls,
+                search_site_crawl,
+                read_crawled_page,
+                list_site_crawls,
             ]
         )
 
@@ -1998,10 +3294,14 @@ def run_parent_agent() -> dict[str, Any]:
             "implementation and must explicitly request parent review by calling its "
             "request_parent_review tool. Do not edit files yourself and do not perform the "
             f"implementation yourself. Required workflow: (1) call {deep_tool_instruction}, "
-            f"passing only output-gate allowed expected artifacts ({ALLOWED_EXPORT_EXTENSIONS_TEXT}), "
+            f"passing the configured final artifacts as expected_artifacts and only "
+            f"output-gate allowed paths ({ALLOWED_EXPORT_EXTENSIONS_TEXT}); do not add "
+            "root-level self-check files to expected_artifacts, "
             "(2) check whether its result has review_requested=true, (3) if review was "
-            "requested, call run_output_gate for the declared review artifacts before "
-            "reading any produced files, (4) inspect the gate manifest and only read clean "
+            "requested, call run_output_gate with no explicit artifact override so the "
+            "latest request_parent_review artifact list is gated, including self-check "
+            "plan/report files, before reading any produced files, (4) inspect the gate "
+            "manifest and only read clean "
             "exports with inspect_exported_artifacts, read_exported_file, or list_exported_files. "
             "Do not read raw /outputs in production mode. If the gate rejects files, use "
             "inspect_gate_manifest and list_quarantine_metadata to cite concrete findings, "

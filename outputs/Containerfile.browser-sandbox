@@ -2,7 +2,9 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    BROWSER_USE_CHROME_NO_SANDBOX=1 \
+    ANONYMIZED_TELEMETRY=false
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -16,6 +18,7 @@ RUN useradd --create-home --uid 1000 analyst
 
 RUN pip install --no-cache-dir \
     beautifulsoup4 \
+    'browser-use[core]' \
     html5lib \
     httpx \
     jinja2 \

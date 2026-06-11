@@ -226,6 +226,41 @@ smoke checks. The default sandbox security policy disables network access, so
 this browser profile is for offline/local artifact validation. It does not
 enable external web search or internet browsing by itself.
 
+The `browser_research` profile is for rendered and interactive public websites.
+It uses the generic deterministic `run_playwright_task` tool for forms,
+CSRF-managed flows, clicks, and JavaScript-rendered pages. Each call must
+provide `allowed_domains`; the tool saves JSON/Markdown traces under
+`/outputs/_playwright/<run_id>/`. Browser input is egress guarded: long values,
+secret/path-like strings, high-entropy encoded payloads, and structured
+payload-like values are rejected. File-upload actions are not implemented. Use
+this profile when a rendered site must be inspected without broad web search.
+
+The `site_research` profile is for controlled research against a specific public
+site or small domain allowlist. The Deep Agent can call `crawl_allowed_site`,
+`extract_allowed_site_links`, `crawl_allowed_urls`, `search_site_crawl`,
+`read_crawled_page`, and `list_site_crawls`; those tools only fetch allowed
+http(s) URLs, reject local/private hosts, respect robots.txt by default, and
+store extracted text plus an index under `/outputs/_site_crawl/<crawl_id>/`.
+This is not a general web search feature.
+
+Use `extract_allowed_site_links` first when a listing/index page controls
+coverage. It supports `required_year`, `required_month`, `date_from`, `date_to`,
+text/URL include and exclude regexes, `css_selector`, `url_contains`,
+`allowed_extensions`, and `max_links`. Then pass the returned URLs to
+`crawl_allowed_urls`.
+
+Example:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+python outputs/generic_parent_runner.py `
+  --deep-agent-profile outputs/deep_agent_profiles/site_research.yaml `
+  --prompt "https://ondankataisaku.env.go.jp/carbon_neutral/ を開始URLとして、ondankataisaku.env.go.jp 内だけを最大30ページ、深さ2で調査し、企業・自治体向けの脱炭素支援情報を出典URL付きで整理してください。" `
+  --expected-artifact /outputs/site_research_report.md `
+  --output-dir outputs/site_research_example `
+  --max-review-rounds 2
+```
+
 ## Skill Example
 
 The included seal-reading skill lives at:
