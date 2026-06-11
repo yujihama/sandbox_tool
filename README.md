@@ -91,6 +91,9 @@ Deep Agent writes raw artifacts under `/outputs`, mapped to
 `raw_outputs/` in the run directory. The parent must call `run_output_gate`
 before reading final artifacts. Clean artifacts are copied or sanitized into
 `clean_exports/`; rejected raw artifacts are copied into `quarantine/`.
+Text artifacts are rejected if they start with known binary magic bytes or if
+their declared extension clearly conflicts with the document shape, such as an
+HTML document saved as `.md` or `.csv`.
 
 Allowed final artifact extensions are:
 
@@ -102,6 +105,9 @@ Allowed final artifact extensions are:
 For `.xlsx`, normal formulas are preserved. Dangerous formula functions and
 external references are rejected by default, or stringified if the runner is
 called with `--xlsx-dangerous-formula-action stringify`.
+
+For `.csv`, formula-like cells are apostrophe-prefixed, while valid numeric
+literals such as `-100`, `+25.5`, and `-1.25e3` are preserved.
 
 ## Linux / RedHat
 
