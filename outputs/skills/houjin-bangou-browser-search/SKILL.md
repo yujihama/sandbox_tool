@@ -10,7 +10,8 @@ description: Use guarded Playwright to search Japan's National Tax Agency Corpor
 Use this skill when a task asks for company-existence checks or search-result
 summaries on the Japanese Corporate Number Publication Site. Keep the work as
 generic browser automation: call `run_playwright_task` with an explicit
-allowlist and inspect its saved traces before deciding the next action.
+allowlist, but prefer the known-good recipes and parser bundled with this skill
+before exploratory browsing.
 
 ## Required Guardrails
 
@@ -24,22 +25,14 @@ allowlist and inspect its saved traces before deciding the next action.
 
 ## Workflow
 
-1. Start with an observation-only call.
-   - Go to `https://www.houjin-bangou.nta.go.jp/`.
-   - Wait for `body`.
-   - Extract visible text, links, forms, inputs, and tables.
-   - Read `/outputs/_playwright/<run_id>/result.json` or `summary.md` before
-     issuing a second call.
+1. Load the known-good recipe.
+   - Read
+     `/input/browser-skills/houjin-bangou-browser-search/references/known_good_steps.md`.
+   - Use the recipe steps first when the task fits name search or direct detail
+     verification. Do not re-discover the same selectors unless the recipe
+     fails.
 
-2. Choose the search mode from observed controls.
-   - Company-name input is usually `#corp_name`.
-   - The search button is usually `#search_condition`.
-   - English-name search may use an option such as `#corp_opt_en`; confirm from
-     the observed DOM before using it.
-   - If selectors differ, use the labels and page structure from the first
-     observation instead of guessing.
-
-3. Search.
+2. Search using the closest recipe.
    - For Japanese names, submit the provided legal/common name directly.
    - For English names, first use the English-name option if present. If the
      site returns no useful results, use a clearly labeled Japanese-name
@@ -48,17 +41,40 @@ allowlist and inspect its saved traces before deciding the next action.
    - For corporate numbers, prefer direct number search or detail-page
      navigation when a number is already known.
 
-4. Extract and verify results.
-   - Prefer the structured tables in the Playwright `result.json` over repeated
-     manual scraping.
-   - Capture the result URL, page title, submitted query, result count, and the
-     top rows requested by the task.
-   - For each selected row, open or navigate to its detail URL if available.
-     Detail pages commonly use:
-     `https://www.houjin-bangou.nta.go.jp/henkorireki-johoto.html?selHouzinNo=<corporate_number>`
-   - Verify that the detail page contains the corporate number and legal name.
+3. Parse saved browser results mechanically.
+   - After useful Playwright runs, execute:
 
-5. Report with uncertainty separated from facts.
+```bash
+python /input/browser-skills/houjin-bangou-browser-search/scripts/parse_houjin_playwright_result.py \
+  "/outputs/_playwright/*/result.json" \
+  --query "<submitted_or_target_company_name>" \
+  --output /outputs/subtasks/houjin_parse_summary.json
+```
+
+   - Add `--prefecture "<prefecture_name>"` when a prefecture filter was used.
+   - Use `/outputs/subtasks/houjin_parse_summary.json` to extract result rows,
+     ranked `best_matches`, corporate numbers, detail URLs, no-data signals,
+     titles, and detail-page facts.
+   - Use `best_matches[0]` only when it has `match_type: "exact"` for the
+     target query. Do not use the first visual result row if its legal name is
+     not an exact match.
+   - Do not spend model turns manually reading large Playwright JSON unless the
+     parser output is insufficient.
+
+4. Verify selected candidates.
+   - For each exact or likely candidate that needs verification, open its direct
+     detail URL:
+     `https://www.houjin-bangou.nta.go.jp/henkorireki-johoto.html?selHouzinNo=<corporate_number>`
+   - Run the parser again after detail-page navigation and compare the detail
+     page name, corporate number, and address against the result row.
+
+5. Explore only on recipe failure.
+   - If a known selector is missing, run one observation-oriented Playwright
+     call to inspect visible text, forms, inputs, and tables.
+   - Update the next Playwright call from the observed DOM. Do not repeat a
+     failed action unchanged.
+
+6. Report with uncertainty separated from facts.
    - Include original query, submitted query, match type
      (`exact`, `broad`, `fallback`, or `not_found`), corporate number, legal
      name, address/location, source URL, and retrieval time when available.
@@ -70,6 +86,7 @@ allowlist and inspect its saved traces before deciding the next action.
 Before requesting parent review:
 
 - Re-read the saved Playwright `result.json` or `summary.md`.
+- Re-run the parser and use its JSON output as the main evidence index.
 - Confirm every reported row appears in the saved browser trace.
 - Confirm every detail URL stays under `www.houjin-bangou.nta.go.jp`.
 - Confirm the final artifact distinguishes exact matches from broad candidates.

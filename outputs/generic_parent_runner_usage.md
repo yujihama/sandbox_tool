@@ -236,7 +236,10 @@ payload-like values are rejected. File-upload actions are not implemented. Use
 this profile when a rendered site must be inspected without broad web search.
 This profile also stages only the `houjin-bangou-browser-search` skill for
 Corporate Number Publication Site tasks. Other profiles do not receive that
-skill unless explicitly configured.
+skill unless explicitly configured. The skill contains known-good Playwright
+step recipes and a parser for saved Playwright `result.json` files, which helps
+the Deep Agent reuse successful paths and extract corporate numbers/detail URLs
+without re-reading large browser traces by hand.
 
 The `site_research` profile is for controlled research against a specific public
 site or small domain allowlist. The Deep Agent can call `crawl_allowed_site`,

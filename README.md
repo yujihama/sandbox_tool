@@ -182,7 +182,10 @@ Deep Agent and parent reviewer.
 Only `browser_research` currently receives the
 `houjin-bangou-browser-search` skill. That skill packages the browser workflow
 for Japan's Corporate Number Publication Site while still using the generic
-guarded Playwright tool rather than exposing a site-specific lookup tool.
+guarded Playwright tool rather than exposing a site-specific lookup tool. It
+also includes known-good Playwright step recipes and a local result parser so
+the agent can extract search rows and detail-page facts without manually
+reading large browser traces.
 
 ## Linux / RedHat
 
