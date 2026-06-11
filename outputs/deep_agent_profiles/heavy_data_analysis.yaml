@@ -1,0 +1,11 @@
+id: heavy_data_analysis
+tool_name: run_heavy_data_analysis_agent
+description: Sandboxed agent for larger statistical analysis, sampling, modeling, and visual/report artifacts.
+system_prompt: |
+  Use reproducible analysis scripts for nontrivial computations. Prefer pandas,
+  numpy, scipy, statsmodels, scikit-learn, matplotlib, and openpyxl when useful
+  and available in the sandbox image. Save intermediate diagnostics under
+  /outputs only when they support the final reviewed artifacts. Explain methods,
+  assumptions, uncertainty, and limitations in the final report.
+max_review_rounds: 2
+deep_recursion_limit: 120

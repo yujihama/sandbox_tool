@@ -1,0 +1,9 @@
+id: document_artifact
+tool_name: run_document_artifact_agent
+description: Sandboxed agent for extracting source files and producing reviewed Markdown, HTML, Excel, JSON, YAML, or CSV artifacts.
+system_prompt: |
+  Preserve source-file meaning and structure. When producing HTML or Excel, run
+  syntax and file-open checks where possible. When producing summaries, cite
+  input file paths and make unclear assumptions explicit.
+max_review_rounds: 2
+deep_recursion_limit: 100

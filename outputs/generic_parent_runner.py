@@ -7,12 +7,13 @@ import json
 import mimetypes
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,22 @@ class InputMapping:
 
 
 @dataclass
+class DeepAgentProfile:
+    id: str
+    tool_name: str
+    description: str
+    system_prompt: str = ""
+    skill_source_specs: list[str] = field(default_factory=list)
+    skill_sources: list[str] = field(default_factory=list)
+    include_global_skills: bool = False
+    image: str = ""
+    deep_model: str = ""
+    deep_recursion_limit: int | None = None
+    max_review_rounds: int | None = None
+    source_path: str = ""
+
+
+@dataclass
 class RunnerConfig:
     prompt: str
     run_root: Path
@@ -82,6 +99,7 @@ class RunnerConfig:
     sandbox_controller_url: str
     sandbox_controller_token: str
     xlsx_dangerous_formula_action: str
+    deep_agent_profiles: list[DeepAgentProfile] = field(default_factory=list)
 
 
 CONFIG: RunnerConfig | None = None
@@ -100,6 +118,116 @@ def load_env_local(path: Path) -> None:
             continue
         key, value = stripped.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def safe_tool_name(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip())
+    name = name.strip("_-")
+    if not name:
+        name = "deep_agent"
+    if not re.match(r"^[A-Za-z_]", name):
+        name = "run_" + name
+    return name[:64]
+
+
+def as_string_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list of strings.")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} must be a list of strings.")
+        if item.strip():
+            result.append(item.strip())
+    return result
+
+
+def read_profile_document(path: Path) -> dict[str, Any]:
+    suffix = path.suffix.lower()
+    text = path.read_text(encoding="utf-8")
+    if suffix == ".json":
+        data = json.loads(text)
+    elif suffix in {".yaml", ".yml"}:
+        import yaml
+
+        data = yaml.safe_load(text)
+    else:
+        raise ValueError(f"Unsupported Deep Agent profile extension: {path}")
+    if not isinstance(data, dict):
+        raise ValueError(f"Deep Agent profile must be an object: {path}")
+    return data
+
+
+def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
+    profile_path = Path(path).expanduser().resolve()
+    data = read_profile_document(profile_path)
+    profile_id = str(data.get("id") or profile_path.stem).strip()
+    if not profile_id:
+        raise ValueError(f"Deep Agent profile id is empty: {profile_path}")
+    tool_name = safe_tool_name(str(data.get("tool_name") or f"run_{profile_id}_agent"))
+    description = str(
+        data.get("description")
+        or f"Run the {profile_id} Deep Agent profile in the sandbox."
+    ).strip()
+    system_prompt = str(data.get("system_prompt") or "").strip()
+    system_prompt_file = data.get("system_prompt_file")
+    if system_prompt_file:
+        prompt_path = Path(str(system_prompt_file)).expanduser()
+        if not prompt_path.is_absolute():
+            prompt_path = profile_path.parent / prompt_path
+        file_prompt = prompt_path.resolve().read_text(encoding="utf-8").strip()
+        system_prompt = (system_prompt + "\n\n" + file_prompt).strip()
+
+    def optional_int(field_name: str) -> int | None:
+        value = data.get(field_name)
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    return DeepAgentProfile(
+        id=profile_id,
+        tool_name=tool_name,
+        description=description,
+        system_prompt=system_prompt,
+        skill_source_specs=as_string_list(data.get("skill_sources"), "skill_sources"),
+        include_global_skills=bool(data.get("include_global_skills", False)),
+        image=str(data.get("image") or "").strip(),
+        deep_model=str(data.get("deep_model") or "").strip(),
+        deep_recursion_limit=optional_int("deep_recursion_limit"),
+        max_review_rounds=optional_int("max_review_rounds"),
+        source_path=str(profile_path),
+    )
+
+
+def load_deep_agent_profiles(
+    profile_paths: list[str],
+    profile_dirs: list[str],
+) -> list[DeepAgentProfile]:
+    paths = [Path(path).expanduser().resolve() for path in profile_paths]
+    for directory in profile_dirs:
+        root = Path(directory).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            raise FileNotFoundError(f"Deep Agent profile directory does not exist: {root}")
+        for suffix in ("*.json", "*.yaml", "*.yml"):
+            paths.extend(sorted(root.glob(suffix)))
+
+    profiles: list[DeepAgentProfile] = []
+    seen_ids: set[str] = set()
+    seen_tools: set[str] = set()
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"Deep Agent profile does not exist: {path}")
+        profile = load_deep_agent_profile(path)
+        if profile.id in seen_ids:
+            raise ValueError(f"Duplicate Deep Agent profile id: {profile.id}")
+        if profile.tool_name in seen_tools:
+            raise ValueError(f"Duplicate Deep Agent tool_name: {profile.tool_name}")
+        seen_ids.add(profile.id)
+        seen_tools.add(profile.tool_name)
+        profiles.append(profile)
+    return profiles
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -238,7 +366,12 @@ def stage_inputs(input_specs: list[str], staging_dir: Path) -> list[InputMapping
     return mappings
 
 
-def stage_skill_sources(skill_specs: list[str], input_dir: Path) -> list[str]:
+def stage_skill_sources(
+    skill_specs: list[str],
+    input_dir: Path,
+    *,
+    base_dir: Path | None = None,
+) -> list[str]:
     """Stage host skill source directories into /input and return sandbox source paths."""
     staged_sources: list[str] = []
     for spec in skill_specs:
@@ -247,7 +380,10 @@ def stage_skill_sources(skill_specs: list[str], input_dir: Path) -> list[str]:
         else:
             host = spec
             target = "skills"
-        host_path = Path(host).expanduser().resolve()
+        host_path = Path(host).expanduser()
+        if not host_path.is_absolute() and base_dir is not None:
+            host_path = base_dir / host_path
+        host_path = host_path.resolve()
         if not host_path.exists() or not host_path.is_dir():
             raise FileNotFoundError(f"Skill source must be an existing directory: {host_path}")
         rel = sandbox_input_relative(target)
@@ -258,6 +394,34 @@ def stage_skill_sources(skill_specs: list[str], input_dir: Path) -> list[str]:
         shutil.copytree(host_path, destination)
         staged_sources.append("/input/" + rel)
     return staged_sources
+
+
+def stage_profile_skill_sources(profile: DeepAgentProfile, input_dir: Path) -> list[str]:
+    staged_sources: list[str] = []
+    host_specs: list[str] = []
+    for spec in profile.skill_source_specs:
+        normalized = spec.replace("\\", "/")
+        if normalized == "/input" or normalized.startswith("/input/"):
+            staged_sources.append(posixpath.normpath(normalized))
+        else:
+            host_specs.append(spec)
+    base_dir = Path(profile.source_path).parent if profile.source_path else None
+    staged_sources.extend(stage_skill_sources(host_specs, input_dir, base_dir=base_dir))
+    return staged_sources
+
+
+def materialize_deep_agent_profiles(
+    profiles: list[DeepAgentProfile],
+    input_dir: Path,
+    global_skill_sources: list[str],
+) -> None:
+    for profile in profiles:
+        profile_sources = stage_profile_skill_sources(profile, input_dir)
+        combined_sources = [
+            *(global_skill_sources if profile.include_global_skills else []),
+            *profile_sources,
+        ]
+        profile.skill_sources = list(dict.fromkeys(combined_sources))
 
 
 def resolve_sandbox_path(path: str | Path) -> Path:
@@ -373,26 +537,28 @@ def resolve_host_os(host_os: str) -> str:
     return "windows" if os.name == "nt" else "linux"
 
 
-def configured_image_available() -> bool:
+def configured_image_available(image: str | None = None) -> bool:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
+    image_name = image or CONFIG.image
     if CONFIG.sandbox_backend == "controller":
         return True
     if CONFIG.host_os == "windows":
-        return wsl_podman_image_available(CONFIG.image, CONFIG.wsl_distro)
-    return native_podman_image_available(CONFIG.image, CONFIG.podman_bin)
+        return wsl_podman_image_available(image_name, CONFIG.wsl_distro)
+    return native_podman_image_available(image_name, CONFIG.podman_bin)
 
 
-def create_configured_backend() -> Any:
+def create_configured_backend(image: str | None = None) -> Any:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
+    image_name = image or CONFIG.image
 
     if CONFIG.sandbox_backend == "controller":
         if not CONFIG.sandbox_controller_url:
             raise RuntimeError("sandbox_controller_url is required for controller backend")
         CONFIG.workspace_dir.mkdir(parents=True, exist_ok=True)
         return ControllerSandboxBackend(
-            image=CONFIG.image,
+            image=image_name,
             controller_url=CONFIG.sandbox_controller_url,
             run_id=CONFIG.run_root.name,
             input_dir=CONFIG.input_dir,
@@ -411,7 +577,7 @@ def create_configured_backend() -> Any:
 
     if CONFIG.host_os == "windows":
         return PodmanSandboxBackend.for_wsl(
-            image=CONFIG.image,
+            image=image_name,
             distro=CONFIG.wsl_distro,
             input_dir=CONFIG.input_dir,
             output_dir=CONFIG.output_dir,
@@ -423,7 +589,7 @@ def create_configured_backend() -> Any:
     from podman_sandbox_backend import PodmanSecurityOptions
 
     return PodmanSandboxBackend(
-        image=CONFIG.image,
+        image=image_name,
         input_dir=CONFIG.input_dir,
         output_dir=CONFIG.output_dir,
         podman=CONFIG.podman_bin,
@@ -491,11 +657,59 @@ def input_manifest() -> list[dict[str, str]]:
     ]
 
 
+def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
+    model_note = f"; model={profile.deep_model}" if profile.deep_model else ""
+    image_note = f"; image={profile.image}" if profile.image else ""
+    rounds_note = (
+        f"; max_review_rounds={profile.max_review_rounds}"
+        if profile.max_review_rounds is not None
+        else ""
+    )
+    skill_note = (
+        f"; skills={', '.join(profile.skill_sources)}" if profile.skill_sources else ""
+    )
+    return (
+        f"- {profile.tool_name}: {profile.description} "
+        f"(profile_id={profile.id}{model_note}{image_note}{rounds_note}{skill_note})"
+    )
+
+
+def deep_agent_profile_prompt_section() -> str:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    if CONFIG.deep_agent_profiles:
+        return (
+            "\n\nAvailable Deep Agent profile tools:\n"
+            + "\n".join(
+                profile_summary_for_prompt(profile)
+                for profile in CONFIG.deep_agent_profiles
+            )
+            + "\nChoose the most appropriate profile tool for the requested work. "
+            "Use the same or a better-suited profile for repair attempts."
+        )
+    if CONFIG.skill_sources:
+        return (
+            "\n\nDeep Agent skill sources:\n"
+            + "\n".join(f"- {path}" for path in CONFIG.skill_sources)
+        )
+    return ""
+
+
 def build_parent_prompt() -> str:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
+    delegate_text = (
+        "the most appropriate Deep Agent profile tool"
+        if CONFIG.deep_agent_profiles
+        else "the Deep Agent tool"
+    )
+    attempt_limit_text = (
+        f"Profile tools may define their own max_review_rounds; runner default is {CONFIG.max_review_rounds}."
+        if CONFIG.deep_agent_profiles
+        else f"Maximum Deep Agent attempts allowed: {CONFIG.max_review_rounds}"
+    )
     return (
-        "Run this task by delegating to the Deep Agent tool. The Deep Agent must request "
+        f"Run this task by delegating to {delegate_text}. The Deep Agent must request "
         "parent review through its request_parent_review tool before the parent can close "
         "the task.\n\n"
         "Inputs available in the sandbox:\n"
@@ -507,13 +721,8 @@ def build_parent_prompt() -> str:
         + "\nDo not ask the Deep Agent to create final or review artifacts with any "
         "other extension. Helper scripts or working files may exist under /outputs, "
         "but they must not be passed as expected_artifacts or request_parent_review artifacts."
-        + (
-            "\n\nDeep Agent skill sources:\n"
-            + "\n".join(f"- {path}" for path in CONFIG.skill_sources)
-            if CONFIG.skill_sources
-            else ""
-        )
-        + f"\n\nMaximum Deep Agent attempts allowed: {CONFIG.max_review_rounds}"
+        + deep_agent_profile_prompt_section()
+        + f"\n\n{attempt_limit_text}"
         + "\n\nUser task:\n"
         + CONFIG.prompt.strip()
     )
@@ -1391,8 +1600,78 @@ def request_parent_review(
     }
 
 
-@tool
-def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, Any]:
+def default_deep_agent_profile() -> DeepAgentProfile:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    return DeepAgentProfile(
+        id="default",
+        tool_name="run_deep_agent_task",
+        description="Run the default sandboxed Deep Agent worker.",
+        skill_sources=CONFIG.skill_sources,
+        image=CONFIG.image,
+        deep_model=CONFIG.deep_model,
+        deep_recursion_limit=CONFIG.deep_recursion_limit,
+        max_review_rounds=CONFIG.max_review_rounds,
+    )
+
+
+def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
+    profile_block = ""
+    if profile.system_prompt.strip():
+        profile_block = (
+            f"Deep Agent profile id: {profile.id}\n"
+            f"Profile purpose: {profile.description}\n"
+            "Profile-specific instructions:\n"
+            f"{profile.system_prompt.strip()}\n\n"
+        )
+    return (
+        profile_block
+        + "You are a task execution agent running in an isolated sandbox. "
+        "Read inputs only from /input and write final artifacts under /outputs. "
+        f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
+        "Do not include helper scripts, images, PDFs, or other non-allowed "
+        "files in request_parent_review. "
+        "Save larger scripts under /outputs before executing them. "
+        "Do not use the network from the sandbox. Use installed local libraries when helpful. "
+        "Use read_sandbox_file when you need a type-aware read of /input or "
+        "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
+        "metadata, and can perform a vision read of images when you pass a "
+        "question. You may still call inspect_sandbox_image directly for focused "
+        "visual review after creating crops, contact sheets, plots, or screenshots. "
+        "Cite inspected file paths and any uncertainty in your artifacts. "
+        "Before requesting parent review, you must perform an autonomous self-check. "
+        "This self-check is task-specific and you must design it yourself; do not "
+        "wait for a prebuilt validator. Required self-check artifacts: "
+        "`/outputs/self_check_plan.md`, one executable check script such as "
+        "`/outputs/self_check.py` or `/outputs/self_check.js`, and "
+        "`/outputs/self_check_report.md`. The plan must explain what you will verify "
+        "against the user task. The script must inspect the generated artifacts and, "
+        "when relevant, execute code, parse files, load workbooks, validate CSV/JSON, "
+        "or run smoke tests using available local tools. If a headless browser is "
+        "available for HTML tasks, use it; otherwise run the strongest available "
+        "syntax/reference checks and state the limitation. Execute the self-check "
+        "script with the `execute` tool. If it fails, fix the artifact and rerun the "
+        "self-check before requesting review. The report must include command(s) run, "
+        "pass/fail status, checked files, limitations, and remaining known issues. "
+        "When you believe the expected artifacts are ready for review, you must "
+        "call request_parent_review with the final artifact paths, a concise summary of "
+        "what you produced, and any known issues. Include `/outputs/self_check_plan.md` "
+        "and `/outputs/self_check_report.md` in the review request artifacts list, but "
+        "do not include the executable self-check script because code is not an allowed "
+        "export format. Call review after creating or updating "
+        "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
+        "for this attempt and respond concisely with the paths awaiting review. "
+        "If this invocation contains parent correction feedback from a previous "
+        "review, fix the issues first, rerun self-check, then call "
+        "request_parent_review again."
+    )
+
+
+def execute_deep_agent_task(
+    task: str,
+    expected_artifacts: list[str],
+    profile: DeepAgentProfile,
+) -> dict[str, Any]:
     """Run one sandboxed Deep Agent attempt for allowed /outputs artifacts.
 
     expected_artifacts must be files under /outputs using only output-gate
@@ -1404,6 +1683,11 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     """
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
+    effective_image = profile.image or CONFIG.image
+    effective_model = profile.deep_model or CONFIG.deep_model
+    effective_recursion_limit = profile.deep_recursion_limit or CONFIG.deep_recursion_limit
+    effective_max_review_rounds = profile.max_review_rounds or CONFIG.max_review_rounds
+    effective_skill_sources = profile.skill_sources or []
     try:
         effective_expected_artifacts = normalize_tool_expected_artifacts(expected_artifacts)
     except Exception as exc:
@@ -1416,12 +1700,16 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
 
     attempt = len(DEEP_AGENT_EVALUATIONS) + 1
     review_start = len(DEEP_REVIEW_REQUESTS)
-    if attempt > CONFIG.max_review_rounds:
+    if attempt > effective_max_review_rounds:
         return {
             "ok": False,
             "error": "max_review_rounds_exceeded",
             "attempt": attempt,
-            "max_review_rounds": CONFIG.max_review_rounds,
+            "max_review_rounds": effective_max_review_rounds,
+            "profile": {
+                "id": profile.id,
+                "tool_name": profile.tool_name,
+            },
         }
 
     log_dir = CONFIG.runner_log_dir
@@ -1449,14 +1737,19 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
     latest_deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
 
-    if not configured_image_available():
+    if not configured_image_available(effective_image):
         evaluation = {
             "ok": False,
             "attempt": attempt,
             "error": "sandbox_image_missing",
             "sandbox_backend": CONFIG.sandbox_backend,
-            "image": CONFIG.image,
+            "image": effective_image,
             "host_os": CONFIG.host_os,
+            "profile": {
+                "id": profile.id,
+                "tool_name": profile.tool_name,
+                "description": profile.description,
+            },
         }
         DEEP_AGENT_EVALUATIONS.append(evaluation)
         evaluation_path.write_text(
@@ -1469,65 +1762,28 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
         )
         return evaluation
 
-    backend = create_configured_backend()
+    backend = create_configured_backend(effective_image)
 
     deep_error: dict[str, Any] | None = None
+    DEEP_AGENT_TRACE.clear()
     try:
         deep_agent = create_deep_agent(
-            model=CONFIG.deep_model,
+            model=effective_model,
             tools=[request_parent_review, read_sandbox_file, inspect_sandbox_image],
             backend=backend,
-            skills=CONFIG.skill_sources or None,
-            system_prompt=(
-                "You are a task execution agent running in an isolated sandbox. "
-                "Read inputs only from /input and write final artifacts under /outputs. "
-                f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
-                "Do not include helper scripts, JSON files, images, PDFs, or other non-allowed "
-                "files in request_parent_review. "
-                "Save larger scripts under /outputs before executing them. "
-                "Do not use the network from the sandbox. Use installed local libraries when helpful. "
-                "Use read_sandbox_file when you need a type-aware read of /input or "
-                "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
-                "metadata, and can perform a vision read of images when you pass a "
-                "question. You may still call inspect_sandbox_image directly for focused "
-                "visual review after creating crops, contact sheets, plots, or screenshots. "
-                "Cite inspected file paths and any uncertainty in your artifacts. "
-                "Before requesting parent review, you must perform an autonomous self-check. "
-                "This self-check is task-specific and you must design it yourself; do not "
-                "wait for a prebuilt validator. Required self-check artifacts: "
-                "`/outputs/self_check_plan.md`, one executable check script such as "
-                "`/outputs/self_check.py` or `/outputs/self_check.js`, and "
-                "`/outputs/self_check_report.md`. The plan must explain what you will verify "
-                "against the user task. The script must inspect the generated artifacts and, "
-                "when relevant, execute code, parse files, load workbooks, validate CSV/JSON, "
-                "or run smoke tests using available local tools. If a headless browser is "
-                "available for HTML tasks, use it; otherwise run the strongest available "
-                "syntax/reference checks and state the limitation. Execute the self-check "
-                "script with the `execute` tool. If it fails, fix the artifact and rerun the "
-                "self-check before requesting review. The report must include command(s) run, "
-                "pass/fail status, checked files, limitations, and remaining known issues. "
-                "When you believe the expected artifacts are ready for review, you must "
-                "call request_parent_review with the final artifact paths, a concise summary of "
-                "what you produced, and any known issues. Include `/outputs/self_check_plan.md` "
-                "and `/outputs/self_check_report.md` in the review request artifacts list, but "
-                "do not include the executable self-check script because code is not an allowed "
-                "export format. Call review after creating or updating "
-                "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
-                "for this attempt and respond concisely with the paths awaiting review. "
-                "If this invocation contains parent correction feedback from a previous "
-                "review, fix the issues first, rerun self-check, then call "
-                "request_parent_review again."
-            ),
+            skills=effective_skill_sources or None,
+            system_prompt=build_deep_agent_system_prompt(profile),
         )
         deep_result = deep_agent.invoke(
             {"messages": [{"role": "user", "content": task_with_contract}]},
             config={
-                "configurable": {"thread_id": "deep-agent-generic-task"},
-                "recursion_limit": CONFIG.deep_recursion_limit,
+                "configurable": {
+                    "thread_id": f"deep-agent-{safe_tool_name(profile.id)}-task"
+                },
+                "recursion_limit": effective_recursion_limit,
             },
         )
         messages = deep_result["messages"]
-        DEEP_AGENT_TRACE.clear()
         DEEP_AGENT_TRACE.extend(trace_messages(messages, content_limit=2600))
         deep_trace_path.write_text(
             json.dumps(DEEP_AGENT_TRACE, ensure_ascii=False, indent=2),
@@ -1562,6 +1818,7 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
             "workspace_exists_after_cleanup": workspace_exists,
             "cleanup_policy": CONFIG.sandbox_backend,
             "cleanup_ok": cleanup_ok,
+            "profile_id": profile.id,
         }
         cleanup_path.write_text(
             json.dumps(cleanup_payload, ensure_ascii=False, indent=2),
@@ -1585,11 +1842,20 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     )
     evaluation = {
         "attempt": attempt,
-        "max_review_rounds": CONFIG.max_review_rounds,
+        "max_review_rounds": effective_max_review_rounds,
+        "profile": {
+            "id": profile.id,
+            "tool_name": profile.tool_name,
+            "description": profile.description,
+            "image": effective_image,
+            "deep_model": effective_model,
+            "deep_recursion_limit": effective_recursion_limit,
+            "skill_sources": effective_skill_sources,
+        },
         "runtime": {
             "host_os": CONFIG.host_os,
             "sandbox_backend": CONFIG.sandbox_backend,
-            "image": CONFIG.image,
+            "image": effective_image,
             "podman_bin": CONFIG.podman_bin,
             "wsl_distro": CONFIG.wsl_distro if CONFIG.host_os == "windows" else None,
             "selinux_relabel": CONFIG.selinux_relabel,
@@ -1628,11 +1894,75 @@ def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, A
     return evaluation
 
 
+@tool
+def run_deep_agent_task(task: str, expected_artifacts: list[str]) -> dict[str, Any]:
+    """Run the default sandboxed Deep Agent attempt for allowed /outputs artifacts.
+
+    expected_artifacts must be files under /outputs using only output-gate
+    allowed extensions: .csv, .html, .json, .md, .xlsx, .yaml, .yml. For the
+    generic runner, pass the configured final artifacts exactly. For multi-step
+    runs, intermediate expected artifacts may be under /outputs/subtasks/. Do
+    not request .py, .js, .png, .pdf, .docx, .pptx, .xlsm, or directory
+    artifacts as review/export artifacts.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    return execute_deep_agent_task(task, expected_artifacts, default_deep_agent_profile())
+
+
+def make_deep_agent_profile_tool(profile: DeepAgentProfile) -> Any:
+    def run_profile_deep_agent(
+        task: str,
+        expected_artifacts: list[str],
+    ) -> dict[str, Any]:
+        return execute_deep_agent_task(task, expected_artifacts, profile)
+
+    run_profile_deep_agent.__name__ = profile.tool_name
+    run_profile_deep_agent.__doc__ = (
+        f"{profile.description}\n\n"
+        "Run this sandboxed Deep Agent profile for allowed /outputs artifacts. "
+        "expected_artifacts must be files under /outputs using only output-gate "
+        "allowed extensions: .csv, .html, .json, .md, .xlsx, .yaml, .yml. "
+        "Do not request .py, .js, .png, .pdf, .docx, .pptx, .xlsm, or directory "
+        "artifacts as review/export artifacts."
+    )
+    return tool(profile.tool_name, description=profile.description)(run_profile_deep_agent)
+
+
+def active_deep_agent_tools() -> list[Any]:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    if CONFIG.deep_agent_profiles:
+        return [make_deep_agent_profile_tool(profile) for profile in CONFIG.deep_agent_profiles]
+    return [run_deep_agent_task]
+
+
+def active_deep_agent_tool_instruction() -> str:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    if CONFIG.deep_agent_profiles:
+        names = ", ".join(profile.tool_name for profile in CONFIG.deep_agent_profiles)
+        return f"the most appropriate Deep Agent profile tool ({names})"
+    return "run_deep_agent_task"
+
+
 def run_parent_agent() -> dict[str, Any]:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
 
     parent_prompt = build_parent_prompt()
+    deep_tool_instruction = active_deep_agent_tool_instruction()
+    if CONFIG.deep_agent_profiles:
+        attempts_instruction = (
+            f"Profile tools may define their own max_review_rounds; runner default is "
+            f"{CONFIG.max_review_rounds}. Never call a Deep Agent tool after it reports "
+            "max_review_rounds_exceeded."
+        )
+    else:
+        attempts_instruction = (
+            f"The maximum Deep Agent attempts is {CONFIG.max_review_rounds}. Never call "
+            "run_deep_agent_task after the tool reports max_review_rounds_exceeded."
+        )
     (CONFIG.runner_log_dir / "parent_prompt.txt").write_text(parent_prompt, encoding="utf-8")
     (CONFIG.runner_log_dir / "input_manifest.json").write_text(
         json.dumps(input_manifest(), ensure_ascii=False, indent=2),
@@ -1640,7 +1970,7 @@ def run_parent_agent() -> dict[str, Any]:
     )
 
     parent_tools = [
-        run_deep_agent_task,
+        *active_deep_agent_tools(),
         run_output_gate,
         inspect_gate_manifest,
         list_exported_files,
@@ -1667,7 +1997,7 @@ def run_parent_agent() -> dict[str, Any]:
             "You are a parent HITL reviewer and orchestrator. The Deep Agent does the "
             "implementation and must explicitly request parent review by calling its "
             "request_parent_review tool. Do not edit files yourself and do not perform the "
-            "implementation yourself. Required workflow: (1) call run_deep_agent_task, "
+            f"implementation yourself. Required workflow: (1) call {deep_tool_instruction}, "
             f"passing only output-gate allowed expected artifacts ({ALLOWED_EXPORT_EXTENSIONS_TEXT}), "
             "(2) check whether its result has review_requested=true, (3) if review was "
             "requested, call run_output_gate for the declared review artifacts before "
@@ -1679,14 +2009,13 @@ def run_parent_agent() -> dict[str, Any]:
             "from clean exports, the self-check did not execute, gate failures were ignored, "
             "or the inspected clean artifact materially fails the user task, and at least one "
             "Deep Agent attempt remains, "
-            "call run_deep_agent_task again with concise correction instructions that include "
+            f"call {deep_tool_instruction} again with concise correction instructions that include "
             "your findings, (6) run the output gate and inspect again after every review "
             "request, and close only when no material issues remain or no attempts remain. "
             "If the Deep Agent does not request review, treat that as a material protocol "
-            "issue; if attempts remain, call run_deep_agent_task again instructing it to "
+            f"issue; if attempts remain, call {deep_tool_instruction} again instructing it to "
             "produce/update artifacts, run self-check, and call request_parent_review. "
-            f"The maximum Deep Agent attempts is {CONFIG.max_review_rounds}. Never call "
-            "run_deep_agent_task after the tool reports max_review_rounds_exceeded. "
+            f"{attempts_instruction} "
             "In the final response, report attempts used, files inspected, material findings, "
             "gate status, self-check status, remaining issues if any, whether the last Deep "
             "Agent attempt requested review, and clean export paths. Keep claims tied to "
@@ -1725,6 +2054,36 @@ def run_parent_agent() -> dict[str, Any]:
         "",
         "```json",
         json.dumps(CONFIG.expected_artifacts, ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## Deep Agent Profiles",
+        "",
+        "```json",
+        json.dumps(
+            [
+                {
+                    "id": profile.id,
+                    "tool_name": profile.tool_name,
+                    "description": profile.description,
+                    "image": profile.image or CONFIG.image,
+                    "deep_model": profile.deep_model or CONFIG.deep_model,
+                    "skill_sources": profile.skill_sources,
+                }
+                for profile in CONFIG.deep_agent_profiles
+            ]
+            or [
+                {
+                    "id": "default",
+                    "tool_name": "run_deep_agent_task",
+                    "description": "Default sandboxed Deep Agent worker.",
+                    "image": CONFIG.image,
+                    "deep_model": CONFIG.deep_model,
+                    "skill_sources": CONFIG.skill_sources,
+                }
+            ],
+            ensure_ascii=False,
+            indent=2,
+        ),
         "```",
         "",
         "## Parent Tool Calls",
@@ -1797,6 +2156,18 @@ def parse_args() -> argparse.Namespace:
             "or just HOST_DIR to stage it at /input/skills. The source should contain "
             "skill-name/SKILL.md directories."
         ),
+    )
+    parser.add_argument(
+        "--deep-agent-profile",
+        action="append",
+        default=[],
+        help="Deep Agent profile YAML/JSON file. Repeat to expose multiple profile tools.",
+    )
+    parser.add_argument(
+        "--deep-agent-profile-dir",
+        action="append",
+        default=[],
+        help="Directory containing Deep Agent profile .json/.yaml/.yml files.",
     )
     parser.add_argument(
         "--output-dir",
@@ -1907,6 +2278,11 @@ def main() -> None:
     input_dir = run_dirs["input_dir"]
     input_mappings = stage_inputs(args.input, input_dir)
     skill_sources = stage_skill_sources(args.skill_source, input_dir)
+    deep_agent_profiles = load_deep_agent_profiles(
+        args.deep_agent_profile,
+        args.deep_agent_profile_dir,
+    )
+    materialize_deep_agent_profiles(deep_agent_profiles, input_dir, skill_sources)
     expected_artifacts = [
         normalize_expected_artifact(path) for path in args.expected_artifact
     ]
@@ -1943,6 +2319,7 @@ def main() -> None:
         sandbox_controller_url=args.sandbox_controller_url,
         sandbox_controller_token=args.sandbox_controller_token,
         xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
+        deep_agent_profiles=deep_agent_profiles,
     )
 
     try:
