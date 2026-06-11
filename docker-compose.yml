@@ -1,0 +1,61 @@
+services:
+  agent-app:
+    image: sandbox-tool-agent:local
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+    user: root
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RUNS_ROOT: /srv/sandbox-tool/runs
+      RUNS_ROOT_HOST: ${RUNS_ROOT_HOST:-/srv/sandbox-tool/runs}
+      SANDBOX_BACKEND: controller
+      SANDBOX_CONTROLLER_URL: http://sandbox-controller:8080
+      SANDBOX_CONTROLLER_TOKEN: ${SANDBOX_CONTROLLER_TOKEN:-}
+    volumes:
+      - ${RUNS_ROOT_HOST:-/srv/sandbox-tool/runs}:/srv/sandbox-tool/runs
+      - ${INPUTS_HOST:-/srv/sandbox-tool/inputs}:/inputs:ro
+    depends_on:
+      sandbox-controller:
+        condition: service_healthy
+    command: ["python", "-c", "import time; print('agent-app ready'); time.sleep(31536000)"]
+
+  sandbox-controller:
+    image: sandbox-tool-agent:local
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+    user: root
+    environment:
+      RUNS_ROOT: /srv/sandbox-tool/runs
+      RUN_DIR_MODE: ${RUN_DIR_MODE:-0777}
+      SANDBOX_SOCKET: /var/run/docker.sock
+      RUNS_ROOT_HOST: ${RUNS_ROOT_HOST:-/srv/sandbox-tool/runs}
+      SANDBOX_CONTROLLER_TOKEN: ${SANDBOX_CONTROLLER_TOKEN:-}
+      OUTPUT_GATE_IMAGE: sandbox-tool-agent:local
+      SANDBOX_IMAGE_ALLOWLIST: ${SANDBOX_IMAGE_ALLOWLIST:-localhost/python-data-sandbox:latest}
+      SANDBOX_CONTAINER_USER: ${SANDBOX_CONTAINER_USER:-1000:1000}
+      SANDBOX_MEMORY_LIMIT: ${SANDBOX_MEMORY_LIMIT:-2g}
+      SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-256}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-2}
+    volumes:
+      - ${RUNS_ROOT_HOST:-/srv/sandbox-tool/runs}:/srv/sandbox-tool/runs
+      - ${SANDBOX_SOCKET_HOST:-/var/run/docker.sock}:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:${SANDBOX_CONTROLLER_PORT:-8080}:8080"
+    command: ["python", "-m", "uvicorn", "sandbox_tool.sandbox_controller:app", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  python-data-sandbox:
+    image: localhost/python-data-sandbox:latest
+    build:
+      context: outputs
+      dockerfile: Containerfile.python-data-sandbox
+    profiles:
+      - sandbox-image
+    command: ["python", "-V"]

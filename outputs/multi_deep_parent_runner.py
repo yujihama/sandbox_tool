@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import threading
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -77,7 +76,13 @@ def run_deep_agent_subtask(
     objective: str,
     expected_artifacts: list[str],
 ) -> dict[str, Any]:
-    """Delegate one decomposed subtask to a Deep Agent and check that subtask's artifacts."""
+    """Delegate one subtask to a Deep Agent with output-gate allowed expected artifacts.
+
+    expected_artifacts must be files under /outputs with one of these extensions:
+    .csv, .html, .md, .xlsx. Intermediate artifacts should normally be under
+    /outputs/subtasks/. Do not request .json, .py, .js, .png, .pdf, .docx,
+    .pptx, .xlsm, or directory artifacts as review/export artifacts.
+    """
     if base.CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
 
@@ -120,7 +125,7 @@ def run_deep_agent_subtask(
         }
         SUBTASK_CALLS.append(call_record)
 
-        history_path = base.CONFIG.output_dir / "multi_deep_subtask_history.json"
+        history_path = base.CONFIG.runner_log_dir / "multi_deep_subtask_history.json"
         history_path.write_text(
             json.dumps(SUBTASK_CALLS, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -151,6 +156,11 @@ def build_multi_parent_prompt(min_subtasks: int) -> str:
         + "\n".join(f"- {item.sandbox_path}" for item in base.CONFIG.input_mappings)
         + "\n\nFinal expected artifact(s):\n"
         + "\n".join(f"- {path}" for path in base.CONFIG.expected_artifacts)
+        + "\n\nOutput-gate allowed review/export extensions:\n"
+        + base.ALLOWED_EXPORT_EXTENSIONS_TEXT
+        + "\nDo not ask Deep Agents to create expected/review artifacts with other "
+        "extensions. Helper files may exist under /outputs, but reviewed artifacts "
+        "must be .md, .csv, .xlsx, or .html."
         + (
             "\n\nDeep Agent skill sources:\n"
             + "\n".join(f"- {path}" for path in base.CONFIG.skill_sources)
@@ -162,7 +172,8 @@ def build_multi_parent_prompt(min_subtasks: int) -> str:
         "input is unreadable. At least one call must be a final synthesis subtask that "
         "reads prior /outputs/subtasks artifacts and creates the final expected artifact(s). "
         "For intermediate subtasks, set expected_artifacts to specific paths under "
-        "`/outputs/subtasks/`, usually a .md and .json file. "
+        "`/outputs/subtasks/` using only output-gate allowed extensions, usually "
+        ".md for narrative or .csv/.xlsx for structured data. "
         "After each subtask review request, inspect the subtask artifacts with "
         "read_sandbox_file, inspect_sandbox_file, or list_sandbox_files; use "
         "read_sandbox_file with a question or inspect_sandbox_image when visual "
@@ -181,35 +192,55 @@ def run_parent_agent(min_subtasks: int) -> dict[str, Any]:
         raise RuntimeError("Runner config is not initialized.")
 
     parent_prompt = build_multi_parent_prompt(min_subtasks)
-    (base.CONFIG.output_dir / "parent_prompt.txt").write_text(
+    (base.CONFIG.runner_log_dir / "parent_prompt.txt").write_text(
         parent_prompt,
         encoding="utf-8",
     )
-    (base.CONFIG.output_dir / "input_manifest.json").write_text(
+    (base.CONFIG.runner_log_dir / "input_manifest.json").write_text(
         json.dumps(base.input_manifest(), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
+    parent_tools = [
+        run_deep_agent_subtask,
+        inspect_subtask_history,
+        base.run_output_gate,
+        base.inspect_gate_manifest,
+        base.inspect_exported_artifacts,
+        base.read_exported_file,
+        base.list_exported_files,
+    ]
+    if base.CONFIG.allow_raw_parent_inspection:
+        parent_tools.extend(
+            [
+                base.list_sandbox_files,
+                base.read_sandbox_file,
+                base.inspect_sandbox_file,
+                base.inspect_sandbox_image,
+                base.inspect_expected_artifacts,
+                base.inspect_self_check_artifacts,
+            ]
+        )
+
     parent_agent = create_agent(
         model=base.CONFIG.parent_model,
-        tools=[
-            run_deep_agent_subtask,
-            inspect_subtask_history,
-            base.list_sandbox_files,
-            base.read_sandbox_file,
-            base.inspect_sandbox_file,
-            base.inspect_sandbox_image,
-            base.inspect_expected_artifacts,
-            base.inspect_self_check_artifacts,
-        ],
+        tools=parent_tools,
         system_prompt=(
             "You are a parent decomposition and review agent. You do not implement "
             "analysis yourself and you do not edit files yourself. Your job is to split "
             "the vague request into meaningful subtasks, call run_deep_agent_subtask for "
-            "each, review the produced files with read_sandbox_file and other inspection "
-            "tools, use image inspection for visual artifacts when relevant, then delegate one final "
+            f"output-gate allowed artifacts ({base.ALLOWED_EXPORT_EXTENSIONS_TEXT}) for "
+            "each, review subtask status through inspect_subtask_history"
+            + (
+                " and raw inspection tools when needed"
+                if base.CONFIG.allow_raw_parent_inspection
+                else ""
+            )
+            + ", then delegate one final "
             "synthesis subtask that creates the final expected artifact. Intermediate "
             "subtasks are allowed to have their own artifacts under /outputs/subtasks. "
+            "After the final synthesis subtask requests review, call run_output_gate and "
+            "review the final clean exports with inspect_exported_artifacts/read_exported_file. "
             "Do not treat the final artifact being absent as a failure until after the "
             "synthesis subtask. Do treat missing subtask artifacts, missing review requests, "
             "or weak self-checks as material issues. Never exceed the Deep Agent call budget."
@@ -233,7 +264,7 @@ def run_parent_agent(min_subtasks: int) -> dict[str, Any]:
         }
 
     parent_trace = base.trace_messages(messages, content_limit=3200) if messages else []
-    (base.CONFIG.output_dir / "parent_agent_trace.json").write_text(
+    (base.CONFIG.runner_log_dir / "parent_agent_trace.json").write_text(
         json.dumps(parent_trace, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -290,7 +321,7 @@ def run_parent_agent(min_subtasks: int) -> dict[str, Any]:
         "",
         final_text,
     ]
-    (base.CONFIG.output_dir / "parent_agent_report.md").write_text(
+    (base.CONFIG.runner_log_dir / "parent_agent_report.md").write_text(
         "\n".join(report),
         encoding="utf-8",
     )
@@ -301,7 +332,9 @@ def run_parent_agent(min_subtasks: int) -> dict[str, Any]:
         "subtasks": list(SUBTASK_CALLS),
         "final_check": final_check,
         "parent_error": parent_error,
-        "output_dir": str(base.CONFIG.output_dir),
+        "output_dir": str(base.CONFIG.run_root),
+        "raw_output_dir": str(base.CONFIG.output_dir),
+        "clean_export_dir": str(base.CONFIG.clean_export_dir),
     }
 
 
@@ -322,6 +355,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--image", default="localhost/python-data-sandbox:latest")
+    parser.add_argument(
+        "--sandbox-backend",
+        choices=["podman", "controller"],
+        default=os.getenv("SANDBOX_BACKEND", "podman"),
+    )
+    parser.add_argument(
+        "--sandbox-controller-url",
+        default=os.getenv("SANDBOX_CONTROLLER_URL", ""),
+    )
+    parser.add_argument(
+        "--sandbox-controller-token",
+        default=os.getenv("SANDBOX_CONTROLLER_TOKEN", ""),
+    )
     parser.add_argument("--host-os", choices=["auto", "windows", "linux"], default="auto")
     parser.add_argument("--wsl-distro", default="Ubuntu-22.04")
     parser.add_argument("--wsl-no-sudo", action="store_true")
@@ -335,6 +381,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-deep-calls", type=int, default=3)
     parser.add_argument("--no-clear-output", action="store_true")
     parser.add_argument("--keep-staged-input", action="store_true")
+    parser.add_argument("--allow-raw-parent-inspection", action="store_true")
+    parser.add_argument(
+        "--xlsx-dangerous-formula-action",
+        choices=["reject", "stringify"],
+        default="reject",
+    )
     return parser.parse_args()
 
 
@@ -352,15 +404,20 @@ def main() -> None:
         else args.prompt
     )
     output_arg = Path(args.output_dir)
-    output_dir = base.require_safe_output_dir(
-        output_arg.resolve() if output_arg.is_absolute() else (ROOT / output_arg).resolve()
+    output_base = (
+        Path(os.getenv("RUNS_ROOT", "/srv/sandbox-tool/runs"))
+        if args.sandbox_backend == "controller"
+        else ROOT
+    )
+    run_root = base.require_safe_output_dir(
+        output_arg.resolve() if output_arg.is_absolute() else (output_base / output_arg).resolve(),
+        sandbox_backend=args.sandbox_backend,
     )
     if not args.no_clear_output:
-        base.clear_directory_contents(output_dir)
+        base.clear_directory_contents(run_root)
+    run_dirs = base.prepare_run_directories(run_root)
 
-    staging_root = WORK_DIR / "multi_deep_parent_runner_inputs"
-    staging_root.mkdir(parents=True, exist_ok=True)
-    input_dir = Path(tempfile.mkdtemp(prefix="input-", dir=staging_root)).resolve()
+    input_dir = run_dirs["input_dir"]
     input_mappings = base.stage_inputs(args.input, input_dir)
     skill_sources = base.stage_skill_sources(args.skill_source, input_dir)
     expected_artifacts = normalize_artifact_list(args.expected_artifact)
@@ -368,8 +425,14 @@ def main() -> None:
 
     base.CONFIG = base.RunnerConfig(
         prompt=prompt,
-        output_dir=output_dir,
+        run_root=run_dirs["run_root"],
+        output_dir=run_dirs["raw_output_dir"],
+        clean_export_dir=run_dirs["clean_export_dir"],
+        quarantine_dir=run_dirs["quarantine_dir"],
+        gate_log_dir=run_dirs["gate_log_dir"],
+        runner_log_dir=run_dirs["runner_log_dir"],
         input_dir=input_dir,
+        workspace_dir=run_dirs["workspace_dir"],
         input_mappings=input_mappings,
         expected_artifacts=expected_artifacts,
         skill_sources=skill_sources,
@@ -386,6 +449,11 @@ def main() -> None:
         selinux_relabel=args.selinux_relabel,
         clear_output=not args.no_clear_output,
         keep_staged_input=args.keep_staged_input,
+        allow_raw_parent_inspection=args.allow_raw_parent_inspection,
+        sandbox_backend=args.sandbox_backend,
+        sandbox_controller_url=args.sandbox_controller_url,
+        sandbox_controller_token=args.sandbox_controller_token,
+        xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
     )
     base.DEEP_AGENT_TRACE.clear()
     base.DEEP_AGENT_EVALUATIONS.clear()
