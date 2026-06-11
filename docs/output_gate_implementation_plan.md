@@ -593,10 +593,16 @@ services:
 
 ### Security Regression Fixtures
 
+Fixture location:
+
+- `tests/security_fixtures/`
+
 - `evil.csv`
   - `=WEBSERVICE("https://example.com")`
   - `+cmd|`
   - `@SUM(1,1)`
+  - formula-like `-SUM(1,1)`
+  - normal negative numbers must not be escaped.
 - `evil.html`
   - `<script>`
   - `onload=`

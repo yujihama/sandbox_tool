@@ -24,6 +24,32 @@ MAX_ZIP_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
 MAX_ZIP_COMPRESSION_RATIO = 100
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 CSV_ESCAPE_POLICY = "apostrophe-prefix"
+BINARY_MAGIC_SIGNATURES = [
+    (b"PK\x03\x04", "zip_ooxml"),
+    (b"PK\x05\x06", "zip_empty"),
+    (b"PK\x07\x08", "zip_spanned"),
+    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "ole_compound_document"),
+    (b"%PDF-", "pdf"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"7z\xbc\xaf\x27\x1c", "7zip"),
+    (b"Rar!\x1a\x07\x00", "rar"),
+    (b"Rar!\x1a\x07\x01\x00", "rar5"),
+    (b"\x1f\x8b", "gzip"),
+    (b"BZh", "bzip2"),
+    (b"SQLite format 3\x00", "sqlite"),
+    (b"PAR1", "parquet"),
+]
+HTML_DOCUMENT_START_RE = re.compile(r"^\s*(?:<!doctype\s+html\b|<html\b)", re.IGNORECASE)
+HTML_DOCUMENT_MARKER_RE = re.compile(
+    r"<\s*(?:!doctype\s+html\b|html\b|head\b|body\b)",
+    re.IGNORECASE,
+)
+NUMERIC_LITERAL_RE = re.compile(
+    r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$"
+)
 YAML_ALLOWED_TAGS = {
     "tag:yaml.org,2002:map",
     "tag:yaml.org,2002:seq",
@@ -191,6 +217,92 @@ def read_text_strict(path: Path) -> str:
     return raw.decode("utf-8-sig")
 
 
+def known_binary_magic(path: Path) -> str | None:
+    with path.open("rb") as handle:
+        prefix = handle.read(32)
+    for signature, name in BINARY_MAGIC_SIGNATURES:
+        if prefix.startswith(signature):
+            return name
+    return None
+
+
+def format_declaration_findings(text: str, *, expected_kind: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    if expected_kind in {"md", "csv"} and HTML_DOCUMENT_START_RE.match(text):
+        findings.append(
+            finding(
+                "declared_format_mismatch",
+                f"{expected_kind} artifact appears to be an HTML document",
+                expected_kind=expected_kind,
+                detected_kind="html",
+            )
+        )
+    if expected_kind == "html" and not HTML_DOCUMENT_MARKER_RE.search(text):
+        findings.append(
+            finding(
+                "html_document_marker_missing",
+                "HTML artifact must contain a document marker such as <!doctype html>, <html>, <head>, or <body>",
+                expected_kind=expected_kind,
+            )
+        )
+    return findings
+
+
+def read_text_artifact(path: Path, *, expected_kind: str) -> str:
+    magic = known_binary_magic(path)
+    if magic:
+        raise GateReject(
+            [
+                finding(
+                    "magic_extension_mismatch",
+                    f"{expected_kind} artifact starts with {magic} magic bytes",
+                    expected_kind=expected_kind,
+                    detected_magic=magic,
+                )
+            ]
+        )
+    try:
+        text = read_text_strict(path)
+    except UnicodeDecodeError as exc:
+        raise GateReject(
+            [
+                finding(
+                    "text_decode_error",
+                    f"{expected_kind} artifact is not valid UTF-8 text: {exc}",
+                    expected_kind=expected_kind,
+                )
+            ]
+        ) from exc
+    except ValueError as exc:
+        raise GateReject(
+            [
+                finding(
+                    "text_artifact_invalid",
+                    f"{expected_kind} artifact failed text validation: {exc}",
+                    expected_kind=expected_kind,
+                )
+            ]
+        ) from exc
+
+    findings = format_declaration_findings(text, expected_kind=expected_kind)
+    if findings:
+        raise GateReject(findings)
+    return text
+
+
+def csv_cell_needs_formula_escape(value: str) -> bool:
+    if not value:
+        return False
+    stripped = value.lstrip(" ")
+    if not stripped:
+        return False
+    if stripped.startswith(("\t", "\r")):
+        return True
+    if stripped.startswith(("+", "-")) and NUMERIC_LITERAL_RE.fullmatch(stripped):
+        return False
+    return stripped.startswith(CSV_FORMULA_PREFIXES)
+
+
 def active_content_findings(text: str, patterns: list[tuple[re.Pattern[str], str]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for pattern, code in patterns:
@@ -209,7 +321,7 @@ def active_content_findings(text: str, patterns: list[tuple[re.Pattern[str], str
 
 
 def sanitize_md(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    text = read_text_strict(raw_path)
+    text = read_text_artifact(raw_path, expected_kind="md")
     findings = active_content_findings(text, MARKDOWN_ACTIVE_PATTERNS)
     if findings:
         raise GateReject(findings)
@@ -219,7 +331,7 @@ def sanitize_md(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]],
 
 
 def sanitize_html(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    text = read_text_strict(raw_path)
+    text = read_text_artifact(raw_path, expected_kind="html")
     findings = active_content_findings(text, HTML_ACTIVE_PATTERNS)
     if findings:
         raise GateReject(findings)
@@ -244,7 +356,7 @@ def sanitize_html(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]
 
 
 def sanitize_csv(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    text = read_text_strict(raw_path)
+    text = read_text_artifact(raw_path, expected_kind="csv")
     sample = text[:4096]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
@@ -254,13 +366,13 @@ def sanitize_csv(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]]
     changed_cells: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows, start=1):
         for col_index, value in enumerate(row, start=1):
-            if value.startswith(CSV_FORMULA_PREFIXES):
+            if csv_cell_needs_formula_escape(value):
                 row[col_index - 1] = "'" + value
                 changed_cells.append(
                     {
                         "row": row_index,
                         "column": col_index,
-                        "original_prefix": value[:1],
+                        "original_prefix": value.lstrip(" ")[:1],
                         "policy": CSV_ESCAPE_POLICY,
                     }
                 )
@@ -331,7 +443,7 @@ def json_compatible_findings(value: Any, *, path: str = "$") -> list[dict[str, A
 
 
 def sanitize_json(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    text = read_text_strict(raw_path)
+    text = read_text_artifact(raw_path, expected_kind="json")
     try:
         data = json.loads(text, parse_constant=reject_json_constant)
     except Exception as exc:
@@ -464,7 +576,7 @@ def yaml_token_findings(text: str) -> list[dict[str, Any]]:
 
 
 def sanitize_yaml(raw_path: Path, clean_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    text = read_text_strict(raw_path)
+    text = read_text_artifact(raw_path, expected_kind="yaml")
     token_findings = yaml_token_findings(text)
     if token_findings:
         raise GateReject(token_findings)

@@ -1,0 +1,7 @@
+name,value
+formula,"=WEBSERVICE(""https://example.com"")"
+plus,+cmd|
+at,"@SUM(1,1)"
+negative_formula,"-SUM(1,1)"
+normal_negative,-100
+normal_positive,+100

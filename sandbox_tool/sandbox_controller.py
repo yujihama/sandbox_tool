@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,17 @@ def run_path(run_id: str) -> Path:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="run path escaped root") from exc
     return path
+
+
+def normalize_controller_artifact_path(artifact: str) -> str:
+    raw = artifact.replace("\\", "/")
+    normalized = posixpath.normpath(raw)
+    if not normalized.startswith("/outputs/"):
+        raise HTTPException(status_code=400, detail=f"invalid artifact path: {artifact}")
+    rel = normalized.removeprefix("/outputs/")
+    if rel in {"", ".", ".."} or rel.startswith("../"):
+        raise HTTPException(status_code=400, detail=f"invalid artifact path: {artifact}")
+    return normalized
 
 
 def ensure_run_dirs(run_id: str) -> dict[str, Path]:
@@ -200,10 +212,7 @@ def run_gate(run_id: str, request: GateRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="invalid xlsx action")
     if not request.artifacts:
         raise HTTPException(status_code=400, detail="artifacts required")
-    for artifact in request.artifacts:
-        normalized = artifact.replace("\\", "/")
-        if not normalized.startswith("/outputs/") or "/../" in normalized:
-            raise HTTPException(status_code=400, detail=f"invalid artifact path: {artifact}")
+    artifacts = [normalize_controller_artifact_path(artifact) for artifact in request.artifacts]
 
     dirs = ensure_run_dirs(run_id)
     command = [
@@ -223,7 +232,7 @@ def run_gate(run_id: str, request: GateRequest) -> dict[str, Any]:
         "--xlsx-dangerous-formula-action",
         request.xlsx_dangerous_formula_action,
     ]
-    for artifact in request.artifacts:
+    for artifact in artifacts:
         command.extend(["--artifact", artifact])
 
     try:
