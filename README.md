@@ -9,6 +9,7 @@ Generic parent-agent runner with a sandboxed Deep Agent worker and a determinist
 - `outputs/deep_agent_profiles/`: optional Deep Agent profile YAML files that expose multiple worker tools to the parent agent.
 - `outputs/podman_sandbox_backend.py`: short-lived Podman container backend for Deep Agents.
 - `outputs/Containerfile.python-data-sandbox`: Python data-analysis sandbox image.
+- `outputs/Containerfile.browser-sandbox`: Playwright/Chromium sandbox image for local browser validation.
 - `sandbox_tool/output_gate.py`: allowlist gate that validates and sanitizes final artifacts before the parent reads them.
 - `sandbox_tool/sandbox_controller.py`: FastAPI controller that runs sandbox/gate containers through Docker Compose.
 - `outputs/generic_parent_runner_usage.md`: usage and CLI reference.
@@ -32,6 +33,7 @@ Build the sandbox image:
 
 ```bash
 podman build -t localhost/python-data-sandbox:latest -f outputs/Containerfile.python-data-sandbox outputs
+podman build -t localhost/python-browser-sandbox:latest -f outputs/Containerfile.browser-sandbox outputs
 ```
 
 ## Docker Compose
@@ -42,7 +44,7 @@ does not receive it.
 
 ```bash
 docker compose build sandbox-controller agent-app
-docker compose --profile sandbox-image build python-data-sandbox
+docker compose --profile sandbox-image build python-data-sandbox browser-sandbox
 docker compose up -d sandbox-controller agent-app
 ```
 
@@ -79,6 +81,11 @@ host and containers.
 For SELinux-enabled RedHat hosts, create the run directory with a suitable
 container label policy before starting Compose, or set `RUNS_ROOT_HOST` to a
 pre-labeled path.
+
+Sandbox containers are started with network disabled by default. The browser
+sandbox can run Playwright/Chromium against local files and generated artifacts,
+but it cannot perform external web search or browse internet sites unless the
+controller/backend network policy is explicitly changed.
 
 Stop runtime containers after use:
 
@@ -146,7 +153,7 @@ Each profile can define:
   overrides for that worker profile.
 
 The included examples cover quick checks, heavier statistical analysis,
-document/artifact generation, and seal-image reading.
+document/artifact generation, seal-image reading, and local browser validation.
 
 ## Linux / RedHat
 

@@ -220,6 +220,12 @@ The bundled examples live under:
 outputs/deep_agent_profiles/
 ```
 
+The `browser_validation` profile uses `localhost/python-browser-sandbox:latest`
+and provides Playwright/Chromium for local HTML, DOM, JavaScript, and screenshot
+smoke checks. The default sandbox security policy disables network access, so
+this browser profile is for offline/local artifact validation. It does not
+enable external web search or internet browsing by itself.
+
 ## Skill Example
 
 The included seal-reading skill lives at:

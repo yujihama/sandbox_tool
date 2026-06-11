@@ -93,6 +93,23 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertEqual(generated_tool.name, "run_analysis_agent")
         self.assertIn("Analysis profile.", generated_tool.description)
 
+    def test_bundled_profiles_load_with_browser_profile(self) -> None:
+        profiles = runner.load_deep_agent_profiles(
+            [],
+            [str(ROOT / "outputs" / "deep_agent_profiles")],
+        )
+        by_id = {profile.id: profile for profile in profiles}
+
+        self.assertIn("browser_validation", by_id)
+        self.assertEqual(
+            by_id["browser_validation"].image,
+            "localhost/python-browser-sandbox:latest",
+        )
+        self.assertEqual(
+            by_id["browser_validation"].tool_name,
+            "run_browser_validation_agent",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

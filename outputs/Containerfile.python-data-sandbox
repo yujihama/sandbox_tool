@@ -8,15 +8,32 @@ RUN useradd --create-home --uid 1000 analyst
 
 RUN pip install --no-cache-dir \
     arviz \
+    beautifulsoup4 \
+    charset-normalizer \
+    duckdb \
+    html5lib \
+    jinja2 \
+    jsonschema \
+    lxml \
+    markdown \
     matplotlib \
     numpy \
+    opencv-python-headless \
     openpyxl \
     pandas \
+    pdfplumber \
+    polars \
     pymc \
+    pyarrow \
+    pypdf \
+    PyYAML \
     scikit-learn \
+    scikit-image \
     scipy \
+    seaborn \
     statsmodels \
-    tabulate
+    tabulate \
+    xlsxwriter
 
 USER analyst
 WORKDIR /workspace

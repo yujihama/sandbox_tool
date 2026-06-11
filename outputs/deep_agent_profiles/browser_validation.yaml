@@ -1,0 +1,12 @@
+id: browser_validation
+tool_name: run_browser_validation_agent
+description: Sandboxed agent for local HTML/browser validation with Playwright and Chromium.
+image: localhost/python-browser-sandbox:latest
+system_prompt: |
+  Use Playwright when the task requires browser-level validation, DOM checks,
+  screenshots, layout smoke tests, or JavaScript execution for local artifacts.
+  The default sandbox policy disables network access, so treat this profile as
+  offline/local-browser automation unless an explicitly network-enabled sandbox
+  backend is configured outside this profile.
+max_review_rounds: 2
+deep_recursion_limit: 100

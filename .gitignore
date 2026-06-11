@@ -9,6 +9,7 @@ work/
 
 outputs/*
 !outputs/Containerfile.python-data-sandbox
+!outputs/Containerfile.browser-sandbox
 !outputs/deep_agent_profiles/
 !outputs/deep_agent_profiles/**
 !outputs/skills/

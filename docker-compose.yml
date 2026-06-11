@@ -33,7 +33,7 @@ services:
       RUNS_ROOT_HOST: ${RUNS_ROOT_HOST:-/srv/sandbox-tool/runs}
       SANDBOX_CONTROLLER_TOKEN: ${SANDBOX_CONTROLLER_TOKEN:-}
       OUTPUT_GATE_IMAGE: sandbox-tool-agent:local
-      SANDBOX_IMAGE_ALLOWLIST: ${SANDBOX_IMAGE_ALLOWLIST:-localhost/python-data-sandbox:latest}
+      SANDBOX_IMAGE_ALLOWLIST: ${SANDBOX_IMAGE_ALLOWLIST:-localhost/python-data-sandbox:latest,localhost/python-browser-sandbox:latest}
       SANDBOX_CONTAINER_USER: ${SANDBOX_CONTAINER_USER:-1000:1000}
       SANDBOX_MEMORY_LIMIT: ${SANDBOX_MEMORY_LIMIT:-2g}
       SANDBOX_PIDS_LIMIT: ${SANDBOX_PIDS_LIMIT:-256}
@@ -59,3 +59,12 @@ services:
     profiles:
       - sandbox-image
     command: ["python", "-V"]
+
+  browser-sandbox:
+    image: localhost/python-browser-sandbox:latest
+    build:
+      context: outputs
+      dockerfile: Containerfile.browser-sandbox
+    profiles:
+      - sandbox-image
+    command: ["python", "-c", "from playwright.sync_api import sync_playwright; print('playwright ready')"]
