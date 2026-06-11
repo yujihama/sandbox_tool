@@ -79,9 +79,9 @@ def run_deep_agent_subtask(
     """Delegate one subtask to a Deep Agent with output-gate allowed expected artifacts.
 
     expected_artifacts must be files under /outputs with one of these extensions:
-    .csv, .html, .md, .xlsx. Intermediate artifacts should normally be under
-    /outputs/subtasks/. Do not request .json, .py, .js, .png, .pdf, .docx,
-    .pptx, .xlsm, or directory artifacts as review/export artifacts.
+    .csv, .html, .json, .md, .xlsx, .yaml, .yml. Intermediate artifacts should
+    normally be under /outputs/subtasks/. Do not request .py, .js, .png, .pdf,
+    .docx, .pptx, .xlsm, or directory artifacts as review/export artifacts.
     """
     if base.CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
@@ -160,7 +160,7 @@ def build_multi_parent_prompt(min_subtasks: int) -> str:
         + base.ALLOWED_EXPORT_EXTENSIONS_TEXT
         + "\nDo not ask Deep Agents to create expected/review artifacts with other "
         "extensions. Helper files may exist under /outputs, but reviewed artifacts "
-        "must be .md, .csv, .xlsx, or .html."
+        "must use one of the output-gate allowed extensions."
         + (
             "\n\nDeep Agent skill sources:\n"
             + "\n".join(f"- {path}" for path in base.CONFIG.skill_sources)
@@ -173,7 +173,7 @@ def build_multi_parent_prompt(min_subtasks: int) -> str:
         "reads prior /outputs/subtasks artifacts and creates the final expected artifact(s). "
         "For intermediate subtasks, set expected_artifacts to specific paths under "
         "`/outputs/subtasks/` using only output-gate allowed extensions, usually "
-        ".md for narrative or .csv/.xlsx for structured data. "
+        ".md for narrative or .csv/.xlsx/.json/.yaml for structured data. "
         "After each subtask review request, inspect the subtask artifacts with "
         "read_sandbox_file, inspect_sandbox_file, or list_sandbox_files; use "
         "read_sandbox_file with a question or inspect_sandbox_image when visual "

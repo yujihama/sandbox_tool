@@ -139,6 +139,9 @@ run_root/
 
 - `.md`
 - `.csv`
+- `.json`
+- `.yaml`
+- `.yml`
 - `.xlsx`
 - `.html`
 
@@ -611,11 +614,23 @@ Fixture location:
 - `evil.md`
   - raw `<script>`
   - raw iframe
+- `evil.json`
+  - malformed JSON
+  - `NaN` / `Infinity`
+- `evil.yaml`
+  - anchors / aliases
+  - duplicate keys
+  - non-string keys
+  - tags outside the JSON-compatible safe subset
 - `evil.xlsx`
   - `WEBSERVICE`
   - external links
   - `vbaProject.bin`
   - data connections
+- `good.json`
+  - parsed and canonicalized.
+- `good.yaml`
+  - parsed through the safe subset and canonicalized.
 - `good.xlsx`
   - normal formulas preserved after gate.
 

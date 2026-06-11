@@ -99,8 +99,16 @@ Allowed final artifact extensions are:
 
 - `.md`
 - `.csv`
+- `.json`
+- `.yaml`
+- `.yml`
 - `.xlsx`
 - `.html`
+
+For `.json`, the gate parses strict JSON and writes a canonicalized copy. For
+`.yaml`/`.yml`, the gate uses PyYAML safe loading, rejects anchors, aliases,
+duplicate keys, non-string mapping keys, and tags outside a JSON-compatible
+safe subset, then writes a canonicalized YAML copy.
 
 For `.xlsx`, normal formulas are preserved. Dangerous formula functions and
 external references are rejected by default, or stringified if the runner is
