@@ -21,6 +21,11 @@ NO_DATA_PATTERNS = [
     "該当するデータ",
     "該当する情報",
 ]
+RESULT_COUNT_RE = re.compile(r"(\d+)\s*件\s*見つかりました")
+RESULT_RANGE_RE = re.compile(
+    r"(\d+)\s*件\s*[～~]\s*(\d+)\s*件\s*\(\s*全\s*(\d+)\s*件\s*\)"
+)
+NEXT_PAGE_RE = re.compile(r"次の\s*\d+\s*件")
 
 
 def normalize_space(value: str) -> str:
@@ -99,6 +104,70 @@ def parse_result_table(table: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_result_summary(
+    text: str,
+    result_rows: list[dict[str, Any]],
+    page: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = normalize_space(text)
+    total_count: int | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+
+    range_match = RESULT_RANGE_RE.search(normalized)
+    if range_match:
+        page_start = int(range_match.group(1))
+        page_end = int(range_match.group(2))
+        total_count = int(range_match.group(3))
+
+    count_match = RESULT_COUNT_RE.search(normalized)
+    if count_match:
+        total_count = int(count_match.group(1))
+
+    rows_seen = len(result_rows)
+    if rows_seen and page_start is None:
+        page_start = 1
+    if rows_seen and page_end is None:
+        page_end = rows_seen
+
+    link_texts: list[str] = []
+    links = page.get("links") if isinstance(page.get("links"), list) else []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        text_value = normalize_space(str(link.get("text") or ""))
+        if text_value:
+            link_texts.append(text_value)
+
+    available_controls: list[str] = []
+    for label in ["50件", "100件"]:
+        if label in normalized or label in link_texts:
+            available_controls.append(label)
+    has_next_page = bool(NEXT_PAGE_RE.search(normalized)) or any(
+        "次" in text_value and "件" in text_value for text_value in link_texts
+    )
+    if has_next_page:
+        available_controls.append("次の10件")
+    available_controls = list(dict.fromkeys(available_controls))
+
+    has_more_results = False
+    if total_count is not None:
+        seen_until = page_end if page_end is not None else rows_seen
+        has_more_results = bool(seen_until and seen_until < total_count)
+    has_more_results = has_more_results or has_next_page
+
+    return {
+        "total_count": total_count,
+        "page_start": page_start,
+        "page_end": page_end,
+        "rows_seen": rows_seen,
+        "has_next_page": has_next_page,
+        "has_more_results": bool(has_more_results),
+        "coverage_incomplete": bool(rows_seen and has_more_results),
+        "available_controls": available_controls,
+    }
+
+
 def extract_between(text: str, start_label: str, end_labels: list[str]) -> str:
     start = text.find(start_label)
     if start < 0:
@@ -172,6 +241,7 @@ def parse_result_file(path: Path) -> dict[str, Any]:
         result_rows.extend(parse_result_table(table))
 
     detail = parse_detail_text(text_preview, url, title)
+    result_summary = parse_result_summary(text_preview, result_rows, page)
     no_data = any(pattern in text_preview for pattern in NO_DATA_PATTERNS)
     if not result_rows and "kensaku-kekka.html" in url and tables == []:
         no_data = no_data or "検索結果" in text_preview or "Search Results" in text_preview
@@ -186,6 +256,7 @@ def parse_result_file(path: Path) -> dict[str, Any]:
         "blocked_url_count": data.get("blocked_url_count", 0),
         "no_data": bool(no_data),
         "result_row_count": len(result_rows),
+        "result_summary": result_summary,
         "result_rows": result_rows,
         "detail": detail,
     }
@@ -275,6 +346,54 @@ def summarize(
         )
         if row["match_score"] > 0
     ]
+    exact_found = any(row["match_type"] == "exact" for row in best_matches)
+    incomplete_files = [
+        {
+            "run_id": file_result["run_id"],
+            "url": file_result["url"],
+            **file_result["result_summary"],
+        }
+        for file_result in files
+        if file_result["result_summary"]["coverage_incomplete"]
+    ]
+    recommended_actions: list[str] = []
+    recommended_next_step = ""
+    if incomplete_files and not exact_found:
+        controls = {
+            control
+            for file_result in incomplete_files
+            for control in file_result.get("available_controls", [])
+        }
+        if "100件" in controls:
+            recommended_next_step = "expand_display_100"
+            recommended_actions.append(
+                "Rerun the search and click the 100件 display control, then parse the expanded result set."
+            )
+        if "50件" in controls:
+            recommended_next_step = recommended_next_step or "expand_display_50"
+            recommended_actions.append(
+                "Rerun the search and click the 50件 display control if 100件 is unavailable."
+            )
+        if "次の10件" in controls:
+            recommended_next_step = recommended_next_step or "follow_next_page_once"
+            recommended_actions.append(
+                "Follow 次の10件 or numbered result pages and parse each page until an exact match is found or coverage is complete."
+            )
+        recommended_next_step = recommended_next_step or "apply_input_filter_or_mark_incomplete"
+        recommended_actions.append(
+            "If the input row has prefecture/address context, add that filter and rerun before returning a broad candidate."
+        )
+    coverage = {
+        "coverage_incomplete": bool(incomplete_files),
+        "exact_found": exact_found,
+        "must_continue_before_broad_candidate": bool(query and incomplete_files and not exact_found),
+        "incomplete_files": incomplete_files,
+        "recommended_next_step": recommended_next_step,
+        "minimum_followup_required": bool(query and incomplete_files and not exact_found),
+        "max_additional_search_runs_per_query": 3,
+        "bounded_stop_status": "coverage_incomplete",
+        "recommended_actions": list(dict.fromkeys(recommended_actions)),
+    }
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "query": query,
@@ -283,6 +402,7 @@ def summarize(
         "no_data_count": sum(1 for item in files if item["no_data"]),
         "result_row_count": sum(item["result_row_count"] for item in files),
         "detail_page_count": sum(1 for item in files if item["detail"]["is_detail_page"]),
+        "coverage": coverage,
         "corporate_numbers": list(numbers.values()),
         "best_matches": best_matches,
         "files": files,

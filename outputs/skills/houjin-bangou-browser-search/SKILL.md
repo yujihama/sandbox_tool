@@ -58,6 +58,18 @@ python /input/browser-skills/houjin-bangou-browser-search/scripts/parse_houjin_p
    - Use `best_matches[0]` only when it has `match_type: "exact"` for the
      target query. Do not use the first visual result row if its legal name is
      not an exact match.
+   - If `coverage.must_continue_before_broad_candidate` is `true`, do not close
+     the task as `broad_candidate`. Continue with
+     `coverage.recommended_next_step`.
+   - If `coverage.minimum_followup_required` is `true`, do not close as
+     `needs_more_search` or `coverage_incomplete` until at least one
+     recommended follow-up browser run has been attempted, or until the browser
+     result shows that the recommended control/action is unavailable.
+   - Keep this continuation bounded. For each input query, use at most
+     `coverage.max_additional_search_runs_per_query` additional search/browser
+     runs after the initial broad result. If no exact match is found after that
+     budget, report `coverage_incomplete` or `needs_more_search` and request
+     parent review instead of continuing to browse.
    - Do not spend model turns manually reading large Playwright JSON unless the
      parser output is insufficient.
 
@@ -74,7 +86,20 @@ python /input/browser-skills/houjin-bangou-browser-search/scripts/parse_houjin_p
    - Update the next Playwright call from the observed DOM. Do not repeat a
      failed action unchanged.
 
-6. Report with uncertainty separated from facts.
+6. Use broad candidates only after coverage is sufficient.
+   - A first-page broad match is not enough when the parser says coverage is
+     incomplete.
+   - Broad candidate is acceptable only when the visible result set has been
+     covered enough to rule out an exact match, or when the report explicitly
+     states the site/control limitation that prevented further coverage.
+   - If the output schema permits it, prefer `needs_more_search` or
+     `coverage_incomplete` over `broad_candidate` when coverage remains
+     incomplete.
+   - Once the bounded continuation budget is spent, stop browsing, write the
+     artifact with the incomplete-coverage status, and call
+     `request_parent_review`.
+
+7. Report with uncertainty separated from facts.
    - Include original query, submitted query, match type
      (`exact`, `broad`, `fallback`, or `not_found`), corporate number, legal
      name, address/location, source URL, and retrieval time when available.
@@ -89,4 +114,9 @@ Before requesting parent review:
 - Re-run the parser and use its JSON output as the main evidence index.
 - Confirm every reported row appears in the saved browser trace.
 - Confirm every detail URL stays under `www.houjin-bangou.nta.go.jp`.
+- Confirm no row is closed as `broad_candidate` while parser coverage says
+  `must_continue_before_broad_candidate: true`.
+- Confirm no row is closed as `needs_more_search` or `coverage_incomplete`
+  while parser coverage says `minimum_followup_required: true` unless the final
+  notes cite the follow-up run attempted or the unavailable control/action.
 - Confirm the final artifact distinguishes exact matches from broad candidates.

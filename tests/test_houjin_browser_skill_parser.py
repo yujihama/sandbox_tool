@@ -150,6 +150,83 @@ class HoujinBrowserSkillParserTests(unittest.TestCase):
             )
             self.assertEqual(summary["best_matches"][0]["match_type"], "exact")
 
+    def test_parser_requires_more_search_when_exact_absent_and_coverage_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result_path = root / "toyota_first_page.json"
+            output_path = root / "summary.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "run_id": "toyota-first-page",
+                        "page": {
+                            "url": "https://www.houjin-bangou.nta.go.jp/kensaku-kekka.html",
+                            "title": "検索結果一覧｜国税庁法人番号公表サイト",
+                            "text_preview": (
+                                "検索条件： 部分一致検索/トヨタ自動車株式会社 "
+                                "48件 見つかりました。 表示件数10件50件100件 "
+                                "12345次の10件 1件 ～ 10件 (全48件)"
+                            ),
+                            "links": [
+                                {"text": "50件", "href": "#", "title": ""},
+                                {"text": "100件", "href": "#", "title": ""},
+                                {"text": "次の10件", "href": "#", "title": ""},
+                            ],
+                            "tables": [
+                                [
+                                    ["法人番号", "商号又は名称", "所在地", "変更履歴情報等"],
+                                    [
+                                        "9180001059935",
+                                        "アイチトヨタジドウシャ\n愛知トヨタ自動車株式会社",
+                                        "愛知県名古屋市昭和区高辻町６番８号",
+                                        "履歴等",
+                                    ],
+                                ]
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(result_path),
+                    "--output",
+                    str(output_path),
+                    "--query",
+                    "トヨタ自動車株式会社",
+                ],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+            summary = json.loads(output_path.read_text(encoding="utf-8"))
+            file_summary = summary["files"][0]["result_summary"]
+            self.assertEqual(file_summary["total_count"], 48)
+            self.assertEqual(file_summary["page_start"], 1)
+            self.assertEqual(file_summary["page_end"], 10)
+            self.assertTrue(file_summary["has_next_page"])
+            self.assertTrue(file_summary["coverage_incomplete"])
+            self.assertTrue(summary["coverage"]["coverage_incomplete"])
+            self.assertFalse(summary["coverage"]["exact_found"])
+            self.assertTrue(summary["coverage"]["must_continue_before_broad_candidate"])
+            self.assertEqual(
+                summary["coverage"]["recommended_next_step"], "expand_display_100"
+            )
+            self.assertTrue(summary["coverage"]["minimum_followup_required"])
+            self.assertEqual(summary["coverage"]["max_additional_search_runs_per_query"], 3)
+            self.assertEqual(summary["coverage"]["bounded_stop_status"], "coverage_incomplete")
+            self.assertIn("100件", file_summary["available_controls"])
+            self.assertTrue(
+                any("100件" in action for action in summary["coverage"]["recommended_actions"])
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
