@@ -1,6 +1,11 @@
 id: browser_research
 tool_name: run_browser_research_agent
 description: Sandboxed agent for interactive public website research using deterministic Playwright with egress guard.
+expose_to_parent: false
+toolsets:
+  - review
+  - file_read
+  - browser
 image: localhost/python-browser-sandbox:latest
 skill_sources:
   - ../skills/houjin-bangou-browser-search=/input/browser-skills/houjin-bangou-browser-search

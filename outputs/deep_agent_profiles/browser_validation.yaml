@@ -1,6 +1,10 @@
 id: browser_validation
 tool_name: run_browser_validation_agent
 description: Sandboxed agent for local HTML/browser validation with Playwright and Chromium.
+toolsets:
+  - review
+  - file_read
+  - browser
 image: localhost/python-browser-sandbox:latest
 system_prompt: |
   Use Playwright when the task requires browser-level validation, DOM checks,

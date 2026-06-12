@@ -19,12 +19,16 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest
+from langchain.agents.middleware.types import ModelResponse
 from langchain.tools import tool
+from langchain_core.messages import SystemMessage, ToolMessage
 from openai import OpenAI
+from typing_extensions import NotRequired
 
 from deepagents import create_deep_agent
 
@@ -75,6 +79,8 @@ class DeepAgentProfile:
     id: str
     tool_name: str
     description: str
+    toolsets: list[str] = field(default_factory=list)
+    expose_to_parent: bool = True
     system_prompt: str = ""
     skill_source_specs: list[str] = field(default_factory=list)
     skill_sources: list[str] = field(default_factory=list)
@@ -131,6 +137,251 @@ PLAYWRIGHT_MAX_MIN_ACTION_DELAY_MS = 10000
 PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS = 5000
 PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS = 60000
 PLAYWRIGHT_DOMAIN_LAST_FINISH: dict[str, float] = {}
+ACTIVE_DEEP_AGENT_TOOLSETS: set[str] = set()
+
+TOOLSET_TOOL_NAMES: dict[str, list[str]] = {
+    "review": ["request_parent_review"],
+    "file_read": ["read_sandbox_file"],
+    "image_inspect": ["inspect_sandbox_image"],
+    "site_crawl": [
+        "crawl_allowed_site",
+        "extract_allowed_site_links",
+        "crawl_allowed_urls",
+        "search_site_crawl",
+        "read_crawled_page",
+        "list_site_crawls",
+    ],
+    "browser": ["run_playwright_task"],
+}
+TOOLSET_DESCRIPTIONS: dict[str, str] = {
+    "review": "request parent review for gated artifacts",
+    "file_read": "type-aware reads of /input and /outputs files",
+    "image_inspect": "direct image vision inspection",
+    "site_crawl": "controlled allowlisted site crawling and crawl-index reads",
+    "browser": "deterministic Playwright browser interaction",
+}
+ALLOWED_TOOLSETS = set(TOOLSET_TOOL_NAMES)
+FINALIZE_TOOL_ALLOWLIST = {
+    "request_parent_review",
+    "read_sandbox_file",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "execute",
+    "ls",
+}
+
+
+class GracefulFinalizeState(AgentState):
+    graceful_finalize_model_calls: NotRequired[int]
+    graceful_finalize_mode: NotRequired[str]
+
+
+class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
+    """Shift a Deep Agent from exploration to artifact finalization before hard limits."""
+
+    state_schema = GracefulFinalizeState
+
+    def __init__(
+        self,
+        *,
+        profile_id: str,
+        expected_artifacts: list[str],
+        warning_model_calls: int,
+        finalize_model_calls: int,
+        warning_tool_calls: int,
+        finalize_tool_calls: int,
+        warning_message_count: int,
+        finalize_message_count: int,
+        finalize_tool_allowlist: set[str] | None = None,
+    ) -> None:
+        self.profile_id = profile_id
+        self.expected_artifacts = expected_artifacts
+        self.warning_model_calls = max(1, warning_model_calls)
+        self.finalize_model_calls = max(self.warning_model_calls + 1, finalize_model_calls)
+        self.warning_tool_calls = max(1, warning_tool_calls)
+        self.finalize_tool_calls = max(self.warning_tool_calls + 1, finalize_tool_calls)
+        self.warning_message_count = max(1, warning_message_count)
+        self.finalize_message_count = max(
+            self.warning_message_count + 1,
+            finalize_message_count,
+        )
+        self.finalize_tool_allowlist = finalize_tool_allowlist or FINALIZE_TOOL_ALLOWLIST
+        self.tool_calls = 0
+
+    def before_model(
+        self, state: GracefulFinalizeState, runtime: Any
+    ) -> dict[str, Any] | None:
+        count = state.get("graceful_finalize_model_calls", 0) + 1
+        mode = self._mode_for_state(count, len(state.get("messages", [])), self.tool_calls)
+        return {
+            "graceful_finalize_model_calls": count,
+            "graceful_finalize_mode": mode,
+        }
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        count = int(request.state.get("graceful_finalize_model_calls", 0))
+        message_count = len(request.state.get("messages", []))
+        mode = self._mode_for_state(count, message_count, self.tool_calls)
+
+        if mode == "finalize":
+            return handler(
+                request.override(
+                    tools=self.filter_finalize_tools(request.tools),
+                    system_message=self._append_system_instruction(
+                        request.system_message,
+                        self.finalize_instruction(count, message_count),
+                    ),
+                )
+            )
+
+        if mode == "warning":
+            return handler(
+                request.override(
+                    system_message=self._append_system_instruction(
+                        request.system_message,
+                        self.warning_instruction(count, message_count),
+                    )
+                )
+            )
+
+        return handler(request)
+
+    def wrap_tool_call(
+        self,
+        request: Any,
+        handler: Callable[[Any], Any],
+    ) -> Any:
+        self.tool_calls += 1
+        tool_name = self._tool_name(getattr(request, "tool", None))
+        if not tool_name:
+            tool_name = self._tool_name(getattr(request, "tool_call", {}))
+        mode = self._mode_for_state(
+            int(request.state.get("graceful_finalize_model_calls", 0)),
+            len(request.state.get("messages", [])),
+            self.tool_calls,
+        )
+        if mode == "finalize" and tool_name not in self.finalize_tool_allowlist:
+            tool_call = getattr(request, "tool_call", {}) or {}
+            tool_call_id = str(tool_call.get("id") or tool_call.get("tool_call_id") or "")
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "ok": False,
+                        "error": "graceful_finalize_blocked_tool",
+                        "tool": tool_name,
+                        "message": (
+                            "Execution budget is near the hard recursion limit. "
+                            "Exploration tools are disabled; finalize artifacts, "
+                            "run self-check, and request parent review."
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_call_id=tool_call_id,
+                name=tool_name or None,
+            )
+        return handler(request)
+
+    def _mode_for_state(
+        self,
+        model_calls: int,
+        message_count: int,
+        tool_calls: int,
+    ) -> str:
+        if (
+            model_calls >= self.finalize_model_calls
+            or tool_calls >= self.finalize_tool_calls
+            or message_count >= self.finalize_message_count
+        ):
+            return "finalize"
+        if (
+            model_calls >= self.warning_model_calls
+            or tool_calls >= self.warning_tool_calls
+            or message_count >= self.warning_message_count
+        ):
+            return "warning"
+        return "normal"
+
+    def _append_system_instruction(
+        self,
+        existing: SystemMessage | str | None,
+        instruction: str,
+    ) -> SystemMessage:
+        if existing is None:
+            return SystemMessage(content=instruction)
+        if isinstance(existing, SystemMessage):
+            base = existing.content
+            if isinstance(base, list):
+                base_text = "\n".join(str(part) for part in base)
+            else:
+                base_text = str(base)
+            return SystemMessage(content=base_text + "\n\n" + instruction)
+        return SystemMessage(content=str(existing) + "\n\n" + instruction)
+
+    def _tool_name(self, item: Any) -> str:
+        if isinstance(item, dict):
+            if isinstance(item.get("function"), dict) and item["function"].get("name"):
+                return str(item["function"]["name"])
+            if item.get("name"):
+                return str(item["name"])
+        return str(getattr(item, "name", None) or getattr(item, "__name__", ""))
+
+    def filter_finalize_tools(self, tools: list[Any]) -> list[Any]:
+        return [
+            item
+            for item in tools
+            if self._tool_name(item) in self.finalize_tool_allowlist
+        ]
+
+    def warning_instruction(self, model_calls: int, message_count: int) -> str:
+        return (
+            "[Budget warning]\n"
+            f"Profile `{self.profile_id}` is approaching its execution budget "
+            f"(model_calls={model_calls}, tool_calls={self.tool_calls}, "
+            f"messages={message_count}). Stop broad "
+            "exploration now: do not start new crawls/browser searches unless a "
+            "specific required URL is already identified. Prefer existing collected "
+            "evidence, narrow candidates, and move toward artifact creation, "
+            "self-check, and request_parent_review."
+        )
+
+    def finalize_instruction(self, model_calls: int, message_count: int) -> str:
+        expected_text = "\n".join(f"- {path}" for path in self.expected_artifacts)
+        review_artifacts = list(dict.fromkeys([
+            *self.expected_artifacts,
+            "/outputs/subtasks/self_check_plan.md",
+            "/outputs/subtasks/self_check_report.md",
+        ]))
+        review_text = "\n".join(f"- {path}" for path in review_artifacts)
+        return (
+            "[Graceful finalize mode]\n"
+            f"Profile `{self.profile_id}` is near its execution budget "
+            f"(model_calls={model_calls}, tool_calls={self.tool_calls}, "
+            f"messages={message_count}). You must stop "
+            "exploration and finalize now.\n\n"
+            "Rules:\n"
+            "- Do not perform new crawling, browser actions, broad searches, or new "
+            "candidate discovery.\n"
+            "- Use only already collected evidence and files currently available in "
+            "/outputs or /input.\n"
+            "- If fewer records than requested are supported, produce the supported "
+            "partial result and clearly state the limitation.\n"
+            "- If an expected artifact is missing, create a minimal honest artifact "
+            "in the requested format rather than continuing exploration.\n\n"
+            "Required expected artifacts:\n"
+            f"{expected_text}\n\n"
+            "Create or update `/outputs/subtasks/self_check_plan.md` and "
+            "`/outputs/subtasks/self_check_report.md`. Run a small self-check with "
+            "`execute` if possible; if not, write the limitation in the report.\n\n"
+            "Then call request_parent_review with exactly these review artifacts:\n"
+            f"{review_text}\n\n"
+            "After request_parent_review returns, stop."
+        )
 
 
 def load_env_local(path: Path) -> None:
@@ -166,6 +417,33 @@ def as_string_list(value: Any, field_name: str) -> list[str]:
         if item.strip():
             result.append(item.strip())
     return result
+
+
+def validate_profile_toolsets(value: Any, profile_path: Path) -> list[str]:
+    toolsets = as_string_list(value, "toolsets")
+    if not toolsets:
+        raise ValueError(f"Deep Agent profile must declare non-empty toolsets: {profile_path}")
+    unknown = sorted(set(toolsets) - ALLOWED_TOOLSETS)
+    if unknown:
+        raise ValueError(
+            f"Unknown toolsets in {profile_path}: {', '.join(unknown)}. "
+            f"Allowed toolsets: {', '.join(sorted(ALLOWED_TOOLSETS))}"
+        )
+    if "review" not in toolsets:
+        raise ValueError(f"Deep Agent profile must include the review toolset: {profile_path}")
+    deduped: list[str] = []
+    for toolset in toolsets:
+        if toolset not in deduped:
+            deduped.append(toolset)
+    return deduped
+
+
+def optional_bool(value: Any, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field_name} must be a boolean when specified.")
 
 
 def read_profile_document(path: Path) -> dict[str, Any]:
@@ -214,6 +492,10 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
         id=profile_id,
         tool_name=tool_name,
         description=description,
+        toolsets=validate_profile_toolsets(data.get("toolsets"), profile_path),
+        expose_to_parent=optional_bool(
+            data.get("expose_to_parent"), "expose_to_parent", True
+        ),
         system_prompt=system_prompt,
         skill_source_specs=as_string_list(data.get("skill_sources"), "skill_sources"),
         include_global_skills=bool(data.get("include_global_skills", False)),
@@ -229,21 +511,26 @@ def load_deep_agent_profiles(
     profile_paths: list[str],
     profile_dirs: list[str],
 ) -> list[DeepAgentProfile]:
-    paths = [Path(path).expanduser().resolve() for path in profile_paths]
+    paths = [
+        (Path(path).expanduser().resolve(), True)
+        for path in profile_paths
+    ]
     for directory in profile_dirs:
         root = Path(directory).expanduser().resolve()
         if not root.exists() or not root.is_dir():
             raise FileNotFoundError(f"Deep Agent profile directory does not exist: {root}")
         for suffix in ("*.json", "*.yaml", "*.yml"):
-            paths.extend(sorted(root.glob(suffix)))
+            paths.extend((path, False) for path in sorted(root.glob(suffix)))
 
     profiles: list[DeepAgentProfile] = []
     seen_ids: set[str] = set()
     seen_tools: set[str] = set()
-    for path in paths:
+    for path, explicit in paths:
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Deep Agent profile does not exist: {path}")
         profile = load_deep_agent_profile(path)
+        if not explicit and not profile.expose_to_parent:
+            continue
         if profile.id in seen_ids:
             raise ValueError(f"Duplicate Deep Agent profile id: {profile.id}")
         if profile.tool_name in seen_tools:
@@ -690,9 +977,24 @@ def input_manifest() -> list[dict[str, str]]:
     ]
 
 
+def tool_names_for_toolsets(toolsets: list[str]) -> list[str]:
+    names: list[str] = []
+    for toolset in toolsets:
+        for tool_name in TOOLSET_TOOL_NAMES[toolset]:
+            if tool_name not in names:
+                names.append(tool_name)
+    return names
+
+
 def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     model_note = f"; model={profile.deep_model}" if profile.deep_model else ""
     image_note = f"; image={profile.image}" if profile.image else ""
+    toolset_note = f"; toolsets={', '.join(profile.toolsets)}" if profile.toolsets else ""
+    tools_note = (
+        f"; custom_tools={', '.join(tool_names_for_toolsets(profile.toolsets))}"
+        if profile.toolsets
+        else ""
+    )
     rounds_note = (
         f"; max_review_rounds={profile.max_review_rounds}"
         if profile.max_review_rounds is not None
@@ -703,7 +1005,8 @@ def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     )
     return (
         f"- {profile.tool_name}: {profile.description} "
-        f"(profile_id={profile.id}{model_note}{image_note}{rounds_note}{skill_note})"
+        f"(profile_id={profile.id}{toolset_note}{tools_note}{model_note}"
+        f"{image_note}{rounds_note}{skill_note})"
     )
 
 
@@ -1258,8 +1561,9 @@ def read_sandbox_file(
     Read a sandbox file under /input or /outputs with type-aware handling.
 
     Text, CSV, JSON, Excel, and PDF files return structured previews. Image files
-    return metadata, and when `question` is supplied the tool also performs a
-    vision read. Audio/video and other binaries return metadata only.
+    return metadata. When `question` is supplied for an image, the tool performs
+    a vision read only for profiles that include the `image_inspect` toolset.
+    Audio/video and other binaries return metadata only.
     """
     file_info = inspect_sandbox_file.invoke(
         {
@@ -1282,6 +1586,13 @@ def read_sandbox_file(
         "file": file_info,
     }
     if kind == "image" and question.strip():
+        if ACTIVE_DEEP_AGENT_TOOLSETS and "image_inspect" not in ACTIVE_DEEP_AGENT_TOOLSETS:
+            result["question_note"] = (
+                "Image vision reads are disabled for the active Deep Agent profile "
+                "because it does not include the image_inspect toolset. Use metadata "
+                "only or route the task to a profile with image_inspect."
+            )
+            return result
         vision = inspect_sandbox_image.invoke(
             {
                 "path": path,
@@ -3007,6 +3318,7 @@ def default_deep_agent_profile() -> DeepAgentProfile:
         id="default",
         tool_name="run_deep_agent_task",
         description="Run the default sandboxed Deep Agent worker.",
+        toolsets=["review", "file_read", "image_inspect", "site_crawl", "browser"],
         skill_sources=CONFIG.skill_sources,
         image=CONFIG.image,
         deep_model=CONFIG.deep_model,
@@ -3024,8 +3336,66 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "Profile-specific instructions:\n"
             f"{profile.system_prompt.strip()}\n\n"
         )
+    toolset_lines = [
+        f"- {toolset}: {TOOLSET_DESCRIPTIONS[toolset]} "
+        f"({', '.join(TOOLSET_TOOL_NAMES[toolset])})"
+        for toolset in profile.toolsets
+    ]
+    toolset_block = (
+        "Available custom toolsets for this profile:\n"
+        + "\n".join(toolset_lines)
+        + "\n\n"
+    )
+    file_read_text = ""
+    if "file_read" in profile.toolsets:
+        image_suffix = (
+            " If `image_inspect` is also available, image questions can use vision; "
+            "otherwise image files return metadata only."
+            if "image_inspect" in profile.toolsets
+            else " Image files return metadata only because `image_inspect` is not available."
+        )
+        file_read_text = (
+            "Use read_sandbox_file when you need a type-aware read of /input or "
+            "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
+            f"metadata, and other supported files.{image_suffix} "
+        )
+    image_text = ""
+    if "image_inspect" in profile.toolsets:
+        image_text = (
+            "Use inspect_sandbox_image for focused visual review after creating "
+            "crops, contact sheets, plots, or screenshots. "
+        )
+    site_text = ""
+    if "site_crawl" in profile.toolsets:
+        site_text = (
+            "For website research, do not use arbitrary search or network access "
+            "from the sandbox. Instead, use the controlled site tools: "
+            "crawl_allowed_site, extract_allowed_site_links, crawl_allowed_urls, "
+            "search_site_crawl, read_crawled_page, and list_site_crawls. These "
+            "tools enforce allowed domains, page/depth limits, response-size "
+            "limits, and robots.txt before writing a local crawl index under "
+            "/outputs/_site_crawl. When completeness for dated articles or "
+            "collection pages matters, extract the listing links first, then "
+            "crawl that explicit URL set. "
+        )
+    browser_text = ""
+    if "browser" in profile.toolsets:
+        browser_text = (
+            "For interactive sites or local browser validation that require "
+            "JavaScript, rendered forms, clicks, DOM checks, screenshots, or "
+            "CSRF-managed browser flows, use run_playwright_task with explicit "
+            "allowed_domains. Browser tasks include an egress guard: keep inputs "
+            "short, search-like, and task-relevant; do not send file contents, "
+            "secrets, or structured payloads through browser fields or URLs. "
+            "The browser tool applies generic rate-limit avoidance by default: "
+            "keep min_action_delay_ms at least 1000 unless a slower pace is "
+            "needed, avoid opening many detail pages in rapid succession, and if "
+            "HTTP 429 or Too Many Requests appears, back off and report the "
+            "limitation rather than increasing request volume. "
+        )
     return (
         profile_block
+        + toolset_block
         + "You are a task execution agent running in an isolated sandbox. "
         "Read inputs only from /input and write final artifacts under /outputs. "
         f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
@@ -3033,31 +3403,11 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
         "files in request_parent_review. "
         "Save larger scripts under /outputs before executing them. "
         "Do not use the network from the sandbox. Use installed local libraries when helpful. "
-        "For website research, do not use arbitrary search or network access from the "
-        "sandbox. Instead, use the controlled site tools: crawl_allowed_site, "
-        "extract_allowed_site_links, crawl_allowed_urls, search_site_crawl, "
-        "read_crawled_page, list_site_crawls, and "
-        "run_playwright_task for deterministic rendered browser tasks. These tools "
-        "enforce allowed domains, page/depth limits, response-size limits, and "
-        "robots.txt before writing a local crawl index under /outputs/_site_crawl. "
-        "When completeness for dated articles or collection pages matters, extract "
-        "the listing links first, then crawl that explicit URL set. "
-        "For interactive sites that require JavaScript, rendered forms, clicks, "
-        "or CSRF-managed browser flows, use run_playwright_task with explicit "
-        "allowed_domains. Browser tasks include an egress guard: keep inputs "
-        "short, search-like, and task-relevant; do not send file contents, "
-        "secrets, or structured payloads through browser fields or URLs. "
-        "The browser tool applies generic rate-limit avoidance by default: keep "
-        "min_action_delay_ms at least 1000 unless a slower pace is needed, avoid "
-        "opening many detail pages in rapid succession, and if HTTP 429 or "
-        "Too Many Requests appears, back off and report the limitation rather than "
-        "increasing request volume. "
-        "Use read_sandbox_file when you need a type-aware read of /input or "
-        "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
-        "metadata, and can perform a vision read of images when you pass a "
-        "question. You may still call inspect_sandbox_image directly for focused "
-        "visual review after creating crops, contact sheets, plots, or screenshots. "
-        "Cite inspected file paths and any uncertainty in your artifacts. "
+        + file_read_text
+        + image_text
+        + site_text
+        + browser_text
+        + "Cite inspected file paths and any uncertainty in your artifacts. "
         "Before requesting parent review, you must perform an autonomous self-check. "
         "This self-check is task-specific and you must design it yourself; do not "
         "wait for a prebuilt validator. Required self-check artifacts: "
@@ -3084,6 +3434,53 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
         "review, fix the issues first, rerun self-check, then call "
         "request_parent_review again."
     )
+
+
+def deep_agent_tools_for_profile(profile: DeepAgentProfile) -> list[Any]:
+    tools_by_toolset: dict[str, list[Any]] = {
+        "review": [request_parent_review],
+        "file_read": [read_sandbox_file],
+        "image_inspect": [inspect_sandbox_image],
+        "site_crawl": [
+            crawl_allowed_site,
+            extract_allowed_site_links,
+            crawl_allowed_urls,
+            search_site_crawl,
+            read_crawled_page,
+            list_site_crawls,
+        ],
+        "browser": [run_playwright_task],
+    }
+    selected: list[Any] = []
+    seen_names: set[str] = set()
+    for toolset in profile.toolsets:
+        for item in tools_by_toolset[toolset]:
+            name = getattr(item, "name", None) or getattr(item, "__name__", str(item))
+            if name in seen_names:
+                continue
+            selected.append(item)
+            seen_names.add(name)
+    return selected
+
+
+def graceful_finalize_thresholds(recursion_limit: int) -> dict[str, int]:
+    finalize_model_calls = max(8, min(30, recursion_limit // 4))
+    warning_model_calls = max(4, int(finalize_model_calls * 0.75))
+    finalize_tool_calls = max(8, min(24, recursion_limit // 5))
+    warning_tool_calls = max(4, int(finalize_tool_calls * 0.75))
+    warning_message_count = max(12, int(recursion_limit * 0.55))
+    finalize_message_count = max(
+        warning_message_count + 4,
+        int(recursion_limit * 0.70),
+    )
+    return {
+        "warning_model_calls": warning_model_calls,
+        "finalize_model_calls": finalize_model_calls,
+        "warning_tool_calls": warning_tool_calls,
+        "finalize_tool_calls": finalize_tool_calls,
+        "warning_message_count": warning_message_count,
+        "finalize_message_count": finalize_message_count,
+    }
 
 
 def execute_deep_agent_task(
@@ -3182,27 +3579,31 @@ def execute_deep_agent_task(
         return evaluation
 
     backend = create_configured_backend(effective_image)
+    selected_deep_tools = deep_agent_tools_for_profile(profile)
+    selected_deep_tool_names = [
+        getattr(item, "name", None) or getattr(item, "__name__", str(item))
+        for item in selected_deep_tools
+    ]
+    graceful_finalize_config = graceful_finalize_thresholds(effective_recursion_limit)
 
     deep_error: dict[str, Any] | None = None
     DEEP_AGENT_TRACE.clear()
+    global ACTIVE_DEEP_AGENT_TOOLSETS
     try:
+        ACTIVE_DEEP_AGENT_TOOLSETS = set(profile.toolsets)
         deep_agent = create_deep_agent(
             model=effective_model,
-            tools=[
-                request_parent_review,
-                read_sandbox_file,
-                inspect_sandbox_image,
-                crawl_allowed_site,
-                extract_allowed_site_links,
-                crawl_allowed_urls,
-                run_playwright_task,
-                search_site_crawl,
-                read_crawled_page,
-                list_site_crawls,
-            ],
+            tools=selected_deep_tools,
             backend=backend,
             skills=effective_skill_sources or None,
             system_prompt=build_deep_agent_system_prompt(profile),
+            middleware=[
+                GracefulFinalizeMiddleware(
+                    profile_id=profile.id,
+                    expected_artifacts=effective_expected_artifacts,
+                    **graceful_finalize_config,
+                )
+            ],
         )
         deep_result = deep_agent.invoke(
             {"messages": [{"role": "user", "content": task_with_contract}]},
@@ -3234,6 +3635,7 @@ def execute_deep_agent_task(
             encoding="utf-8",
         )
     finally:
+        ACTIVE_DEEP_AGENT_TOOLSETS = set()
         workspace_dir = backend.workspace_dir
         backend.cleanup()
         workspace_exists = workspace_dir.exists()
@@ -3277,6 +3679,9 @@ def execute_deep_agent_task(
             "id": profile.id,
             "tool_name": profile.tool_name,
             "description": profile.description,
+            "toolsets": profile.toolsets,
+            "available_tools": selected_deep_tool_names,
+            "graceful_finalize": graceful_finalize_config,
             "image": effective_image,
             "deep_model": effective_model,
             "deep_recursion_limit": effective_recursion_limit,
@@ -3350,13 +3755,19 @@ def make_deep_agent_profile_tool(profile: DeepAgentProfile) -> Any:
     run_profile_deep_agent.__name__ = profile.tool_name
     run_profile_deep_agent.__doc__ = (
         f"{profile.description}\n\n"
+        f"Available toolsets: {', '.join(profile.toolsets)}. "
+        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}.\n\n"
         "Run this sandboxed Deep Agent profile for allowed /outputs artifacts. "
         "expected_artifacts must be files under /outputs using only output-gate "
         "allowed extensions: .csv, .html, .json, .md, .xlsx, .yaml, .yml. "
         "Do not request .py, .js, .png, .pdf, .docx, .pptx, .xlsm, or directory "
         "artifacts as review/export artifacts."
     )
-    return tool(profile.tool_name, description=profile.description)(run_profile_deep_agent)
+    tool_description = (
+        f"{profile.description} Available toolsets: {', '.join(profile.toolsets)}. "
+        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}."
+    )
+    return tool(profile.tool_name, description=tool_description)(run_profile_deep_agent)
 
 
 def active_deep_agent_tools() -> list[Any]:

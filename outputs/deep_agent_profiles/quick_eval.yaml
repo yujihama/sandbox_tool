@@ -1,6 +1,10 @@
 id: quick_eval
 tool_name: run_quick_eval_agent
 description: Fast sandboxed agent for small checks, lightweight transformations, and quick summaries.
+toolsets:
+  - review
+  - file_read
+  - image_inspect
 system_prompt: |
   Prefer direct, minimal processing. Use short scripts only when they reduce risk
   or make the result reproducible. Keep outputs compact and focus on completing

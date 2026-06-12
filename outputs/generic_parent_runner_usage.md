@@ -190,6 +190,10 @@ Example profile:
 id: heavy_data_analysis
 tool_name: run_heavy_data_analysis_agent
 description: Sandboxed agent for larger statistical analysis, sampling, modeling, and visual/report artifacts.
+toolsets:
+  - review
+  - file_read
+  - image_inspect
 system_prompt: |
   Use reproducible analysis scripts for nontrivial computations. Explain
   methods, assumptions, uncertainty, and limitations in the final report.
@@ -206,6 +210,9 @@ Field behavior:
 
 - `tool_name` is the name exposed to the parent agent.
 - `description` is the routing hint the parent sees.
+- `toolsets` is required for profile YAML files and controls the actual custom
+  tools passed to the Deep Agent. Unknown toolsets or profiles without `review`
+  fail at load time.
 - `system_prompt` and `system_prompt_file` add worker-only instructions.
 - `skill_sources` stage profile-specific skills; relative host paths are
   resolved from the profile file directory.
@@ -213,6 +220,29 @@ Field behavior:
   that profile.
 - `image`, `deep_model`, `deep_recursion_limit`, and `max_review_rounds`
   override the runner defaults only for that profile.
+- `expose_to_parent: false` hides a profile when loading a profile directory.
+  The profile can still be used by passing it explicitly with
+  `--deep-agent-profile`.
+- Deep Agent attempts also use a graceful-finalize middleware derived from
+  `deep_recursion_limit`. Before the hard graph recursion limit is reached, the
+  middleware warns the worker, then removes broad exploration tools and leaves
+  completion tools such as file writing, `execute`, and `request_parent_review`.
+  The worker is instructed to produce supported partial artifacts, self-check,
+  and request parent review instead of failing with `GraphRecursionError`.
+
+Supported toolsets:
+
+- `review`: `request_parent_review`; required for every profile.
+- `file_read`: `read_sandbox_file`; type-aware reads of `/input` and `/outputs`.
+- `image_inspect`: `inspect_sandbox_image`; focused vision reads for images.
+- `site_crawl`: `crawl_allowed_site`, `extract_allowed_site_links`,
+  `crawl_allowed_urls`, `search_site_crawl`, `read_crawled_page`,
+  `list_site_crawls`.
+- `browser`: `run_playwright_task`.
+
+The bundled `quick_eval`, `document_artifact`, and `heavy_data_analysis`
+profiles include `image_inspect` so they can inspect plots, screenshots,
+extracted figures, or other generated images during self-checks.
 
 The bundled examples live under:
 
@@ -220,50 +250,56 @@ The bundled examples live under:
 outputs/deep_agent_profiles/
 ```
 
+For public web research, the default parent-facing profile is `web_research`.
+It receives both `site_crawl` and `browser`, but its prompt is crawler-first:
+use listing/link extraction and controlled crawls when possible, then fall back
+to Playwright only for forms, JavaScript-rendered content, clicks, dynamic
+pagination, or other interactive page state. This keeps the parent-facing tool
+surface simple while preserving both retrieval modes inside one worker.
+
+The specialized `site_research` and `browser_research` profiles remain in the
+profile directory with `expose_to_parent: false`. They are not exposed when the
+directory is loaded, but can be passed explicitly with `--deep-agent-profile`
+for isolation/debugging:
+
+- `site_research`: crawler-only; no Playwright.
+- `browser_research`: Playwright-only; no site crawler.
+
 The `browser_validation` profile uses `localhost/python-browser-sandbox:latest`
 and provides Playwright/Chromium for local HTML, DOM, JavaScript, and screenshot
 smoke checks. The default sandbox security policy disables network access, so
 this browser profile is for offline/local artifact validation. It does not
 enable external web search or internet browsing by itself.
 
-The `browser_research` profile is for rendered and interactive public websites.
-It uses the generic deterministic `run_playwright_task` tool for forms,
-CSRF-managed flows, clicks, and JavaScript-rendered pages. Each call must
-provide `allowed_domains`; the tool saves JSON/Markdown traces under
-`/outputs/_playwright/<run_id>/`. Browser input is egress guarded: long values,
-secret/path-like strings, high-entropy encoded payloads, and structured
-payload-like values are rejected. File-upload actions are not implemented. Use
-this profile when a rendered site must be inspected without broad web search.
-This profile also stages only the `houjin-bangou-browser-search` skill for
-Corporate Number Publication Site tasks. Other profiles do not receive that
-skill unless explicitly configured. The skill contains known-good Playwright
-step recipes and a parser for saved Playwright `result.json` files, which helps
-the Deep Agent reuse successful paths and extract corporate numbers/detail URLs
-without re-reading large browser traces by hand.
+The `web_research` profile stages the `houjin-bangou-browser-search` skill for
+Corporate Number Publication Site tasks. The skill contains known-good
+Playwright step recipes and a parser for saved Playwright `result.json` files,
+which helps the Deep Agent reuse successful paths and extract corporate
+numbers/detail URLs without re-reading large browser traces by hand.
 
-The `site_research` profile is for controlled research against a specific public
-site or small domain allowlist. The Deep Agent can call `crawl_allowed_site`,
-`extract_allowed_site_links`, `crawl_allowed_urls`, `search_site_crawl`,
-`read_crawled_page`, and `list_site_crawls`; those tools only fetch allowed
-http(s) URLs, reject local/private hosts, respect robots.txt by default, and
-store extracted text plus an index under `/outputs/_site_crawl/<crawl_id>/`.
-This is not a general web search feature.
+Crawler tools only fetch allowed http(s) URLs, reject local/private hosts,
+respect robots.txt by default, and store extracted text plus an index under
+`/outputs/_site_crawl/<crawl_id>/`. Use `extract_allowed_site_links` first when
+a listing/index page controls coverage; it supports `required_year`,
+`required_month`, `date_from`, `date_to`, text/URL include and exclude regexes,
+`css_selector`, `url_contains`, `allowed_extensions`, and `max_links`. Then pass
+the returned URLs to `crawl_allowed_urls`.
 
-Use `extract_allowed_site_links` first when a listing/index page controls
-coverage. It supports `required_year`, `required_month`, `date_from`, `date_to`,
-text/URL include and exclude regexes, `css_selector`, `url_contains`,
-`allowed_extensions`, and `max_links`. Then pass the returned URLs to
-`crawl_allowed_urls`.
+Browser calls must provide `allowed_domains`; the tool saves JSON/Markdown
+traces under `/outputs/_playwright/<run_id>/`. Browser input is egress guarded:
+long values, secret/path-like strings, high-entropy encoded payloads, and
+structured payload-like values are rejected. File-upload actions are not
+implemented.
 
 Example:
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'
 python outputs/generic_parent_runner.py `
-  --deep-agent-profile outputs/deep_agent_profiles/site_research.yaml `
-  --prompt "https://ondankataisaku.env.go.jp/carbon_neutral/ を開始URLとして、ondankataisaku.env.go.jp 内だけを最大30ページ、深さ2で調査し、企業・自治体向けの脱炭素支援情報を出典URL付きで整理してください。" `
-  --expected-artifact /outputs/site_research_report.md `
-  --output-dir outputs/site_research_example `
+  --deep-agent-profile-dir outputs/deep_agent_profiles `
+  --prompt "Research https://ondankataisaku.env.go.jp/carbon_neutral/ only, collect up to five sourced articles about regulatory changes, and write /outputs/web_research_report.md." `
+  --expected-artifact /outputs/web_research_report.md `
+  --output-dir outputs/web_research_example `
   --max-review-rounds 2
 ```
 
