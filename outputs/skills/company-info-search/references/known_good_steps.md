@@ -79,7 +79,7 @@ Use:
 After each useful Playwright run, run:
 
 ```bash
-python /input/browser-skills/houjin-bangou-browser-search/scripts/parse_houjin_playwright_result.py \
+python /input/profile-skills/company-info-search/scripts/parse_houjin_playwright_result.py \
   "/outputs/_playwright/*/result.json" \
   --query "<submitted_or_target_company_name>" \
   --output /outputs/subtasks/houjin_parse_summary.json

@@ -13,7 +13,7 @@ SCRIPT = (
     ROOT
     / "outputs"
     / "skills"
-    / "houjin-bangou-browser-search"
+    / "company-info-search"
     / "scripts"
     / "parse_houjin_playwright_result.py"
 )
