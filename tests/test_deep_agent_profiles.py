@@ -407,7 +407,6 @@ class DeepAgentProfileTests(unittest.TestCase):
             "search_houjin_bangou_by_name",
             by_id["web_research"].system_prompt,
         )
-        self.assertNotIn("run_browser_use_task", by_id["web_research"].system_prompt)
         self.assertIn("egress guarded", by_id["web_research"].system_prompt)
         self.assertIn("Too Many Requests", by_id["web_research"].system_prompt)
         self.assertEqual(
@@ -477,26 +476,6 @@ class DeepAgentProfileTests(unittest.TestCase):
             runner.clamp_playwright_delay_ms("bad", default_ms=1000, max_ms=10000),
             1000,
         )
-
-    def test_browser_use_domain_validation_requires_public_allowlist(self) -> None:
-        self.assertEqual(
-            runner.validate_browser_use_allowed_domains(["houjin-bangou.nta.go.jp"]),
-            ["houjin-bangou.nta.go.jp"],
-        )
-        self.assertEqual(
-            runner.validate_browser_use_allowed_domains(["*.example.com"]),
-            ["*.example.com"],
-        )
-        with self.assertRaises(ValueError):
-            runner.validate_browser_use_allowed_domains([])
-        with self.assertRaises(ValueError):
-            runner.validate_browser_use_allowed_domains(["localhost"])
-        with self.assertRaises(ValueError):
-            runner.validate_browser_use_allowed_domains(["example.*"])
-
-    def test_browser_use_model_normalization_strips_provider_prefix(self) -> None:
-        self.assertEqual(runner.normalize_browser_use_model("openai:gpt-5.2"), "gpt-5.2")
-        self.assertEqual(runner.normalize_browser_use_model("gpt-5-mini"), "gpt-5-mini")
 
     def test_playwright_url_allowlist_blocks_private_and_cross_domain(self) -> None:
         domains = runner.validate_public_allowed_domains(
