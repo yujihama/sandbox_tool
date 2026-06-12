@@ -293,11 +293,12 @@ smoke checks. The default sandbox security policy disables network access, so
 this browser profile is for offline/local artifact validation. It does not
 enable external web search or internet browsing by itself.
 
-The `web_research` profile stages the `houjin-bangou-browser-search` skill for
-Corporate Number Publication Site tasks. The skill contains known-good
-Playwright step recipes and a parser for saved Playwright `result.json` files,
-which helps the Deep Agent reuse successful paths and extract corporate
-numbers/detail URLs without re-reading large browser traces by hand.
+The `web_research` profile stages the `company-info-search` skill for public
+company-information tasks. Its current bundled recipe covers Corporate Number
+Publication Site searches. The skill contains known-good Playwright step
+recipes and a parser for saved Playwright `result.json` files, which helps the
+Deep Agent reuse successful paths and extract corporate numbers/detail URLs
+without re-reading large browser traces by hand.
 
 Crawler tools only fetch allowed http(s) URLs, reject local/private hosts,
 respect robots.txt by default, and store extracted text plus an index under

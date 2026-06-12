@@ -1,17 +1,20 @@
 ---
-name: houjin-bangou-browser-search
-description: Use guarded Playwright to search Japan's National Tax Agency Corporate Number Publication Site at houjin-bangou.nta.go.jp, extract corporate-number search results and detail pages, and produce sourced verification reports for company-existence tasks.
+name: company-info-search
+description: Use guarded public-site workflows to verify company existence and registry facts. Includes a Japan National Tax Agency Corporate Number Publication Site recipe and parser for sourced company-information reports.
 ---
 
-# Houjin Bangou Browser Search
+# Company Info Search
 
 ## Overview
 
-Use this skill when a task asks for company-existence checks or search-result
-summaries on the Japanese Corporate Number Publication Site. Keep the work as
-generic browser automation: call `run_playwright_task` with an explicit
-allowlist, but prefer the known-good recipes and parser bundled with this skill
+Use this skill when a task asks for company-existence checks, registry lookups,
+or search-result summaries on public company-information sites. Keep the work as
+generic guarded browser automation: call `run_playwright_task` with an explicit
+allowlist, and prefer the known-good recipes and parsers bundled with this skill
 before exploratory browsing.
+
+The current bundled recipe covers Japan's National Tax Agency Corporate Number
+Publication Site.
 
 ## Required Guardrails
 
@@ -27,7 +30,7 @@ before exploratory browsing.
 
 1. Load the known-good recipe.
    - Read
-     `/input/browser-skills/houjin-bangou-browser-search/references/known_good_steps.md`.
+     `/input/profile-skills/company-info-search/references/known_good_steps.md`.
    - Use the recipe steps first when the task fits name search or direct detail
      verification. Do not re-discover the same selectors unless the recipe
      fails.
@@ -45,7 +48,7 @@ before exploratory browsing.
    - After useful Playwright runs, execute:
 
 ```bash
-python /input/browser-skills/houjin-bangou-browser-search/scripts/parse_houjin_playwright_result.py \
+python /input/profile-skills/company-info-search/scripts/parse_houjin_playwright_result.py \
   "/outputs/_playwright/*/result.json" \
   --query "<submitted_or_target_company_name>" \
   --output /outputs/subtasks/houjin_parse_summary.json

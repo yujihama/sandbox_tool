@@ -204,13 +204,13 @@ payload-like values. The tool does not implement file upload actions. Results
 are saved under `/outputs/_playwright/<run_id>/` for later inspection by the
 Deep Agent and parent reviewer.
 
-Only `browser_research` currently receives the
-`houjin-bangou-browser-search` skill. That skill packages the browser workflow
-for Japan's Corporate Number Publication Site while still using the generic
-guarded Playwright tool rather than exposing a site-specific lookup tool. It
-also includes known-good Playwright step recipes and a local result parser so
-the agent can extract search rows and detail-page facts without manually
-reading large browser traces.
+Network research profiles receive the `company-info-search` skill. That skill
+packages public company-information workflows while still using the generic
+guarded Playwright tool rather than exposing a site-specific lookup tool. Its
+current bundled recipe covers Japan's Corporate Number Publication Site, with
+known-good Playwright steps and a local result parser so the agent can extract
+search rows and detail-page facts without manually reading large browser
+traces.
 
 ## Linux / RedHat
 

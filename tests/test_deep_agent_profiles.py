@@ -100,13 +100,13 @@ class DeepAgentProfileTests(unittest.TestCase):
             (skill_dir / "SKILL.md").write_text("# Demo Skill\n", encoding="utf-8")
 
             staged = runner.stage_skill_sources(
-                [f"{skill_dir}=/input/browser-skills/demo-skill"],
+                [f"{skill_dir}=/input/profile-skills/demo-skill"],
                 input_dir,
             )
 
-            self.assertEqual(staged, ["/input/browser-skills"])
+            self.assertEqual(staged, ["/input/profile-skills"])
             self.assertTrue(
-                (input_dir / "browser-skills" / "demo-skill" / "SKILL.md").exists()
+                (input_dir / "profile-skills" / "demo-skill" / "SKILL.md").exists()
             )
 
     def test_profile_tool_uses_declared_name_and_description(self) -> None:
@@ -335,8 +335,8 @@ class DeepAgentProfileTests(unittest.TestCase):
                 root = Path(temp)
                 input_dir = root / "input"
                 run_root = root / "run"
-                (input_dir / "browser-skills" / "demo").mkdir(parents=True)
-                (input_dir / "browser-skills" / "demo" / "SKILL.md").write_text(
+                (input_dir / "profile-skills" / "demo").mkdir(parents=True)
+                (input_dir / "profile-skills" / "demo" / "SKILL.md").write_text(
                     "# Demo\n", encoding="utf-8"
                 )
                 (input_dir / "secret.csv").write_text("secret,value\n", encoding="utf-8")
@@ -348,13 +348,13 @@ class DeepAgentProfileTests(unittest.TestCase):
                     description="Web profile.",
                     toolsets=["review", "browser"],
                     input_access="skills_only",
-                    skill_sources=["/input/browser-skills"],
+                    skill_sources=["/input/profile-skills"],
                 )
 
                 profile_dir = runner.profile_input_dir(profile)
 
                 self.assertTrue(
-                    (profile_dir / "browser-skills" / "demo" / "SKILL.md").exists()
+                    (profile_dir / "profile-skills" / "demo" / "SKILL.md").exists()
                 )
                 self.assertFalse((profile_dir / "secret.csv").exists())
         finally:
@@ -413,7 +413,7 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertEqual(
             by_id["web_research"].skill_source_specs,
             [
-                "../skills/houjin-bangou-browser-search=/input/browser-skills/houjin-bangou-browser-search"
+                "../skills/company-info-search=/input/profile-skills/company-info-search"
             ],
         )
 
@@ -427,13 +427,13 @@ class DeepAgentProfileTests(unittest.TestCase):
             materialized = {profile.id: profile for profile in materialized_profiles}
             self.assertEqual(
                 materialized["web_research"].skill_sources,
-                ["/input/browser-skills"],
+                ["/input/profile-skills"],
             )
             self.assertTrue(
                 (
                     input_dir
-                    / "browser-skills"
-                    / "houjin-bangou-browser-search"
+                    / "profile-skills"
+                    / "company-info-search"
                     / "SKILL.md"
                 ).exists()
             )
