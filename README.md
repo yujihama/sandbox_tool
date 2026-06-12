@@ -46,10 +46,14 @@ process, so Compose puts `agent-app` on an internal network and routes external
 HTTP(S) only through `egress-proxy`.
 
 ```bash
-docker compose build egress-proxy sandbox-controller agent-app
-docker compose --profile sandbox-image build python-data-sandbox browser-sandbox
+docker compose build
 docker compose up -d egress-proxy sandbox-controller agent-app
 ```
+
+`docker compose build` builds both the parent/controller/proxy image and the
+short-lived sandbox images. Keep `up` scoped to `egress-proxy`,
+`sandbox-controller`, and `agent-app`; the sandbox image services are build
+helpers, not long-running services.
 
 If you keep credentials in `.env.local`, pass them explicitly instead of baking
 them into the image:
