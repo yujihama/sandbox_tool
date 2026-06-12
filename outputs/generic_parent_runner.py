@@ -53,6 +53,7 @@ from sandbox_tool.houjin_bangou import (  # noqa: E402
     HoujinBangouSearchPolicy,
     run_houjin_bangou_search,
 )
+from sandbox_tool.egress_proxy import create_egress_token  # noqa: E402
 from sandbox_tool.site_crawler import (  # noqa: E402
     CrawlPolicy,
     LinkExtractPolicy,
@@ -81,6 +82,7 @@ class DeepAgentProfile:
     description: str
     toolsets: list[str] = field(default_factory=list)
     expose_to_parent: bool = True
+    input_access: str = "all"
     system_prompt: str = ""
     skill_source_specs: list[str] = field(default_factory=list)
     skill_sources: list[str] = field(default_factory=list)
@@ -123,6 +125,8 @@ class RunnerConfig:
     sandbox_backend: str
     sandbox_controller_url: str
     sandbox_controller_token: str
+    egress_proxy_url: str
+    egress_proxy_signing_secret: str
     xlsx_dangerous_formula_action: str
     deep_agent_profiles: list[DeepAgentProfile] = field(default_factory=list)
 
@@ -446,6 +450,17 @@ def optional_bool(value: Any, field_name: str, default: bool) -> bool:
     raise ValueError(f"{field_name} must be a boolean when specified.")
 
 
+def normalize_profile_input_access(value: Any, profile_path: Path) -> str:
+    if value is None or value == "":
+        return "all"
+    access = str(value).strip().lower().replace("-", "_")
+    if access not in {"all", "skills_only", "none"}:
+        raise ValueError(
+            f"Deep Agent profile input_access must be all, skills_only, or none: {profile_path}"
+        )
+    return access
+
+
 def read_profile_document(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
@@ -488,14 +503,23 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
             return None
         return int(value)
 
+    toolsets = validate_profile_toolsets(data.get("toolsets"), profile_path)
+    input_access = normalize_profile_input_access(data.get("input_access"), profile_path)
+    if input_access != "all" and "file_read" in toolsets:
+        raise ValueError(
+            "Profiles with input_access other than all must not include the "
+            f"file_read toolset: {profile_path}"
+        )
+
     return DeepAgentProfile(
         id=profile_id,
         tool_name=tool_name,
         description=description,
-        toolsets=validate_profile_toolsets(data.get("toolsets"), profile_path),
+        toolsets=toolsets,
         expose_to_parent=optional_bool(
             data.get("expose_to_parent"), "expose_to_parent", True
         ),
+        input_access=input_access,
         system_prompt=system_prompt,
         skill_source_specs=as_string_list(data.get("skill_sources"), "skill_sources"),
         include_global_skills=bool(data.get("include_global_skills", False)),
@@ -868,10 +892,45 @@ def configured_image_available(image: str | None = None) -> bool:
     return native_podman_image_available(image_name, CONFIG.podman_bin)
 
 
-def create_configured_backend(image: str | None = None) -> Any:
+def profile_input_dir(profile: DeepAgentProfile) -> Path:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    if profile.input_access == "all":
+        return CONFIG.input_dir
+
+    root = CONFIG.run_root / "profile_inputs" / safe_tool_name(profile.id)
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if profile.input_access == "skills_only":
+        for virtual_source in profile.skill_sources:
+            normalized = virtual_source.replace("\\", "/").strip().lstrip("/")
+            if not normalized.startswith("input/"):
+                continue
+            rel = normalized.removeprefix("input/").strip("/")
+            if not rel:
+                continue
+            source = (CONFIG.input_dir / rel).resolve()
+            destination = (root / rel).resolve()
+            if not is_relative_to(source, CONFIG.input_dir.resolve()):
+                raise ValueError(f"Profile skill source escapes input dir: {virtual_source}")
+            if source.is_dir():
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+            elif source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+    return root
+
+
+def create_configured_backend(
+    image: str | None = None,
+    *,
+    input_dir: Path | None = None,
+) -> Any:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
     image_name = image or CONFIG.image
+    effective_input_dir = input_dir or CONFIG.input_dir
 
     if CONFIG.sandbox_backend == "controller":
         if not CONFIG.sandbox_controller_url:
@@ -881,7 +940,7 @@ def create_configured_backend(image: str | None = None) -> Any:
             image=image_name,
             controller_url=CONFIG.sandbox_controller_url,
             run_id=CONFIG.run_root.name,
-            input_dir=CONFIG.input_dir,
+            input_dir=effective_input_dir,
             output_dir=CONFIG.output_dir,
             workspace_dir=CONFIG.workspace_dir,
             token=CONFIG.sandbox_controller_token,
@@ -899,7 +958,7 @@ def create_configured_backend(image: str | None = None) -> Any:
         return PodmanSandboxBackend.for_wsl(
             image=image_name,
             distro=CONFIG.wsl_distro,
-            input_dir=CONFIG.input_dir,
+            input_dir=effective_input_dir,
             output_dir=CONFIG.output_dir,
             use_sudo=CONFIG.wsl_use_sudo,
             limits=limits,
@@ -910,7 +969,7 @@ def create_configured_backend(image: str | None = None) -> Any:
 
     return PodmanSandboxBackend(
         image=image_name,
-        input_dir=CONFIG.input_dir,
+        input_dir=effective_input_dir,
         output_dir=CONFIG.output_dir,
         podman=CONFIG.podman_bin,
         host_path_mode="native",
@@ -1000,13 +1059,14 @@ def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
         if profile.max_review_rounds is not None
         else ""
     )
+    input_note = f"; input_access={profile.input_access}"
     skill_note = (
         f"; skills={', '.join(profile.skill_sources)}" if profile.skill_sources else ""
     )
     return (
         f"- {profile.tool_name}: {profile.description} "
         f"(profile_id={profile.id}{toolset_note}{tools_note}{model_note}"
-        f"{image_note}{rounds_note}{skill_note})"
+        f"{image_note}{rounds_note}{input_note}{skill_note})"
     )
 
 
@@ -1021,7 +1081,11 @@ def deep_agent_profile_prompt_section() -> str:
                 for profile in CONFIG.deep_agent_profiles
             )
             + "\nChoose the most appropriate profile tool for the requested work. "
-            "Use the same or a better-suited profile for repair attempts."
+            "Use the same or a better-suited profile for repair attempts. "
+            "If a profile has input_access=skills_only or input_access=none, "
+            "do not send it tasks that require reading user-provided /input files; "
+            "first use a non-network profile to extract the needed non-sensitive "
+            "values into an intermediate artifact."
         )
     if CONFIG.skill_sources:
         return (
@@ -1634,9 +1698,15 @@ def crawl_allowed_site(
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     try:
+        safe_domains = default_allowed_domains_for_url(
+            start_url,
+            allowed_domains,
+            tool_name="site crawl",
+        )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="site-crawl")
         policy = CrawlPolicy(
             start_url=start_url,
-            allowed_domains=allowed_domains or [],
+            allowed_domains=safe_domains,
             max_pages=max_pages,
             max_depth=max_depth,
             path_prefixes=path_prefixes or [],
@@ -1644,6 +1714,7 @@ def crawl_allowed_site(
             request_delay_seconds=request_delay_seconds,
             max_bytes_per_url=max_bytes_per_url,
             respect_robots_txt=respect_robots_txt,
+            proxy_url=proxy_url,
         )
         crawl = run_site_crawl(CONFIG.output_dir, policy)
         manifest = crawl["manifest"]
@@ -1655,6 +1726,7 @@ def crawl_allowed_site(
             "pages_fetched": manifest["pages_fetched"],
             "skipped_count": manifest["skipped_count"],
             "allowed_domains": manifest["allowed_domains"],
+            "network_proxy_enabled": bool(proxy_url),
             "virtual_root": virtual_root,
             "manifest_path": f"{virtual_root}/crawl_manifest.json",
             "summary_path": f"{virtual_root}/crawl_summary.md",
@@ -1700,9 +1772,15 @@ def extract_allowed_site_links(
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     try:
+        safe_domains = default_allowed_domains_for_url(
+            list_url,
+            allowed_domains,
+            tool_name="site link extraction",
+        )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="site-link-extract")
         policy = LinkExtractPolicy(
             list_url=list_url,
-            allowed_domains=allowed_domains or [],
+            allowed_domains=safe_domains,
             path_prefixes=path_prefixes or [],
             required_year=required_year,
             required_month=required_month,
@@ -1717,6 +1795,7 @@ def extract_allowed_site_links(
             url_contains=url_contains,
             max_links=max_links,
             respect_robots_txt=respect_robots_txt,
+            proxy_url=proxy_url,
         )
         result = extract_links_from_listing(CONFIG.output_dir, policy)
         manifest = result["manifest"]
@@ -1731,6 +1810,7 @@ def extract_allowed_site_links(
             "required_month": manifest["required_month"],
             "date_from": manifest["date_from"],
             "date_to": manifest["date_to"],
+            "network_proxy_enabled": bool(proxy_url),
             "virtual_root": virtual_root,
             "links_json_path": f"{virtual_root}/links.json",
             "links": manifest["links"][: max(1, min(max_links, 300))],
@@ -1760,15 +1840,23 @@ def crawl_allowed_urls(
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     try:
+        first_url = urls[0] if urls else ""
+        safe_domains = default_allowed_domains_for_url(
+            first_url,
+            allowed_domains,
+            tool_name="site URL crawl",
+        )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="site-url-crawl")
         policy = CrawlPolicy(
-            start_url=urls[0] if urls else "",
-            allowed_domains=allowed_domains or [],
+            start_url=first_url,
+            allowed_domains=safe_domains,
             max_pages=len(urls),
             max_depth=0,
             path_prefixes=path_prefixes or [],
             request_delay_seconds=request_delay_seconds,
             max_bytes_per_url=max_bytes_per_url,
             respect_robots_txt=respect_robots_txt,
+            proxy_url=proxy_url,
         )
         crawl = run_url_crawl(CONFIG.output_dir, urls, policy)
         manifest = crawl["manifest"]
@@ -1780,6 +1868,7 @@ def crawl_allowed_urls(
             "pages_fetched": manifest["pages_fetched"],
             "skipped_count": manifest["skipped_count"],
             "allowed_domains": manifest["allowed_domains"],
+            "network_proxy_enabled": bool(proxy_url),
             "virtual_root": virtual_root,
             "manifest_path": f"{virtual_root}/crawl_manifest.json",
             "summary_path": f"{virtual_root}/crawl_summary.md",
@@ -1819,6 +1908,10 @@ def search_houjin_bangou_by_name(
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     try:
+        proxy_url = network_tool_proxy_url(
+            ["www.houjin-bangou.nta.go.jp"],
+            purpose="houjin-bangou-search",
+        )
         result = run_houjin_bangou_search(
             CONFIG.output_dir,
             HoujinBangouSearchPolicy(
@@ -1828,8 +1921,10 @@ def search_houjin_bangou_by_name(
                 max_results=max_results,
                 try_name_variants=try_name_variants,
                 respect_robots_txt=respect_robots_txt,
+                proxy_url=proxy_url,
             ),
         )
+        result["network_proxy_enabled"] = bool(proxy_url)
         return result
     except Exception as exc:
         return {
@@ -1958,6 +2053,63 @@ def validate_public_allowed_domains(
     if not normalized:
         raise ValueError("allowed_domains is empty after normalization.")
     return normalized
+
+
+def default_allowed_domains_for_url(
+    url: str,
+    allowed_domains: list[str] | None,
+    *,
+    tool_name: str,
+) -> list[str]:
+    if allowed_domains:
+        return validate_public_allowed_domains(allowed_domains, tool_name=tool_name)
+    parsed = urllib.parse.urlsplit(url if "://" in url else f"https://{url}")
+    host = parsed.hostname or ""
+    return validate_public_allowed_domains([host], tool_name=tool_name)
+
+
+def network_tool_proxy_url(allowed_domains: list[str], *, purpose: str) -> str:
+    if CONFIG is None or not CONFIG.egress_proxy_url:
+        return ""
+    if not CONFIG.egress_proxy_signing_secret:
+        raise ValueError(
+            "EGRESS_PROXY_URL is configured but EGRESS_PROXY_SIGNING_SECRET is missing."
+        )
+    token = create_egress_token(
+        allowed_domains=allowed_domains,
+        secret=CONFIG.egress_proxy_signing_secret,
+        purpose=purpose,
+        ttl_seconds=900,
+    )
+    parsed = urllib.parse.urlsplit(CONFIG.egress_proxy_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Invalid EGRESS_PROXY_URL: {CONFIG.egress_proxy_url}")
+    username = urllib.parse.quote(token, safe="")
+    password = urllib.parse.quote("x", safe="")
+    netloc = f"{username}:{password}@{parsed.hostname}"
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path or "", "", ""))
+
+
+def playwright_proxy_settings(proxy_url: str) -> dict[str, str] | None:
+    if not proxy_url:
+        return None
+    parsed = urllib.parse.urlsplit(proxy_url)
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("proxy URL host is required")
+    netloc = host
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    settings: dict[str, str] = {
+        "server": urllib.parse.urlunsplit((parsed.scheme or "http", netloc, "", "", "")),
+    }
+    if parsed.username is not None:
+        settings["username"] = urllib.parse.unquote(parsed.username)
+    if parsed.password is not None:
+        settings["password"] = urllib.parse.unquote(parsed.password)
+    return settings
 
 
 def allowed_domain_matches(hostname: str, allowed_domain: str) -> bool:
@@ -2369,6 +2521,7 @@ def run_playwright_steps(
     max_text_chars: int,
     min_action_delay_ms: int,
     rate_limit_backoff_ms: int,
+    proxy_url: str = "",
 ) -> dict[str, Any]:
     import time
 
@@ -2389,11 +2542,15 @@ def run_playwright_steps(
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            locale="ja-JP",
-            timezone_id="Asia/Tokyo",
-            viewport={"width": 1365, "height": 900},
-        )
+        context_kwargs: dict[str, Any] = {
+            "locale": "ja-JP",
+            "timezone_id": "Asia/Tokyo",
+            "viewport": {"width": 1365, "height": 900},
+        }
+        proxy_settings = playwright_proxy_settings(proxy_url)
+        if proxy_settings:
+            context_kwargs["proxy"] = proxy_settings
+        context = browser.new_context(**context_kwargs)
         page = context.new_page()
         page.set_default_timeout(min(safe_timeout_ms, 30000))
 
@@ -2630,6 +2787,7 @@ def run_playwright_task(
             default_ms=PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS,
             max_ms=PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS,
         )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="playwright")
         domain_wait_ms = apply_playwright_domain_delay(safe_domains, safe_min_action_delay_ms)
         run_id = browser_tool_run_id("playwright", task + "|" + safe_start_url, safe_domains)
         playwright_dir = CONFIG.output_dir / "_playwright" / run_id
@@ -2645,6 +2803,7 @@ def run_playwright_task(
                 max_text_chars=max(1000, min(max_text_chars, 30000)),
                 min_action_delay_ms=safe_min_action_delay_ms,
                 rate_limit_backoff_ms=safe_rate_limit_backoff_ms,
+                proxy_url=proxy_url,
             )
         finally:
             record_playwright_domain_finish(safe_domains)
@@ -2660,6 +2819,7 @@ def run_playwright_task(
             "min_action_delay_ms": safe_min_action_delay_ms,
             "rate_limit_backoff_ms": safe_rate_limit_backoff_ms,
             "domain_wait_ms": domain_wait_ms,
+            "network_proxy_enabled": bool(proxy_url),
             "virtual_root": virtual_root,
             **result,
         }
@@ -2681,6 +2841,7 @@ def run_playwright_task(
             f"- Blocked external requests: {saved_result.get('blocked_url_count')}",
             f"- Min action delay ms: {saved_result.get('min_action_delay_ms')}",
             f"- Domain wait ms before start: {saved_result.get('domain_wait_ms')}",
+            f"- Network proxy enabled: {saved_result.get('network_proxy_enabled')}",
             f"- Rate-limit events: {saved_result.get('rate_limit_event_count')}",
             "",
             "## Text Preview",
@@ -3393,12 +3554,25 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "HTTP 429 or Too Many Requests appears, back off and report the "
             "limitation rather than increasing request volume. "
         )
+    if profile.input_access == "all":
+        input_text = "Read task inputs only from /input and write final artifacts under /outputs. "
+    elif profile.input_access == "skills_only":
+        input_text = (
+            "No user task input files are mounted in this profile. /input contains "
+            "profile skills only; do not treat it as task evidence. Write final "
+            "artifacts under /outputs. "
+        )
+    else:
+        input_text = (
+            "No user task input files are mounted in this profile. Write final "
+            "artifacts under /outputs. "
+        )
     return (
         profile_block
         + toolset_block
         + "You are a task execution agent running in an isolated sandbox. "
-        "Read inputs only from /input and write final artifacts under /outputs. "
-        f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
+        + input_text
+        + f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
         "Do not include helper scripts, images, PDFs, or other non-allowed "
         "files in request_parent_review. "
         "Save larger scripts under /outputs before executing them. "
@@ -3504,6 +3678,7 @@ def execute_deep_agent_task(
     effective_recursion_limit = profile.deep_recursion_limit or CONFIG.deep_recursion_limit
     effective_max_review_rounds = profile.max_review_rounds or CONFIG.max_review_rounds
     effective_skill_sources = profile.skill_sources or []
+    effective_input_dir = profile_input_dir(profile)
     try:
         effective_expected_artifacts = normalize_tool_expected_artifacts(expected_artifacts)
     except Exception as exc:
@@ -3578,7 +3753,7 @@ def execute_deep_agent_task(
         )
         return evaluation
 
-    backend = create_configured_backend(effective_image)
+    backend = create_configured_backend(effective_image, input_dir=effective_input_dir)
     selected_deep_tools = deep_agent_tools_for_profile(profile)
     selected_deep_tool_names = [
         getattr(item, "name", None) or getattr(item, "__name__", str(item))
@@ -3686,6 +3861,7 @@ def execute_deep_agent_task(
             "deep_model": effective_model,
             "deep_recursion_limit": effective_recursion_limit,
             "skill_sources": effective_skill_sources,
+            "input_access": profile.input_access,
         },
         "runtime": {
             "host_os": CONFIG.host_os,
@@ -3694,6 +3870,7 @@ def execute_deep_agent_task(
             "podman_bin": CONFIG.podman_bin,
             "wsl_distro": CONFIG.wsl_distro if CONFIG.host_os == "windows" else None,
             "selinux_relabel": CONFIG.selinux_relabel,
+            "egress_proxy_enabled": bool(CONFIG.egress_proxy_url),
         },
         "expected_artifacts": effective_expected_artifacts,
         "configured_final_artifacts": CONFIG.expected_artifacts,
@@ -4043,6 +4220,19 @@ def parse_args() -> argparse.Namespace:
         help="Bearer token for sandbox-controller, if configured.",
     )
     parser.add_argument(
+        "--egress-proxy-url",
+        default=os.getenv("EGRESS_PROXY_URL", ""),
+        help=(
+            "Optional HTTP proxy URL used by network-enabled tools. When set, "
+            "browser/crawler tools receive a signed per-call allowlist token."
+        ),
+    )
+    parser.add_argument(
+        "--egress-proxy-signing-secret",
+        default=os.getenv("EGRESS_PROXY_SIGNING_SECRET", ""),
+        help="Shared signing secret for per-tool egress proxy tokens.",
+    )
+    parser.add_argument(
         "--host-os",
         choices=["auto", "windows", "linux"],
         default="auto",
@@ -4169,6 +4359,8 @@ def main() -> None:
         sandbox_backend=args.sandbox_backend,
         sandbox_controller_url=args.sandbox_controller_url,
         sandbox_controller_token=args.sandbox_controller_token,
+        egress_proxy_url=args.egress_proxy_url,
+        egress_proxy_signing_secret=args.egress_proxy_signing_secret,
         xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
         deep_agent_profiles=deep_agent_profiles,
     )

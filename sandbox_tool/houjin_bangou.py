@@ -17,6 +17,7 @@ from sandbox_tool.site_crawler import (
     DEFAULT_USER_AGENT,
     CrawlPolicy,
     RobotsCache,
+    build_url_opener,
     decode_text,
     domain_matches,
     host_from_url,
@@ -46,6 +47,7 @@ class HoujinBangouSearchPolicy:
     try_name_variants: bool = True
     user_agent: str = DEFAULT_USER_AGENT
     respect_robots_txt: bool = True
+    proxy_url: str = ""
 
 
 def utc_now() -> str:
@@ -360,6 +362,7 @@ def run_houjin_bangou_search(output_root: Path, policy: HoujinBangouSearchPolicy
         max_depth=0,
         user_agent=policy.user_agent,
         respect_robots_txt=policy.respect_robots_txt,
+        proxy_url=policy.proxy_url,
     )
     robots = RobotsCache(robots_policy)
     if not robots.can_fetch(HOUJIN_BANGOU_HOME):
@@ -376,7 +379,8 @@ def run_houjin_bangou_search(output_root: Path, policy: HoujinBangouSearchPolicy
     with HOUJIN_SEARCH_LOCK:
         for attempt_query in attempt_queries:
             attempt_policy = replace(policy, query=attempt_query)
-            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+            opener = build_url_opener(robots_policy)
+            opener.add_handler(urllib.request.HTTPCookieProcessor())
             form_html = fetch_home(opener, attempt_policy)
             params = build_search_params(form_html, attempt_policy)
             time.sleep(0.25)

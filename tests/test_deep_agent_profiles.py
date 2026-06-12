@@ -12,6 +12,7 @@ if str(OUTPUTS) not in sys.path:
     sys.path.insert(0, str(OUTPUTS))
 
 import generic_parent_runner as runner  # noqa: E402
+from sandbox_tool.egress_proxy import verify_egress_token  # noqa: E402
 
 
 class DeepAgentProfileTests(unittest.TestCase):
@@ -168,6 +169,28 @@ class DeepAgentProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "review toolset"):
                 runner.load_deep_agent_profile(no_review_path)
 
+    def test_profile_disallows_file_read_without_full_input_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profile_path = root / "network.yaml"
+            profile_path.write_text(
+                "\n".join(
+                    [
+                        "id: network",
+                        "description: Network profile.",
+                        "input_access: skills_only",
+                        "toolsets:",
+                        "  - review",
+                        "  - file_read",
+                        "  - browser",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "must not include the file_read toolset"):
+                runner.load_deep_agent_profile(profile_path)
+
     def test_deep_agent_tools_are_profile_scoped(self) -> None:
         site_profile = runner.DeepAgentProfile(
             id="site",
@@ -179,7 +202,7 @@ class DeepAgentProfileTests(unittest.TestCase):
             id="browser",
             tool_name="run_browser_agent",
             description="Browser profile.",
-            toolsets=["review", "file_read", "browser"],
+            toolsets=["review", "browser"],
         )
         seal_profile = runner.DeepAgentProfile(
             id="seal",
@@ -305,6 +328,38 @@ class DeepAgentProfileTests(unittest.TestCase):
             explicit = runner.load_deep_agent_profiles([str(hidden_path)], [])
             self.assertEqual([profile.id for profile in explicit], ["hidden"])
 
+    def test_profile_input_dir_skills_only_excludes_user_inputs(self) -> None:
+        old_config = runner.CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                input_dir = root / "input"
+                run_root = root / "run"
+                (input_dir / "browser-skills" / "demo").mkdir(parents=True)
+                (input_dir / "browser-skills" / "demo" / "SKILL.md").write_text(
+                    "# Demo\n", encoding="utf-8"
+                )
+                (input_dir / "secret.csv").write_text("secret,value\n", encoding="utf-8")
+                run_root.mkdir()
+                runner.CONFIG = SimpleNamespace(input_dir=input_dir, run_root=run_root)
+                profile = runner.DeepAgentProfile(
+                    id="web",
+                    tool_name="run_web_agent",
+                    description="Web profile.",
+                    toolsets=["review", "browser"],
+                    input_access="skills_only",
+                    skill_sources=["/input/browser-skills"],
+                )
+
+                profile_dir = runner.profile_input_dir(profile)
+
+                self.assertTrue(
+                    (profile_dir / "browser-skills" / "demo" / "SKILL.md").exists()
+                )
+                self.assertFalse((profile_dir / "secret.csv").exists())
+        finally:
+            runner.CONFIG = old_config
+
     def test_bundled_profiles_load_with_browser_profile(self) -> None:
         profiles = runner.load_deep_agent_profiles(
             [],
@@ -330,8 +385,10 @@ class DeepAgentProfileTests(unittest.TestCase):
         )
         self.assertEqual(
             by_id["web_research"].toolsets,
-            ["review", "file_read", "site_crawl", "browser"],
+            ["review", "site_crawl", "browser"],
         )
+        self.assertEqual(by_id["web_research"].input_access, "skills_only")
+        self.assertEqual(by_id["browser_validation"].input_access, "none")
         self.assertEqual(
             by_id["web_research"].tool_name,
             "run_web_research_agent",
@@ -394,12 +451,14 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertFalse(explicit_by_id["site_research"].expose_to_parent)
         self.assertEqual(
             explicit_by_id["browser_research"].toolsets,
-            ["review", "file_read", "browser"],
+            ["review", "browser"],
         )
+        self.assertEqual(explicit_by_id["browser_research"].input_access, "skills_only")
         self.assertEqual(
             explicit_by_id["site_research"].toolsets,
-            ["review", "file_read", "site_crawl"],
+            ["review", "site_crawl"],
         )
+        self.assertEqual(explicit_by_id["site_research"].input_access, "none")
 
     def test_playwright_delay_clamping(self) -> None:
         self.assertEqual(
@@ -464,6 +523,34 @@ class DeepAgentProfileTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             runner.validate_public_allowed_domains(["localhost"], tool_name="Playwright")
+
+    def test_network_tool_proxy_url_uses_signed_allowlist_token(self) -> None:
+        old_config = runner.CONFIG
+        try:
+            runner.CONFIG = SimpleNamespace(
+                egress_proxy_url="http://egress-proxy:8888",
+                egress_proxy_signing_secret="unit-secret",
+            )
+
+            proxy_url = runner.network_tool_proxy_url(
+                ["houjin-bangou.nta.go.jp"],
+                purpose="unit-test",
+            )
+            parsed = runner.urllib.parse.urlsplit(proxy_url)
+            token = runner.urllib.parse.unquote(parsed.username or "")
+
+            self.assertEqual(parsed.hostname, "egress-proxy")
+            self.assertEqual(parsed.port, 8888)
+            self.assertEqual(
+                verify_egress_token(token, "unit-secret"),
+                ["houjin-bangou.nta.go.jp"],
+            )
+            self.assertEqual(
+                runner.playwright_proxy_settings(proxy_url)["server"],
+                "http://egress-proxy:8888",
+            )
+        finally:
+            runner.CONFIG = old_config
 
     def test_playwright_egress_allows_short_search_values(self) -> None:
         runner.validate_playwright_steps_egress(

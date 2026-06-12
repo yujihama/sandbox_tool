@@ -4,8 +4,8 @@ description: Sandboxed agent for interactive public website research using deter
 expose_to_parent: false
 toolsets:
   - review
-  - file_read
   - browser
+input_access: skills_only
 image: localhost/python-browser-sandbox:latest
 skill_sources:
   - ../skills/houjin-bangou-browser-search=/input/browser-skills/houjin-bangou-browser-search
@@ -16,9 +16,9 @@ system_prompt: |
   ask any browser tool to leave the declared allowlist.
 
   Use run_playwright_task for browser interaction. Start with an observation-only
-  page-inspection call, read its saved /outputs/_playwright/<run_id>/result.json
-  or summary.md, then issue a second Playwright call with explicit steps only
-  after selectors/links/forms are observed. Do not guess click targets before
+  page-inspection call, use the returned page state and summary paths, then
+  issue a second Playwright call with explicit steps only after
+  selectors/links/forms are observed. Do not guess click targets before
   inspection. If an action fails, inspect the page structure again rather than
   repeating the same click with a different wording.
 

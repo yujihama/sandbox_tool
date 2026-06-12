@@ -1,4 +1,26 @@
 services:
+  egress-proxy:
+    image: sandbox-tool-agent:local
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+    user: root
+    environment:
+      EGRESS_PROXY_HOST: 0.0.0.0
+      EGRESS_PROXY_PORT: 8888
+      EGRESS_PROXY_SIGNING_SECRET: ${EGRESS_PROXY_SIGNING_SECRET:-local-dev-egress-signing-secret-change-me}
+      EGRESS_PROXY_DEFAULT_ALLOWLIST: ${EGRESS_PROXY_DEFAULT_ALLOWLIST:-api.openai.com}
+    networks:
+      - sandbox-internal
+      - egress-public
+    command: ["python", "-m", "sandbox_tool.egress_proxy"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8888), 2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
   agent-app:
     image: sandbox-tool-agent:local
     build:
@@ -12,12 +34,24 @@ services:
       SANDBOX_BACKEND: controller
       SANDBOX_CONTROLLER_URL: http://sandbox-controller:8080
       SANDBOX_CONTROLLER_TOKEN: ${SANDBOX_CONTROLLER_TOKEN:-}
+      EGRESS_PROXY_URL: http://egress-proxy:8888
+      EGRESS_PROXY_SIGNING_SECRET: ${EGRESS_PROXY_SIGNING_SECRET:-local-dev-egress-signing-secret-change-me}
+      HTTP_PROXY: http://egress-proxy:8888
+      HTTPS_PROXY: http://egress-proxy:8888
+      http_proxy: http://egress-proxy:8888
+      https_proxy: http://egress-proxy:8888
+      NO_PROXY: sandbox-controller,localhost,127.0.0.1
+      no_proxy: sandbox-controller,localhost,127.0.0.1
     volumes:
       - ${RUNS_ROOT_HOST:-/srv/sandbox-tool/runs}:/srv/sandbox-tool/runs
       - ${INPUTS_HOST:-/srv/sandbox-tool/inputs}:/inputs:ro
     depends_on:
+      egress-proxy:
+        condition: service_healthy
       sandbox-controller:
         condition: service_healthy
+    networks:
+      - sandbox-internal
     command: ["python", "-c", "import time; print('agent-app ready'); time.sleep(31536000)"]
 
   sandbox-controller:
@@ -43,6 +77,8 @@ services:
       - ${SANDBOX_SOCKET_HOST:-/var/run/docker.sock}:/var/run/docker.sock
     ports:
       - "127.0.0.1:${SANDBOX_CONTROLLER_PORT:-8080}:8080"
+    networks:
+      - sandbox-internal
     command: ["python", "-m", "uvicorn", "sandbox_tool.sandbox_controller:app", "--host", "0.0.0.0", "--port", "8080"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
@@ -68,3 +104,8 @@ services:
     profiles:
       - sandbox-image
     command: ["python", "-c", "from playwright.sync_api import sync_playwright; print('playwright ready')"]
+
+networks:
+  sandbox-internal:
+    internal: true
+  egress-public:

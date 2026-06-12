@@ -33,6 +33,14 @@ The runner does:
 - Confirm sandbox cleanup.
 - Save traces and evaluation JSON.
 
+In Docker Compose, network-enabled crawler/browser tools run in the parent
+runner process, not inside the `network_disabled` sandbox execution container.
+Compose therefore treats them as a separate trust boundary: `agent-app` is on an
+internal network and can reach the public internet only through
+`egress-proxy`. OpenAI API traffic is allowed by the proxy default allowlist;
+browser/crawler tools get short-lived signed proxy tokens scoped to their
+explicit `allowed_domains`.
+
 The runner does not:
 
 - Repair generated artifacts.
@@ -144,6 +152,11 @@ docker compose --env-file .env.local exec agent-app \
   Compose runs where agent-app calls sandbox-controller over HTTP.
 - `--sandbox-controller-url`: controller base URL for `--sandbox-backend controller`.
 - `--sandbox-controller-token`: optional bearer token for controller API.
+- `--egress-proxy-url`: optional HTTP proxy URL for network-enabled tools.
+  In Compose this is set to `http://egress-proxy:8888`.
+- `--egress-proxy-signing-secret`: shared secret used to sign per-tool
+  allowlist tokens for the egress proxy. Set `EGRESS_PROXY_SIGNING_SECRET` in
+  production instead of relying on the local-development default.
 - `--host-os`: `auto`, `windows`, or `linux`. `windows` uses WSL Podman;
   `linux` uses native Podman directly.
 - `--wsl-distro`: WSL distribution name for `--host-os windows`.
@@ -218,6 +231,11 @@ Field behavior:
   resolved from the profile file directory.
 - `include_global_skills: true` also passes global `--skill-source` entries to
   that profile.
+- `input_access`: `all`, `skills_only`, or `none`. Use `skills_only` or `none`
+  for profiles that include `site_crawl` or `browser`; otherwise a
+  network-enabled profile can read user `/input` files and later send derived
+  values through browser/crawler tools. `skills_only` mounts only profile skill
+  directories under `/input`, not task input files.
 - `image`, `deep_model`, `deep_recursion_limit`, and `max_review_rounds`
   override the runner defaults only for that profile.
 - `expose_to_parent: false` hides a profile when loading a profile directory.
@@ -255,15 +273,19 @@ It receives both `site_crawl` and `browser`, but its prompt is crawler-first:
 use listing/link extraction and controlled crawls when possible, then fall back
 to Playwright only for forms, JavaScript-rendered content, clicks, dynamic
 pagination, or other interactive page state. This keeps the parent-facing tool
-surface simple while preserving both retrieval modes inside one worker.
+surface simple while preserving both retrieval modes inside one worker. It uses
+`input_access: skills_only`, so user-provided `/input` files are not mounted
+into the web-research sandbox. If a web task needs values from a source file,
+use a non-network profile to extract the necessary non-sensitive values into an
+intermediate artifact, then ask `web_research` to use those values.
 
 The specialized `site_research` and `browser_research` profiles remain in the
 profile directory with `expose_to_parent: false`. They are not exposed when the
 directory is loaded, but can be passed explicitly with `--deep-agent-profile`
 for isolation/debugging:
 
-- `site_research`: crawler-only; no Playwright.
-- `browser_research`: Playwright-only; no site crawler.
+- `site_research`: crawler-only; no Playwright; `input_access: none`.
+- `browser_research`: Playwright-only; no site crawler; `input_access: skills_only`.
 
 The `browser_validation` profile uses `localhost/python-browser-sandbox:latest`
 and provides Playwright/Chromium for local HTML, DOM, JavaScript, and screenshot
@@ -288,8 +310,10 @@ the returned URLs to `crawl_allowed_urls`.
 Browser calls must provide `allowed_domains`; the tool saves JSON/Markdown
 traces under `/outputs/_playwright/<run_id>/`. Browser input is egress guarded:
 long values, secret/path-like strings, high-entropy encoded payloads, and
-structured payload-like values are rejected. File-upload actions are not
-implemented.
+structured payload-like values are rejected. In Compose, the same
+`allowed_domains` are also encoded into the proxy token, so the browser cannot
+connect to a different public domain even if the browser-layer guard misses a
+request. File-upload actions are not implemented.
 
 Example:
 

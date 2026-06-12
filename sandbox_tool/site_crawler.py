@@ -36,6 +36,7 @@ class CrawlPolicy:
     user_agent: str = DEFAULT_USER_AGENT
     allow_private_hosts: bool = False
     respect_robots_txt: bool = True
+    proxy_url: str = ""
 
 
 @dataclass
@@ -74,6 +75,7 @@ class LinkExtractPolicy:
     user_agent: str = DEFAULT_USER_AGENT
     allow_private_hosts: bool = False
     respect_robots_txt: bool = True
+    proxy_url: str = ""
 
 
 def utc_now() -> str:
@@ -305,7 +307,7 @@ def fetch_limited(url: str, policy: CrawlPolicy) -> dict[str, Any]:
             "Accept": "text/html,application/xhtml+xml,application/pdf,text/plain,*/*;q=0.5",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with build_url_opener(policy).open(request, timeout=20) as response:
         final_url = normalize_url(response.geturl())
         final_host = host_from_url(final_url)
         if not domain_matches(final_host, policy.allowed_domains):
@@ -315,6 +317,20 @@ def fetch_limited(url: str, policy: CrawlPolicy) -> dict[str, Any]:
             raise ValueError(f"Response exceeded max_bytes_per_url: {policy.max_bytes_per_url}")
         content_type = response.headers.get("Content-Type", "application/octet-stream")
     return {"final_url": final_url, "content_type": content_type, "data": raw}
+
+
+def build_url_opener(policy: CrawlPolicy) -> urllib.request.OpenerDirector:
+    handlers: list[Any] = []
+    if policy.proxy_url:
+        handlers.append(
+            urllib.request.ProxyHandler(
+                {
+                    "http": policy.proxy_url,
+                    "https": policy.proxy_url,
+                }
+            )
+        )
+    return urllib.request.build_opener(*handlers)
 
 
 class RobotsCache:
@@ -330,9 +346,19 @@ class RobotsCache:
         parser = self.parsers.get(host_key)
         if parser is None:
             parser = urllib.robotparser.RobotFileParser()
-            parser.set_url(urllib.parse.urljoin(host_key, "/robots.txt"))
+            robots_url = urllib.parse.urljoin(host_key, "/robots.txt")
+            parser.set_url(robots_url)
             try:
-                parser.read()
+                request = urllib.request.Request(
+                    robots_url,
+                    headers={"User-Agent": self.policy.user_agent},
+                )
+                with build_url_opener(self.policy).open(request, timeout=20) as response:
+                    raw = response.read(1_000_000 + 1)
+                if len(raw) > 1_000_000:
+                    return True
+                text = raw.decode("utf-8", errors="replace")
+                parser.parse(text.splitlines())
             except Exception:
                 return True
             self.parsers[host_key] = parser
@@ -529,6 +555,7 @@ def run_site_crawl(output_root: Path, policy: CrawlPolicy) -> dict[str, Any]:
         user_agent=policy.user_agent or DEFAULT_USER_AGENT,
         allow_private_hosts=policy.allow_private_hosts,
         respect_robots_txt=policy.respect_robots_txt,
+        proxy_url=policy.proxy_url,
     )
     exclude_patterns = compile_exclude_patterns(policy.exclude_url_patterns)
     if not is_allowed_url(
@@ -611,6 +638,7 @@ def run_url_crawl(output_root: Path, urls: list[str], policy: CrawlPolicy) -> di
         user_agent=policy.user_agent or DEFAULT_USER_AGENT,
         allow_private_hosts=policy.allow_private_hosts,
         respect_robots_txt=policy.respect_robots_txt,
+        proxy_url=policy.proxy_url,
     )
     exclude_patterns = compile_exclude_patterns(policy.exclude_url_patterns)
     crawl_id = make_crawl_id(policy.start_url)
@@ -722,6 +750,7 @@ def extract_links_from_listing(output_root: Path, policy: LinkExtractPolicy) -> 
         user_agent=policy.user_agent,
         allow_private_hosts=policy.allow_private_hosts,
         respect_robots_txt=policy.respect_robots_txt,
+        proxy_url=policy.proxy_url,
     )
     exclude_patterns: list[re.Pattern[str]] = []
     if not is_allowed_url(

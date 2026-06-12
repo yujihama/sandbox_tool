@@ -12,6 +12,7 @@ Generic parent-agent runner with a sandboxed Deep Agent worker and a determinist
 - `outputs/Containerfile.browser-sandbox`: Playwright/Chromium sandbox image for local browser validation.
 - `sandbox_tool/output_gate.py`: allowlist gate that validates and sanitizes final artifacts before the parent reads them.
 - `sandbox_tool/sandbox_controller.py`: FastAPI controller that runs sandbox/gate containers through Docker Compose.
+- `sandbox_tool/egress_proxy.py`: allowlist HTTP(S) proxy used as the network boundary for website/browser tools in Compose.
 - `outputs/generic_parent_runner_usage.md`: usage and CLI reference.
 - `docs/output_gate_implementation_plan.md`: implementation plan based on the reviewed sandbox requirements.
 
@@ -40,12 +41,14 @@ podman build -t localhost/python-browser-sandbox:latest -f outputs/Containerfile
 
 The Compose layout is intended for a Linux/RedHat host with Docker Compose. It
 keeps the Docker socket only in `sandbox-controller`; the parent agent container
-does not receive it.
+does not receive it. Website and browser tools are executed by the parent runner
+process, so Compose puts `agent-app` on an internal network and routes external
+HTTP(S) only through `egress-proxy`.
 
 ```bash
-docker compose build sandbox-controller agent-app
+docker compose build egress-proxy sandbox-controller agent-app
 docker compose --profile sandbox-image build python-data-sandbox browser-sandbox
-docker compose up -d sandbox-controller agent-app
+docker compose up -d egress-proxy sandbox-controller agent-app
 ```
 
 If you keep credentials in `.env.local`, pass them explicitly instead of baking
@@ -73,6 +76,14 @@ Default host paths:
 - Run data: `/srv/sandbox-tool/runs` mounted to the same path in containers.
 - Optional read-only inputs: `/srv/sandbox-tool/inputs` mounted to `/inputs`.
 - Docker socket: `/var/run/docker.sock` mounted only into `sandbox-controller`.
+- Egress proxy: `egress-proxy:8888` is the only Compose service with public
+  network egress.
+
+Set `EGRESS_PROXY_SIGNING_SECRET` in production. The default is for local
+development only. `EGRESS_PROXY_DEFAULT_ALLOWLIST` defaults to `api.openai.com`
+so the parent agent can call the OpenAI API through the proxy. Browser/crawler
+tools generate short-lived signed proxy tokens for the explicit `allowed_domains`
+provided to each tool call.
 
 For Docker-out-of-Docker bind mounts, keep `RUNS_ROOT_HOST` as an absolute host
 path. The easiest RedHat layout is to use `/srv/sandbox-tool/runs` on both the
@@ -82,10 +93,19 @@ For SELinux-enabled RedHat hosts, create the run directory with a suitable
 container label policy before starting Compose, or set `RUNS_ROOT_HOST` to a
 pre-labeled path.
 
-Sandbox containers are started with network disabled by default. The browser
-sandbox can run Playwright/Chromium against local files and generated artifacts,
-but it cannot perform external web search or browse internet sites unless the
-controller/backend network policy is explicitly changed.
+Sandbox containers are started with network disabled by default. The browser and
+site-research tools are not sandbox-container network access; they are controlled
+runner tools. In Compose, their network path is still forced through the
+allowlist proxy by Docker network topology:
+
+- `agent-app` and `sandbox-controller` are attached only to an internal network.
+- `egress-proxy` is attached to both the internal network and a public egress
+  network.
+- OpenAI API calls are allowed by the proxy default allowlist.
+- Browser/crawler calls use per-call signed proxy tokens scoped to the declared
+  public domains.
+- The proxy rejects private/non-global DNS resolutions to reduce DNS-rebinding
+  and SSRF risk.
 
 Stop runtime containers after use:
 
@@ -149,6 +169,9 @@ Each profile can define:
 - `system_prompt` or `system_prompt_file`: profile-specific worker instructions.
 - `skill_sources`: profile-only skill directories staged under `/input`.
 - `include_global_skills`: also pass global `--skill-source` entries.
+- `input_access`: `all`, `skills_only`, or `none`. Network-enabled profiles
+  should use `skills_only` or `none` so user `/input` files are not mounted into
+  a profile that can use browser/crawler tools.
 - `image`, `deep_model`, `deep_recursion_limit`, `max_review_rounds`: optional
   overrides for that worker profile.
 
@@ -156,13 +179,13 @@ The included examples cover quick checks, heavier statistical analysis,
 document/artifact generation, seal-image reading, local browser validation,
 controlled site-limited research, and interactive browser research.
 
-The `site_research` profile is for tasks such as "crawl this specific public
-website and summarize the relevant policy/support information." It does not
-provide broad web search. The Deep Agent receives controlled tools that enforce
-allowed domains, page/depth limits, response-size limits, and robots.txt before
-writing a local crawl index under `/outputs/_site_crawl/<crawl_id>/`. Use this
-profile when you want the agent to gather information from a specified site
-without relying on a search API or a metasearch engine.
+The `web_research` profile is for tasks such as "crawl this specific public
+website and summarize the relevant policy/support information" or "use this
+public form and report the observed result." It does not provide broad web
+search. The Deep Agent receives controlled crawler/browser tools that enforce
+allowed domains, page/depth limits, response-size limits, robots.txt, browser
+egress guards, and the Compose network proxy before writing local evidence under
+`/outputs/_site_crawl/<crawl_id>/` or `/outputs/_playwright/<run_id>/`.
 
 For listing pages, the agent can call `extract_allowed_site_links` before
 crawling. The extractor supports reusable filters for `required_year`,
@@ -170,11 +193,13 @@ crawling. The extractor supports reusable filters for `required_year`,
 selectors, URL substrings, allowed extensions, and maximum link count. Use
 `crawl_allowed_urls` on that extracted explicit URL set when coverage matters.
 
-The `browser_research` profile is for rendered and interactive public sites
-that require JavaScript, form submission, clicks, or CSRF-managed browser flows.
-It exposes the generic deterministic `run_playwright_task` tool with an explicit
-`allowed_domains` allowlist and egress guard. The guard rejects long form/query
-values, secret/path-like strings, high-entropy encoded payloads, and structured
+The older `site_research` and `browser_research` profiles are retained as
+explicit opt-in compatibility profiles with `expose_to_parent: false`; the
+default profile directory exposes the unified `web_research` profile.
+
+`run_playwright_task` requires an explicit `allowed_domains` allowlist and has
+an application-layer egress guard. The guard rejects long form/query values,
+secret/path-like strings, high-entropy encoded payloads, and structured
 payload-like values. The tool does not implement file upload actions. Results
 are saved under `/outputs/_playwright/<run_id>/` for later inspection by the
 Deep Agent and parent reviewer.
