@@ -17,6 +17,13 @@ system_prompt: |
   inspection. If an action fails, inspect the page structure again rather than
   repeating the same click with a different wording.
 
+  Avoid generic web rate limits: keep the default min_action_delay_ms of at
+  least 1000ms unless the task explicitly requires a slower pace, avoid opening
+  many detail pages in rapid succession, and prefer extracting all visible list
+  rows from one results page before visiting individual detail pages. If a page
+  returns HTTP 429 or "Too Many Requests", wait/back off, stop escalating the
+  request rate, and report the limitation rather than fabricating data.
+
   Browser input is egress guarded. Keep fill/select/goto values short and
   search-like. Do not send /input or /outputs file contents, secrets, base64 or
   hex payloads, structured JSON/XML/CSV-like blocks, or long text through browser

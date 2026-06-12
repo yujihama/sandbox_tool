@@ -126,6 +126,11 @@ DEEP_AGENT_TRACE: list[dict[str, Any]] = []
 DEEP_AGENT_EVALUATIONS: list[dict[str, Any]] = []
 DEEP_REVIEW_REQUESTS: list[dict[str, Any]] = []
 ALLOWED_EXPORT_EXTENSIONS_TEXT = ", ".join(sorted(ALLOWED_EXTENSIONS))
+PLAYWRIGHT_DEFAULT_MIN_ACTION_DELAY_MS = 1000
+PLAYWRIGHT_MAX_MIN_ACTION_DELAY_MS = 10000
+PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS = 5000
+PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS = 60000
+PLAYWRIGHT_DOMAIN_LAST_FINISH: dict[str, float] = {}
 
 
 def load_env_local(path: Path) -> None:
@@ -1541,6 +1546,44 @@ def browser_tool_run_id(prefix: str, task: str, allowed_domains: list[str]) -> s
     return f"{safe_prefix}_{timestamp}_{digest}"
 
 
+def clamp_playwright_delay_ms(value: int | None, *, default_ms: int, max_ms: int) -> int:
+    if value is None:
+        return default_ms
+    try:
+        delay_ms = int(value)
+    except (TypeError, ValueError):
+        return default_ms
+    return max(0, min(delay_ms, max_ms))
+
+
+def playwright_domain_delay_key(allowed_domains: list[str]) -> str:
+    return "|".join(sorted(normalize_domain(domain) for domain in allowed_domains))
+
+
+def apply_playwright_domain_delay(allowed_domains: list[str], min_delay_ms: int) -> int:
+    if min_delay_ms <= 0:
+        return 0
+    import time
+
+    key = playwright_domain_delay_key(allowed_domains)
+    last_finish = PLAYWRIGHT_DOMAIN_LAST_FINISH.get(key)
+    if last_finish is None:
+        return 0
+    elapsed_ms = int((time.monotonic() - last_finish) * 1000)
+    wait_ms = max(0, min_delay_ms - elapsed_ms)
+    if wait_ms > 0:
+        time.sleep(wait_ms / 1000)
+    return wait_ms
+
+
+def record_playwright_domain_finish(allowed_domains: list[str]) -> None:
+    if not allowed_domains:
+        return
+    import time
+
+    PLAYWRIGHT_DOMAIN_LAST_FINISH[playwright_domain_delay_key(allowed_domains)] = time.monotonic()
+
+
 def normalize_browser_use_model(model: str) -> str:
     cleaned = (model or "").strip()
     if cleaned.startswith("openai:"):
@@ -1991,6 +2034,19 @@ def playwright_extract_page_state(page: Any, *, max_text_chars: int = 12000) -> 
     }
 
 
+def playwright_page_shows_rate_limit(page: Any) -> bool:
+    try:
+        title = str(page.title() or "")
+    except Exception:
+        title = ""
+    try:
+        body = str(page.locator("body").inner_text(timeout=2000) or "")
+    except Exception:
+        body = ""
+    probe = f"{title}\n{body[:1000]}".lower()
+    return "too many requests" in probe or bool(re.search(r"\b429\b", probe))
+
+
 def run_playwright_steps(
     *,
     start_url: str,
@@ -2000,6 +2056,8 @@ def run_playwright_steps(
     timeout_seconds: int,
     capture_screenshot: bool,
     max_text_chars: int,
+    min_action_delay_ms: int,
+    rate_limit_backoff_ms: int,
 ) -> dict[str, Any]:
     import time
 
@@ -2014,6 +2072,7 @@ def run_playwright_steps(
     action_log: list[dict[str, Any]] = []
     blocked_urls: list[str] = []
     screenshots: list[str] = []
+    rate_limit_events: list[dict[str, Any]] = []
     started = time.monotonic()
     safe_timeout_ms = max(10, min(timeout_seconds, 240)) * 1000
 
@@ -2056,13 +2115,42 @@ def run_playwright_steps(
 
         page.route("**/*", route_handler)
 
+        def apply_action_delay(log_item: dict[str, Any]) -> None:
+            if min_action_delay_ms <= 0:
+                return
+            page.wait_for_timeout(min_action_delay_ms)
+            log_item["politeness_delay_ms"] = min_action_delay_ms
+
+        def apply_rate_limit_backoff(log_item: dict[str, Any]) -> None:
+            status = log_item.get("http_status")
+            detected = status == 429 or playwright_page_shows_rate_limit(page)
+            if not detected:
+                return
+            event = {
+                "step": log_item.get("step", 0),
+                "action": log_item.get("action", ""),
+                "url": page.url,
+                "http_status": status,
+                "backoff_ms": rate_limit_backoff_ms,
+            }
+            rate_limit_events.append(event)
+            log_item["rate_limit_detected"] = True
+            log_item["rate_limit_backoff_ms"] = rate_limit_backoff_ms
+            if rate_limit_backoff_ms > 0:
+                page.wait_for_timeout(rate_limit_backoff_ms)
+
         try:
-            page.goto(start_url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
+            response = page.goto(start_url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=5000)
             except Exception:
                 pass
-            action_log.append({"action": "goto", "url": start_url, "ok": True})
+            initial_log: dict[str, Any] = {"action": "goto", "url": start_url, "ok": True}
+            if response is not None:
+                initial_log["http_status"] = response.status
+            apply_rate_limit_backoff(initial_log)
+            apply_action_delay(initial_log)
+            action_log.append(initial_log)
 
             for index, raw_step in enumerate(steps[:20], start=1):
                 step = dict(raw_step or {})
@@ -2072,8 +2160,10 @@ def run_playwright_steps(
                 log_item: dict[str, Any] = {"step": index, "action": action}
                 if action == "goto":
                     url = normalize_playwright_start_url(str(step.get("url") or ""), allowed_domains)
-                    page.goto(url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
+                    response = page.goto(url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
                     log_item["url"] = url
+                    if response is not None:
+                        log_item["http_status"] = response.status
                 elif action == "click":
                     locator = playwright_locator(page, step)
                     locator.click(timeout=min(safe_timeout_ms, 15000))
@@ -2147,6 +2237,9 @@ def run_playwright_steps(
                     page.wait_for_load_state("networkidle", timeout=5000)
                 except Exception:
                     pass
+                apply_rate_limit_backoff(log_item)
+                if action != "wait":
+                    apply_action_delay(log_item)
                 log_item["ok"] = True
                 log_item["url"] = page.url
                 action_log.append(log_item)
@@ -2166,6 +2259,8 @@ def run_playwright_steps(
         "actions": action_log,
         "blocked_urls": blocked_urls[:200],
         "blocked_url_count": len(blocked_urls),
+        "rate_limit_events": rate_limit_events[:50],
+        "rate_limit_event_count": len(rate_limit_events),
         "screenshots": screenshots,
         "page": page_state,
     }
@@ -2180,6 +2275,8 @@ def run_playwright_task(
     timeout_seconds: int = 120,
     capture_screenshot: bool = False,
     max_text_chars: int = 12000,
+    min_action_delay_ms: int = PLAYWRIGHT_DEFAULT_MIN_ACTION_DELAY_MS,
+    rate_limit_backoff_ms: int = PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS,
 ) -> dict[str, Any]:
     """Run a deterministic Playwright browser task with restricted actions.
 
@@ -2193,30 +2290,53 @@ def run_playwright_task(
     field such as selector or placeholder is present. Egress guard rejects long
     values, secret/path-like strings, high-entropy encoded payloads, structured
     payload-like values, and long URL query/fragment values. File upload actions
-    are not supported. Results are saved under /outputs/_playwright/<run_id>/
-    result.json and summary.md.
+    are not supported.
+
+    Generic rate-limit avoidance is enabled by default: min_action_delay_ms
+    defaults to 1000 and is applied after browser actions and between browser
+    tool calls for the same allowed domain set. If a page appears to be rate
+    limited (HTTP 429 or "Too Many Requests"), rate_limit_backoff_ms is applied
+    before returning the observed page state. Results are saved under
+    /outputs/_playwright/<run_id>/result.json and summary.md.
     """
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     run_id = ""
+    safe_domains: list[str] = []
     try:
         safe_domains = validate_public_allowed_domains(allowed_domains, tool_name="Playwright")
         safe_start_url = normalize_playwright_start_url(start_url, safe_domains)
         validate_playwright_url_egress(safe_start_url, context="start_url")
         limited_steps = list(steps or [])[:20]
         validate_playwright_steps_egress(limited_steps, allowed_domains=safe_domains)
+        safe_min_action_delay_ms = clamp_playwright_delay_ms(
+            min_action_delay_ms,
+            default_ms=PLAYWRIGHT_DEFAULT_MIN_ACTION_DELAY_MS,
+            max_ms=PLAYWRIGHT_MAX_MIN_ACTION_DELAY_MS,
+        )
+        safe_rate_limit_backoff_ms = clamp_playwright_delay_ms(
+            rate_limit_backoff_ms,
+            default_ms=PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS,
+            max_ms=PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS,
+        )
+        domain_wait_ms = apply_playwright_domain_delay(safe_domains, safe_min_action_delay_ms)
         run_id = browser_tool_run_id("playwright", task + "|" + safe_start_url, safe_domains)
         playwright_dir = CONFIG.output_dir / "_playwright" / run_id
         playwright_dir.mkdir(parents=True, exist_ok=True)
-        result = run_playwright_steps(
-            start_url=safe_start_url,
-            allowed_domains=safe_domains,
-            steps=limited_steps,
-            output_dir=playwright_dir,
-            timeout_seconds=timeout_seconds,
-            capture_screenshot=capture_screenshot,
-            max_text_chars=max(1000, min(max_text_chars, 30000)),
-        )
+        try:
+            result = run_playwright_steps(
+                start_url=safe_start_url,
+                allowed_domains=safe_domains,
+                steps=limited_steps,
+                output_dir=playwright_dir,
+                timeout_seconds=timeout_seconds,
+                capture_screenshot=capture_screenshot,
+                max_text_chars=max(1000, min(max_text_chars, 30000)),
+                min_action_delay_ms=safe_min_action_delay_ms,
+                rate_limit_backoff_ms=safe_rate_limit_backoff_ms,
+            )
+        finally:
+            record_playwright_domain_finish(safe_domains)
         virtual_root = f"/outputs/_playwright/{run_id}"
         saved_result: dict[str, Any] = {
             "ok": True,
@@ -2226,6 +2346,9 @@ def run_playwright_task(
             "allowed_domains": safe_domains,
             "timeout_seconds": timeout_seconds,
             "capture_screenshot": capture_screenshot,
+            "min_action_delay_ms": safe_min_action_delay_ms,
+            "rate_limit_backoff_ms": safe_rate_limit_backoff_ms,
+            "domain_wait_ms": domain_wait_ms,
             "virtual_root": virtual_root,
             **result,
         }
@@ -2245,6 +2368,9 @@ def run_playwright_task(
             f"- Elapsed seconds: {saved_result.get('elapsed_seconds')}",
             f"- Actions: {len(saved_result.get('actions') or [])}",
             f"- Blocked external requests: {saved_result.get('blocked_url_count')}",
+            f"- Min action delay ms: {saved_result.get('min_action_delay_ms')}",
+            f"- Domain wait ms before start: {saved_result.get('domain_wait_ms')}",
+            f"- Rate-limit events: {saved_result.get('rate_limit_event_count')}",
             "",
             "## Text Preview",
             "",
@@ -2921,6 +3047,11 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
         "allowed_domains. Browser tasks include an egress guard: keep inputs "
         "short, search-like, and task-relevant; do not send file contents, "
         "secrets, or structured payloads through browser fields or URLs. "
+        "The browser tool applies generic rate-limit avoidance by default: keep "
+        "min_action_delay_ms at least 1000 unless a slower pace is needed, avoid "
+        "opening many detail pages in rapid succession, and if HTTP 429 or "
+        "Too Many Requests appears, back off and report the limitation rather than "
+        "increasing request volume. "
         "Use read_sandbox_file when you need a type-aware read of /input or "
         "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
         "metadata, and can perform a vision read of images when you pass a "

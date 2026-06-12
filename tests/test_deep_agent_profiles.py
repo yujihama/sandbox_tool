@@ -145,6 +145,8 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertIn("run_playwright_task", by_id["browser_research"].system_prompt)
         self.assertNotIn("run_browser_use_task", by_id["browser_research"].system_prompt)
         self.assertIn("egress guarded", by_id["browser_research"].system_prompt)
+        self.assertIn("min_action_delay_ms", by_id["browser_research"].system_prompt)
+        self.assertIn("Too Many Requests", by_id["browser_research"].system_prompt)
         self.assertEqual(
             by_id["browser_research"].skill_source_specs,
             [
@@ -173,6 +175,24 @@ class DeepAgentProfileTests(unittest.TestCase):
                 ).exists()
             )
             self.assertEqual(materialized["site_research"].skill_sources, [])
+
+    def test_playwright_delay_clamping(self) -> None:
+        self.assertEqual(
+            runner.clamp_playwright_delay_ms(None, default_ms=1000, max_ms=10000),
+            1000,
+        )
+        self.assertEqual(
+            runner.clamp_playwright_delay_ms(-5, default_ms=1000, max_ms=10000),
+            0,
+        )
+        self.assertEqual(
+            runner.clamp_playwright_delay_ms(20000, default_ms=1000, max_ms=10000),
+            10000,
+        )
+        self.assertEqual(
+            runner.clamp_playwright_delay_ms("bad", default_ms=1000, max_ms=10000),
+            1000,
+        )
 
     def test_browser_use_domain_validation_requires_public_allowlist(self) -> None:
         self.assertEqual(
