@@ -1935,14 +1935,6 @@ def search_houjin_bangou_by_name(
         }
 
 
-def browser_use_run_id(task: str, allowed_domains: list[str]) -> str:
-    digest = hashlib.sha256(
-        (task + "|" + "|".join(sorted(allowed_domains))).encode("utf-8")
-    ).hexdigest()[:10]
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{timestamp}_{digest}"
-
-
 def browser_tool_run_id(prefix: str, task: str, allowed_domains: list[str]) -> str:
     digest = hashlib.sha256(
         (task + "|" + "|".join(sorted(allowed_domains))).encode("utf-8")
@@ -1988,40 +1980,6 @@ def record_playwright_domain_finish(allowed_domains: list[str]) -> None:
     import time
 
     PLAYWRIGHT_DOMAIN_LAST_FINISH[playwright_domain_delay_key(allowed_domains)] = time.monotonic()
-
-
-def normalize_browser_use_model(model: str) -> str:
-    cleaned = (model or "").strip()
-    if cleaned.startswith("openai:"):
-        return cleaned.split(":", 1)[1]
-    return cleaned or "gpt-5.2"
-
-
-def validate_browser_use_allowed_domains(allowed_domains: list[str] | None) -> list[str]:
-    if not allowed_domains:
-        raise ValueError("allowed_domains is required for browser-use tasks.")
-    normalized: list[str] = []
-    for item in allowed_domains:
-        raw = (item or "").strip()
-        if not raw:
-            continue
-        if "*" in raw and not raw.startswith("*.") and not raw.startswith("http*://"):
-            raise ValueError(f"Unsupported allowed domain wildcard: {raw}")
-        domain_part = raw
-        if "://" in domain_part:
-            parsed = urllib.parse.urlsplit(domain_part.replace("http*://", "https://", 1))
-            domain_part = parsed.hostname or ""
-        elif domain_part.startswith("*."):
-            domain_part = domain_part[2:]
-        if not domain_part:
-            raise ValueError(f"Invalid allowed domain: {raw}")
-        normalized_domain = normalize_domain(domain_part)
-        if is_private_or_local_host(normalized_domain):
-            raise ValueError(f"Private/local domains are not allowed for browser-use: {raw}")
-        normalized.append(raw)
-    if not normalized:
-        raise ValueError("allowed_domains is empty after normalization.")
-    return normalized
 
 
 def validate_public_allowed_domains(
@@ -2166,16 +2124,6 @@ def limited_jsonable(value: Any, *, max_items: int = 30, max_chars: int = 4000) 
             result[str(key)] = limited_jsonable(item, max_items=max_items, max_chars=max_chars)
         return result
     return str(value)[:max_chars]
-
-
-def call_history_method(history: Any, name: str) -> Any:
-    method = getattr(history, name, None)
-    if not callable(method):
-        return None
-    try:
-        return limited_jsonable(method())
-    except Exception as exc:
-        return f"{exc.__class__.__name__}: {exc}"
 
 
 def compact_text(value: str, *, max_chars: int = 12000) -> str:
@@ -2880,187 +2828,6 @@ def run_playwright_task(
             "error": f"{exc.__class__.__name__}: {exc}",
             "task": task[:1000],
             "start_url": start_url,
-            "allowed_domains": allowed_domains,
-        }
-
-
-async def run_browser_use_agent_async(
-    *,
-    task: str,
-    allowed_domains: list[str],
-    model: str,
-    max_steps: int,
-    timeout_seconds: int,
-    use_vision: bool,
-) -> dict[str, Any]:
-    import asyncio
-
-    try:
-        from browser_use import Agent, ChatOpenAI
-    except Exception as exc:
-        raise RuntimeError(
-            "browser-use is not installed in the runner environment. "
-            "Install browser-use[core] and rebuild the agent image."
-        ) from exc
-    try:
-        from browser_use import Browser
-    except Exception:
-        Browser = None  # type: ignore[assignment]
-    try:
-        from browser_use import BrowserSession
-    except Exception:
-        BrowserSession = None  # type: ignore[assignment]
-
-    llm = ChatOpenAI(model=normalize_browser_use_model(model))
-    browser_obj: Any | None = None
-    agent_kwargs: dict[str, Any] = {
-        "task": task,
-        "llm": llm,
-        "use_vision": use_vision,
-    }
-    try:
-        if Browser is None:
-            raise RuntimeError("Browser export unavailable")
-        browser_obj = Browser(headless=True, allowed_domains=allowed_domains)
-        agent_kwargs["browser"] = browser_obj
-    except Exception:
-        if BrowserSession is None:
-            raise RuntimeError("browser-use Browser/BrowserSession exports are unavailable")
-        browser_obj = BrowserSession(headless=True, allowed_domains=allowed_domains)
-        agent_kwargs["browser_session"] = browser_obj
-    agent = Agent(**agent_kwargs)
-    history = None
-    try:
-        history = await asyncio.wait_for(
-            agent.run(max_steps=max(1, min(max_steps, 60))),
-            timeout=max(30, min(timeout_seconds, 240)),
-        )
-    finally:
-        close_target = getattr(agent, "browser_session", None) or browser_obj
-        close_method = getattr(close_target, "close", None)
-        if callable(close_method):
-            try:
-                maybe_result = close_method()
-                if hasattr(maybe_result, "__await__"):
-                    await maybe_result
-            except Exception:
-                pass
-    return {
-        "final_result": call_history_method(history, "final_result") if history is not None else "",
-        "is_done": call_history_method(history, "is_done") if history is not None else None,
-        "is_successful": call_history_method(history, "is_successful") if history is not None else None,
-        "urls": call_history_method(history, "urls") if history is not None else [],
-        "action_names": call_history_method(history, "action_names") if history is not None else [],
-        "errors": call_history_method(history, "errors") if history is not None else [],
-        "extracted_content": call_history_method(history, "extracted_content") if history is not None else [],
-        "model_actions": call_history_method(history, "model_actions") if history is not None else [],
-        "model_outputs": call_history_method(history, "model_outputs") if history is not None else [],
-    }
-
-
-@tool
-def run_browser_use_task(
-    task: str,
-    allowed_domains: list[str],
-    max_steps: int = 10,
-    timeout_seconds: int = 180,
-    model: str = "",
-    use_vision: bool = False,
-) -> dict[str, Any]:
-    """Run a generic browser-use autonomous browser task with domain restrictions.
-
-    Use this for interactive public websites that require a rendered browser,
-    JavaScript, forms, CSRF tokens, clicks, or table extraction. This is not a
-    broad web search tool: allowed_domains is required and is passed to
-    browser-use as a navigation allowlist. The full run summary is saved under
-    /outputs/_browser_use/<run_id>/result.json and summary.md.
-    """
-    if CONFIG is None:
-        return {"ok": False, "error": "runner_config_missing"}
-    run_id = ""
-    try:
-        import asyncio
-        import time
-
-        safe_domains = validate_browser_use_allowed_domains(allowed_domains)
-        run_id = browser_use_run_id(task, safe_domains)
-        browser_dir = CONFIG.output_dir / "_browser_use" / run_id
-        browser_dir.mkdir(parents=True, exist_ok=True)
-        started = time.monotonic()
-        browser_result = asyncio.run(
-            run_browser_use_agent_async(
-                task=task,
-                allowed_domains=safe_domains,
-                model=model or CONFIG.deep_model,
-                max_steps=max_steps,
-                timeout_seconds=timeout_seconds,
-                use_vision=use_vision,
-            )
-        )
-        elapsed = time.monotonic() - started
-        result: dict[str, Any] = {
-            "ok": True,
-            "run_id": run_id,
-            "task": task,
-            "allowed_domains": safe_domains,
-            "model": normalize_browser_use_model(model or CONFIG.deep_model),
-            "max_steps": max_steps,
-            "timeout_seconds": timeout_seconds,
-            "use_vision": use_vision,
-            "elapsed_seconds": round(elapsed, 3),
-            **browser_result,
-        }
-        (browser_dir / "result.json").write_text(
-            json.dumps(result, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        summary = [
-            "# Browser Use Task Summary",
-            "",
-            f"- Run ID: {run_id}",
-            f"- Allowed domains: {', '.join(safe_domains)}",
-            f"- Model: {result['model']}",
-            f"- Elapsed seconds: {result['elapsed_seconds']}",
-            f"- Successful: {result.get('is_successful')}",
-            "",
-            "## Final Result",
-            "",
-            str(result.get("final_result") or "")[:12000],
-            "",
-            "## URLs",
-            "",
-        ]
-        for url in result.get("urls") or []:
-            summary.append(f"- {url}")
-        (browser_dir / "summary.md").write_text("\n".join(summary), encoding="utf-8")
-        virtual_root = f"/outputs/_browser_use/{run_id}"
-        return {
-            **result,
-            "virtual_root": virtual_root,
-            "result_json_path": f"{virtual_root}/result.json",
-            "summary_path": f"{virtual_root}/summary.md",
-        }
-    except Exception as exc:
-        if CONFIG is not None and run_id:
-            error_dir = CONFIG.output_dir / "_browser_use" / run_id
-            error_dir.mkdir(parents=True, exist_ok=True)
-            (error_dir / "error.json").write_text(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": f"{exc.__class__.__name__}: {exc}",
-                        "task": task,
-                        "allowed_domains": allowed_domains,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        return {
-            "ok": False,
-            "error": f"{exc.__class__.__name__}: {exc}",
-            "task": task[:1000],
             "allowed_domains": allowed_domains,
         }
 
