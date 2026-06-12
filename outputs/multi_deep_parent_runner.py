@@ -368,6 +368,14 @@ def parse_args() -> argparse.Namespace:
         "--sandbox-controller-token",
         default=os.getenv("SANDBOX_CONTROLLER_TOKEN", ""),
     )
+    parser.add_argument(
+        "--egress-proxy-url",
+        default=os.getenv("EGRESS_PROXY_URL", ""),
+    )
+    parser.add_argument(
+        "--egress-proxy-signing-secret",
+        default=os.getenv("EGRESS_PROXY_SIGNING_SECRET", ""),
+    )
     parser.add_argument("--host-os", choices=["auto", "windows", "linux"], default="auto")
     parser.add_argument("--wsl-distro", default="Ubuntu-22.04")
     parser.add_argument("--wsl-no-sudo", action="store_true")
@@ -453,6 +461,8 @@ def main() -> None:
         sandbox_backend=args.sandbox_backend,
         sandbox_controller_url=args.sandbox_controller_url,
         sandbox_controller_token=args.sandbox_controller_token,
+        egress_proxy_url=args.egress_proxy_url,
+        egress_proxy_signing_secret=args.egress_proxy_signing_secret,
         xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
     )
     base.DEEP_AGENT_TRACE.clear()

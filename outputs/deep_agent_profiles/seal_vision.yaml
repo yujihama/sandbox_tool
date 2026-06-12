@@ -1,6 +1,10 @@
 id: seal_vision
 tool_name: run_seal_vision_agent
 description: Sandboxed agent for Japanese red seal image preprocessing and surname-identification reports.
+toolsets:
+  - review
+  - file_read
+  - image_inspect
 skill_sources:
   - ../skills=/input/skills
 system_prompt: |

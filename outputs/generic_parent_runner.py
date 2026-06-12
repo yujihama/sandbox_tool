@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import json
+import math
 import mimetypes
 import os
 import posixpath
@@ -12,16 +14,21 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest
+from langchain.agents.middleware.types import ModelResponse
 from langchain.tools import tool
+from langchain_core.messages import SystemMessage, ToolMessage
 from openai import OpenAI
+from typing_extensions import NotRequired
 
 from deepagents import create_deep_agent
 
@@ -42,6 +49,23 @@ from sandbox_tool.output_gate import (  # noqa: E402
     run_output_gate as run_output_gate_artifacts,
     sha256_file,
 )
+from sandbox_tool.houjin_bangou import (  # noqa: E402
+    HoujinBangouSearchPolicy,
+    run_houjin_bangou_search,
+)
+from sandbox_tool.egress_proxy import create_egress_token  # noqa: E402
+from sandbox_tool.site_crawler import (  # noqa: E402
+    CrawlPolicy,
+    LinkExtractPolicy,
+    extract_links_from_listing,
+    is_private_or_local_host,
+    list_crawls as list_site_crawl_runs,
+    normalize_domain,
+    read_crawled_page as read_site_crawl_page,
+    run_site_crawl,
+    run_url_crawl,
+    search_crawl as search_site_crawl_index,
+)
 
 
 @dataclass
@@ -56,6 +80,9 @@ class DeepAgentProfile:
     id: str
     tool_name: str
     description: str
+    toolsets: list[str] = field(default_factory=list)
+    expose_to_parent: bool = True
+    input_access: str = "all"
     system_prompt: str = ""
     skill_source_specs: list[str] = field(default_factory=list)
     skill_sources: list[str] = field(default_factory=list)
@@ -98,6 +125,8 @@ class RunnerConfig:
     sandbox_backend: str
     sandbox_controller_url: str
     sandbox_controller_token: str
+    egress_proxy_url: str
+    egress_proxy_signing_secret: str
     xlsx_dangerous_formula_action: str
     deep_agent_profiles: list[DeepAgentProfile] = field(default_factory=list)
 
@@ -107,6 +136,256 @@ DEEP_AGENT_TRACE: list[dict[str, Any]] = []
 DEEP_AGENT_EVALUATIONS: list[dict[str, Any]] = []
 DEEP_REVIEW_REQUESTS: list[dict[str, Any]] = []
 ALLOWED_EXPORT_EXTENSIONS_TEXT = ", ".join(sorted(ALLOWED_EXTENSIONS))
+PLAYWRIGHT_DEFAULT_MIN_ACTION_DELAY_MS = 1000
+PLAYWRIGHT_MAX_MIN_ACTION_DELAY_MS = 10000
+PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS = 5000
+PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS = 60000
+PLAYWRIGHT_DOMAIN_LAST_FINISH: dict[str, float] = {}
+ACTIVE_DEEP_AGENT_TOOLSETS: set[str] = set()
+
+TOOLSET_TOOL_NAMES: dict[str, list[str]] = {
+    "review": ["request_parent_review"],
+    "file_read": ["read_sandbox_file"],
+    "image_inspect": ["inspect_sandbox_image"],
+    "site_crawl": [
+        "crawl_allowed_site",
+        "extract_allowed_site_links",
+        "crawl_allowed_urls",
+        "search_site_crawl",
+        "read_crawled_page",
+        "list_site_crawls",
+    ],
+    "browser": ["run_playwright_task"],
+}
+TOOLSET_DESCRIPTIONS: dict[str, str] = {
+    "review": "request parent review for gated artifacts",
+    "file_read": "type-aware reads of /input and /outputs files",
+    "image_inspect": "direct image vision inspection",
+    "site_crawl": "controlled allowlisted site crawling and crawl-index reads",
+    "browser": "deterministic Playwright browser interaction",
+}
+ALLOWED_TOOLSETS = set(TOOLSET_TOOL_NAMES)
+FINALIZE_TOOL_ALLOWLIST = {
+    "request_parent_review",
+    "read_sandbox_file",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "execute",
+    "ls",
+}
+
+
+class GracefulFinalizeState(AgentState):
+    graceful_finalize_model_calls: NotRequired[int]
+    graceful_finalize_mode: NotRequired[str]
+
+
+class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
+    """Shift a Deep Agent from exploration to artifact finalization before hard limits."""
+
+    state_schema = GracefulFinalizeState
+
+    def __init__(
+        self,
+        *,
+        profile_id: str,
+        expected_artifacts: list[str],
+        warning_model_calls: int,
+        finalize_model_calls: int,
+        warning_tool_calls: int,
+        finalize_tool_calls: int,
+        warning_message_count: int,
+        finalize_message_count: int,
+        finalize_tool_allowlist: set[str] | None = None,
+    ) -> None:
+        self.profile_id = profile_id
+        self.expected_artifacts = expected_artifacts
+        self.warning_model_calls = max(1, warning_model_calls)
+        self.finalize_model_calls = max(self.warning_model_calls + 1, finalize_model_calls)
+        self.warning_tool_calls = max(1, warning_tool_calls)
+        self.finalize_tool_calls = max(self.warning_tool_calls + 1, finalize_tool_calls)
+        self.warning_message_count = max(1, warning_message_count)
+        self.finalize_message_count = max(
+            self.warning_message_count + 1,
+            finalize_message_count,
+        )
+        self.finalize_tool_allowlist = finalize_tool_allowlist or FINALIZE_TOOL_ALLOWLIST
+        self.tool_calls = 0
+
+    def before_model(
+        self, state: GracefulFinalizeState, runtime: Any
+    ) -> dict[str, Any] | None:
+        count = state.get("graceful_finalize_model_calls", 0) + 1
+        mode = self._mode_for_state(count, len(state.get("messages", [])), self.tool_calls)
+        return {
+            "graceful_finalize_model_calls": count,
+            "graceful_finalize_mode": mode,
+        }
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        count = int(request.state.get("graceful_finalize_model_calls", 0))
+        message_count = len(request.state.get("messages", []))
+        mode = self._mode_for_state(count, message_count, self.tool_calls)
+
+        if mode == "finalize":
+            return handler(
+                request.override(
+                    tools=self.filter_finalize_tools(request.tools),
+                    system_message=self._append_system_instruction(
+                        request.system_message,
+                        self.finalize_instruction(count, message_count),
+                    ),
+                )
+            )
+
+        if mode == "warning":
+            return handler(
+                request.override(
+                    system_message=self._append_system_instruction(
+                        request.system_message,
+                        self.warning_instruction(count, message_count),
+                    )
+                )
+            )
+
+        return handler(request)
+
+    def wrap_tool_call(
+        self,
+        request: Any,
+        handler: Callable[[Any], Any],
+    ) -> Any:
+        self.tool_calls += 1
+        tool_name = self._tool_name(getattr(request, "tool", None))
+        if not tool_name:
+            tool_name = self._tool_name(getattr(request, "tool_call", {}))
+        mode = self._mode_for_state(
+            int(request.state.get("graceful_finalize_model_calls", 0)),
+            len(request.state.get("messages", [])),
+            self.tool_calls,
+        )
+        if mode == "finalize" and tool_name not in self.finalize_tool_allowlist:
+            tool_call = getattr(request, "tool_call", {}) or {}
+            tool_call_id = str(tool_call.get("id") or tool_call.get("tool_call_id") or "")
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "ok": False,
+                        "error": "graceful_finalize_blocked_tool",
+                        "tool": tool_name,
+                        "message": (
+                            "Execution budget is near the hard recursion limit. "
+                            "Exploration tools are disabled; finalize artifacts, "
+                            "run self-check, and request parent review."
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_call_id=tool_call_id,
+                name=tool_name or None,
+            )
+        return handler(request)
+
+    def _mode_for_state(
+        self,
+        model_calls: int,
+        message_count: int,
+        tool_calls: int,
+    ) -> str:
+        if (
+            model_calls >= self.finalize_model_calls
+            or tool_calls >= self.finalize_tool_calls
+            or message_count >= self.finalize_message_count
+        ):
+            return "finalize"
+        if (
+            model_calls >= self.warning_model_calls
+            or tool_calls >= self.warning_tool_calls
+            or message_count >= self.warning_message_count
+        ):
+            return "warning"
+        return "normal"
+
+    def _append_system_instruction(
+        self,
+        existing: SystemMessage | str | None,
+        instruction: str,
+    ) -> SystemMessage:
+        if existing is None:
+            return SystemMessage(content=instruction)
+        if isinstance(existing, SystemMessage):
+            base = existing.content
+            if isinstance(base, list):
+                base_text = "\n".join(str(part) for part in base)
+            else:
+                base_text = str(base)
+            return SystemMessage(content=base_text + "\n\n" + instruction)
+        return SystemMessage(content=str(existing) + "\n\n" + instruction)
+
+    def _tool_name(self, item: Any) -> str:
+        if isinstance(item, dict):
+            if isinstance(item.get("function"), dict) and item["function"].get("name"):
+                return str(item["function"]["name"])
+            if item.get("name"):
+                return str(item["name"])
+        return str(getattr(item, "name", None) or getattr(item, "__name__", ""))
+
+    def filter_finalize_tools(self, tools: list[Any]) -> list[Any]:
+        return [
+            item
+            for item in tools
+            if self._tool_name(item) in self.finalize_tool_allowlist
+        ]
+
+    def warning_instruction(self, model_calls: int, message_count: int) -> str:
+        return (
+            "[Budget warning]\n"
+            f"Profile `{self.profile_id}` is approaching its execution budget "
+            f"(model_calls={model_calls}, tool_calls={self.tool_calls}, "
+            f"messages={message_count}). Stop broad "
+            "exploration now: do not start new crawls/browser searches unless a "
+            "specific required URL is already identified. Prefer existing collected "
+            "evidence, narrow candidates, and move toward artifact creation, "
+            "self-check, and request_parent_review."
+        )
+
+    def finalize_instruction(self, model_calls: int, message_count: int) -> str:
+        expected_text = "\n".join(f"- {path}" for path in self.expected_artifacts)
+        review_artifacts = list(dict.fromkeys([
+            *self.expected_artifacts,
+            "/outputs/subtasks/self_check_plan.md",
+            "/outputs/subtasks/self_check_report.md",
+        ]))
+        review_text = "\n".join(f"- {path}" for path in review_artifacts)
+        return (
+            "[Graceful finalize mode]\n"
+            f"Profile `{self.profile_id}` is near its execution budget "
+            f"(model_calls={model_calls}, tool_calls={self.tool_calls}, "
+            f"messages={message_count}). You must stop "
+            "exploration and finalize now.\n\n"
+            "Rules:\n"
+            "- Do not perform new crawling, browser actions, broad searches, or new "
+            "candidate discovery.\n"
+            "- Use only already collected evidence and files currently available in "
+            "/outputs or /input.\n"
+            "- If fewer records than requested are supported, produce the supported "
+            "partial result and clearly state the limitation.\n"
+            "- If an expected artifact is missing, create a minimal honest artifact "
+            "in the requested format rather than continuing exploration.\n\n"
+            "Required expected artifacts:\n"
+            f"{expected_text}\n\n"
+            "Create or update `/outputs/subtasks/self_check_plan.md` and "
+            "`/outputs/subtasks/self_check_report.md`. Run a small self-check with "
+            "`execute` if possible; if not, write the limitation in the report.\n\n"
+            "Then call request_parent_review with exactly these review artifacts:\n"
+            f"{review_text}\n\n"
+            "After request_parent_review returns, stop."
+        )
 
 
 def load_env_local(path: Path) -> None:
@@ -142,6 +421,44 @@ def as_string_list(value: Any, field_name: str) -> list[str]:
         if item.strip():
             result.append(item.strip())
     return result
+
+
+def validate_profile_toolsets(value: Any, profile_path: Path) -> list[str]:
+    toolsets = as_string_list(value, "toolsets")
+    if not toolsets:
+        raise ValueError(f"Deep Agent profile must declare non-empty toolsets: {profile_path}")
+    unknown = sorted(set(toolsets) - ALLOWED_TOOLSETS)
+    if unknown:
+        raise ValueError(
+            f"Unknown toolsets in {profile_path}: {', '.join(unknown)}. "
+            f"Allowed toolsets: {', '.join(sorted(ALLOWED_TOOLSETS))}"
+        )
+    if "review" not in toolsets:
+        raise ValueError(f"Deep Agent profile must include the review toolset: {profile_path}")
+    deduped: list[str] = []
+    for toolset in toolsets:
+        if toolset not in deduped:
+            deduped.append(toolset)
+    return deduped
+
+
+def optional_bool(value: Any, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field_name} must be a boolean when specified.")
+
+
+def normalize_profile_input_access(value: Any, profile_path: Path) -> str:
+    if value is None or value == "":
+        return "all"
+    access = str(value).strip().lower().replace("-", "_")
+    if access not in {"all", "skills_only", "none"}:
+        raise ValueError(
+            f"Deep Agent profile input_access must be all, skills_only, or none: {profile_path}"
+        )
+    return access
 
 
 def read_profile_document(path: Path) -> dict[str, Any]:
@@ -186,10 +503,23 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
             return None
         return int(value)
 
+    toolsets = validate_profile_toolsets(data.get("toolsets"), profile_path)
+    input_access = normalize_profile_input_access(data.get("input_access"), profile_path)
+    if input_access != "all" and "file_read" in toolsets:
+        raise ValueError(
+            "Profiles with input_access other than all must not include the "
+            f"file_read toolset: {profile_path}"
+        )
+
     return DeepAgentProfile(
         id=profile_id,
         tool_name=tool_name,
         description=description,
+        toolsets=toolsets,
+        expose_to_parent=optional_bool(
+            data.get("expose_to_parent"), "expose_to_parent", True
+        ),
+        input_access=input_access,
         system_prompt=system_prompt,
         skill_source_specs=as_string_list(data.get("skill_sources"), "skill_sources"),
         include_global_skills=bool(data.get("include_global_skills", False)),
@@ -205,21 +535,26 @@ def load_deep_agent_profiles(
     profile_paths: list[str],
     profile_dirs: list[str],
 ) -> list[DeepAgentProfile]:
-    paths = [Path(path).expanduser().resolve() for path in profile_paths]
+    paths = [
+        (Path(path).expanduser().resolve(), True)
+        for path in profile_paths
+    ]
     for directory in profile_dirs:
         root = Path(directory).expanduser().resolve()
         if not root.exists() or not root.is_dir():
             raise FileNotFoundError(f"Deep Agent profile directory does not exist: {root}")
         for suffix in ("*.json", "*.yaml", "*.yml"):
-            paths.extend(sorted(root.glob(suffix)))
+            paths.extend((path, False) for path in sorted(root.glob(suffix)))
 
     profiles: list[DeepAgentProfile] = []
     seen_ids: set[str] = set()
     seen_tools: set[str] = set()
-    for path in paths:
+    for path, explicit in paths:
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Deep Agent profile does not exist: {path}")
         profile = load_deep_agent_profile(path)
+        if not explicit and not profile.expose_to_parent:
+            continue
         if profile.id in seen_ids:
             raise ValueError(f"Duplicate Deep Agent profile id: {profile.id}")
         if profile.tool_name in seen_tools:
@@ -379,21 +714,30 @@ def stage_skill_sources(
             host, target = spec.split("=", 1)
         else:
             host = spec
-            target = "skills"
+            target = ""
         host_path = Path(host).expanduser()
         if not host_path.is_absolute() and base_dir is not None:
             host_path = base_dir / host_path
         host_path = host_path.resolve()
         if not host_path.exists() or not host_path.is_dir():
             raise FileNotFoundError(f"Skill source must be an existing directory: {host_path}")
+        is_single_skill = (host_path / "SKILL.md").is_file()
+        if not target:
+            target = f"skills/{host_path.name}" if is_single_skill else "skills"
         rel = sandbox_input_relative(target)
         destination = input_dir / rel
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
             shutil.rmtree(destination)
         shutil.copytree(host_path, destination)
-        staged_sources.append("/input/" + rel)
-    return staged_sources
+        source_rel = posixpath.dirname(rel) if is_single_skill else rel
+        if source_rel in {"", "."}:
+            raise ValueError(
+                "Single skill sources must be staged below a source directory, "
+                f"for example {host_path}=skills/{host_path.name}"
+            )
+        staged_sources.append("/input/" + source_rel)
+    return list(dict.fromkeys(staged_sources))
 
 
 def stage_profile_skill_sources(profile: DeepAgentProfile, input_dir: Path) -> list[str]:
@@ -548,10 +892,45 @@ def configured_image_available(image: str | None = None) -> bool:
     return native_podman_image_available(image_name, CONFIG.podman_bin)
 
 
-def create_configured_backend(image: str | None = None) -> Any:
+def profile_input_dir(profile: DeepAgentProfile) -> Path:
+    if CONFIG is None:
+        raise RuntimeError("Runner config is not initialized.")
+    if profile.input_access == "all":
+        return CONFIG.input_dir
+
+    root = CONFIG.run_root / "profile_inputs" / safe_tool_name(profile.id)
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if profile.input_access == "skills_only":
+        for virtual_source in profile.skill_sources:
+            normalized = virtual_source.replace("\\", "/").strip().lstrip("/")
+            if not normalized.startswith("input/"):
+                continue
+            rel = normalized.removeprefix("input/").strip("/")
+            if not rel:
+                continue
+            source = (CONFIG.input_dir / rel).resolve()
+            destination = (root / rel).resolve()
+            if not is_relative_to(source, CONFIG.input_dir.resolve()):
+                raise ValueError(f"Profile skill source escapes input dir: {virtual_source}")
+            if source.is_dir():
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+            elif source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+    return root
+
+
+def create_configured_backend(
+    image: str | None = None,
+    *,
+    input_dir: Path | None = None,
+) -> Any:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
     image_name = image or CONFIG.image
+    effective_input_dir = input_dir or CONFIG.input_dir
 
     if CONFIG.sandbox_backend == "controller":
         if not CONFIG.sandbox_controller_url:
@@ -561,7 +940,7 @@ def create_configured_backend(image: str | None = None) -> Any:
             image=image_name,
             controller_url=CONFIG.sandbox_controller_url,
             run_id=CONFIG.run_root.name,
-            input_dir=CONFIG.input_dir,
+            input_dir=effective_input_dir,
             output_dir=CONFIG.output_dir,
             workspace_dir=CONFIG.workspace_dir,
             token=CONFIG.sandbox_controller_token,
@@ -579,7 +958,7 @@ def create_configured_backend(image: str | None = None) -> Any:
         return PodmanSandboxBackend.for_wsl(
             image=image_name,
             distro=CONFIG.wsl_distro,
-            input_dir=CONFIG.input_dir,
+            input_dir=effective_input_dir,
             output_dir=CONFIG.output_dir,
             use_sudo=CONFIG.wsl_use_sudo,
             limits=limits,
@@ -590,7 +969,7 @@ def create_configured_backend(image: str | None = None) -> Any:
 
     return PodmanSandboxBackend(
         image=image_name,
-        input_dir=CONFIG.input_dir,
+        input_dir=effective_input_dir,
         output_dir=CONFIG.output_dir,
         podman=CONFIG.podman_bin,
         host_path_mode="native",
@@ -657,20 +1036,37 @@ def input_manifest() -> list[dict[str, str]]:
     ]
 
 
+def tool_names_for_toolsets(toolsets: list[str]) -> list[str]:
+    names: list[str] = []
+    for toolset in toolsets:
+        for tool_name in TOOLSET_TOOL_NAMES[toolset]:
+            if tool_name not in names:
+                names.append(tool_name)
+    return names
+
+
 def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     model_note = f"; model={profile.deep_model}" if profile.deep_model else ""
     image_note = f"; image={profile.image}" if profile.image else ""
+    toolset_note = f"; toolsets={', '.join(profile.toolsets)}" if profile.toolsets else ""
+    tools_note = (
+        f"; custom_tools={', '.join(tool_names_for_toolsets(profile.toolsets))}"
+        if profile.toolsets
+        else ""
+    )
     rounds_note = (
         f"; max_review_rounds={profile.max_review_rounds}"
         if profile.max_review_rounds is not None
         else ""
     )
+    input_note = f"; input_access={profile.input_access}"
     skill_note = (
         f"; skills={', '.join(profile.skill_sources)}" if profile.skill_sources else ""
     )
     return (
         f"- {profile.tool_name}: {profile.description} "
-        f"(profile_id={profile.id}{model_note}{image_note}{rounds_note}{skill_note})"
+        f"(profile_id={profile.id}{toolset_note}{tools_note}{model_note}"
+        f"{image_note}{rounds_note}{input_note}{skill_note})"
     )
 
 
@@ -685,7 +1081,11 @@ def deep_agent_profile_prompt_section() -> str:
                 for profile in CONFIG.deep_agent_profiles
             )
             + "\nChoose the most appropriate profile tool for the requested work. "
-            "Use the same or a better-suited profile for repair attempts."
+            "Use the same or a better-suited profile for repair attempts. "
+            "If a profile has input_access=skills_only or input_access=none, "
+            "do not send it tasks that require reading user-provided /input files; "
+            "first use a non-network profile to extract the needed non-sensitive "
+            "values into an intermediate artifact."
         )
     if CONFIG.skill_sources:
         return (
@@ -720,7 +1120,11 @@ def build_parent_prompt() -> str:
         + ALLOWED_EXPORT_EXTENSIONS_TEXT
         + "\nDo not ask the Deep Agent to create final or review artifacts with any "
         "other extension. Helper scripts or working files may exist under /outputs, "
-        "but they must not be passed as expected_artifacts or request_parent_review artifacts."
+        "but they must not be passed as expected_artifacts or request_parent_review artifacts. "
+        "When you call a Deep Agent profile tool, pass the configured final artifacts "
+        "exactly as expected_artifacts. If you ask for additional self-check plan/report "
+        "review artifacts, place them under /outputs/subtasks/ and include them in the "
+        "Deep Agent task text, not as root-level expected_artifacts."
         + deep_agent_profile_prompt_section()
         + f"\n\n{attempt_limit_text}"
         + "\n\nUser task:\n"
@@ -1221,8 +1625,9 @@ def read_sandbox_file(
     Read a sandbox file under /input or /outputs with type-aware handling.
 
     Text, CSV, JSON, Excel, and PDF files return structured previews. Image files
-    return metadata, and when `question` is supplied the tool also performs a
-    vision read. Audio/video and other binaries return metadata only.
+    return metadata. When `question` is supplied for an image, the tool performs
+    a vision read only for profiles that include the `image_inspect` toolset.
+    Audio/video and other binaries return metadata only.
     """
     file_info = inspect_sandbox_file.invoke(
         {
@@ -1245,6 +1650,13 @@ def read_sandbox_file(
         "file": file_info,
     }
     if kind == "image" and question.strip():
+        if ACTIVE_DEEP_AGENT_TOOLSETS and "image_inspect" not in ACTIVE_DEEP_AGENT_TOOLSETS:
+            result["question_note"] = (
+                "Image vision reads are disabled for the active Deep Agent profile "
+                "because it does not include the image_inspect toolset. Use metadata "
+                "only or route the task to a profile with image_inspect."
+            )
+            return result
         vision = inspect_sandbox_image.invoke(
             {
                 "path": path,
@@ -1262,6 +1674,1466 @@ def read_sandbox_file(
             "the sandbox if the preview is insufficient."
         )
     return result
+
+
+@tool
+def crawl_allowed_site(
+    start_url: str,
+    allowed_domains: list[str] | None = None,
+    max_pages: int = 40,
+    max_depth: int = 2,
+    path_prefixes: list[str] | None = None,
+    exclude_url_patterns: list[str] | None = None,
+    request_delay_seconds: float = 0.25,
+    max_bytes_per_url: int = 2_000_000,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Crawl a specific public website within an explicit domain/path allowlist.
+
+    This is a controlled site-research tool, not a general web search tool.
+    It only fetches http(s) URLs whose final URL remains inside allowed_domains.
+    Private, loopback, and local hosts are rejected by default. Results are
+    stored under /outputs/_site_crawl/<crawl_id>/ for later search and reading.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        safe_domains = default_allowed_domains_for_url(
+            start_url,
+            allowed_domains,
+            tool_name="site crawl",
+        )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="site-crawl")
+        policy = CrawlPolicy(
+            start_url=start_url,
+            allowed_domains=safe_domains,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            path_prefixes=path_prefixes or [],
+            exclude_url_patterns=exclude_url_patterns or [],
+            request_delay_seconds=request_delay_seconds,
+            max_bytes_per_url=max_bytes_per_url,
+            respect_robots_txt=respect_robots_txt,
+            proxy_url=proxy_url,
+        )
+        crawl = run_site_crawl(CONFIG.output_dir, policy)
+        manifest = crawl["manifest"]
+        crawl_id = manifest["crawl_id"]
+        virtual_root = f"/outputs/_site_crawl/{crawl_id}"
+        return {
+            "ok": True,
+            "crawl_id": crawl_id,
+            "pages_fetched": manifest["pages_fetched"],
+            "skipped_count": manifest["skipped_count"],
+            "allowed_domains": manifest["allowed_domains"],
+            "network_proxy_enabled": bool(proxy_url),
+            "virtual_root": virtual_root,
+            "manifest_path": f"{virtual_root}/crawl_manifest.json",
+            "summary_path": f"{virtual_root}/crawl_summary.md",
+            "pages_jsonl_path": f"{virtual_root}/pages.jsonl",
+            "sqlite_index_path": f"{virtual_root}/site_index.sqlite",
+            "first_pages": crawl["records"][:10],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "start_url": start_url,
+        }
+
+
+@tool
+def extract_allowed_site_links(
+    list_url: str,
+    allowed_domains: list[str] | None = None,
+    path_prefixes: list[str] | None = None,
+    required_year: int | None = None,
+    required_month: int | None = None,
+    date_from: str = "",
+    date_to: str = "",
+    include_text_patterns: list[str] | None = None,
+    exclude_text_patterns: list[str] | None = None,
+    include_url_patterns: list[str] | None = None,
+    exclude_url_patterns: list[str] | None = None,
+    css_selector: str = "",
+    allowed_extensions: list[str] | None = None,
+    url_contains: str = "",
+    max_links: int = 300,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Extract allowed links from a listing/index page with structured filters.
+
+    Use this before crawling article collections when completeness matters. It
+    fetches only the listing URL, parses anchors, filters links by allowed
+    domain/path, date, text/URL regex, CSS selector, and extension rules, then
+    stores the extracted link set under
+    /outputs/_site_crawl/_link_extract/<extract_id>/links.json.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        safe_domains = default_allowed_domains_for_url(
+            list_url,
+            allowed_domains,
+            tool_name="site link extraction",
+        )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="site-link-extract")
+        policy = LinkExtractPolicy(
+            list_url=list_url,
+            allowed_domains=safe_domains,
+            path_prefixes=path_prefixes or [],
+            required_year=required_year,
+            required_month=required_month,
+            date_from=date_from,
+            date_to=date_to,
+            include_text_patterns=include_text_patterns or [],
+            exclude_text_patterns=exclude_text_patterns or [],
+            include_url_patterns=include_url_patterns or [],
+            exclude_url_patterns=exclude_url_patterns or [],
+            css_selector=css_selector,
+            allowed_extensions=allowed_extensions or [],
+            url_contains=url_contains,
+            max_links=max_links,
+            respect_robots_txt=respect_robots_txt,
+            proxy_url=proxy_url,
+        )
+        result = extract_links_from_listing(CONFIG.output_dir, policy)
+        manifest = result["manifest"]
+        extract_id = manifest["extract_id"]
+        virtual_root = f"/outputs/_site_crawl/_link_extract/{extract_id}"
+        return {
+            "ok": True,
+            "extract_id": extract_id,
+            "link_count": manifest["link_count"],
+            "list_url": manifest["list_url"],
+            "required_year": manifest["required_year"],
+            "required_month": manifest["required_month"],
+            "date_from": manifest["date_from"],
+            "date_to": manifest["date_to"],
+            "network_proxy_enabled": bool(proxy_url),
+            "virtual_root": virtual_root,
+            "links_json_path": f"{virtual_root}/links.json",
+            "links": manifest["links"][: max(1, min(max_links, 300))],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "list_url": list_url,
+        }
+
+
+@tool
+def crawl_allowed_urls(
+    urls: list[str],
+    allowed_domains: list[str] | None = None,
+    path_prefixes: list[str] | None = None,
+    request_delay_seconds: float = 0.25,
+    max_bytes_per_url: int = 2_000_000,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Crawl an explicit list of allowed URLs and build a local site index.
+
+    Use this after extract_allowed_site_links when collection completeness
+    matters more than graph traversal order.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        first_url = urls[0] if urls else ""
+        safe_domains = default_allowed_domains_for_url(
+            first_url,
+            allowed_domains,
+            tool_name="site URL crawl",
+        )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="site-url-crawl")
+        policy = CrawlPolicy(
+            start_url=first_url,
+            allowed_domains=safe_domains,
+            max_pages=len(urls),
+            max_depth=0,
+            path_prefixes=path_prefixes or [],
+            request_delay_seconds=request_delay_seconds,
+            max_bytes_per_url=max_bytes_per_url,
+            respect_robots_txt=respect_robots_txt,
+            proxy_url=proxy_url,
+        )
+        crawl = run_url_crawl(CONFIG.output_dir, urls, policy)
+        manifest = crawl["manifest"]
+        crawl_id = manifest["crawl_id"]
+        virtual_root = f"/outputs/_site_crawl/{crawl_id}"
+        return {
+            "ok": True,
+            "crawl_id": crawl_id,
+            "pages_fetched": manifest["pages_fetched"],
+            "skipped_count": manifest["skipped_count"],
+            "allowed_domains": manifest["allowed_domains"],
+            "network_proxy_enabled": bool(proxy_url),
+            "virtual_root": virtual_root,
+            "manifest_path": f"{virtual_root}/crawl_manifest.json",
+            "summary_path": f"{virtual_root}/crawl_summary.md",
+            "pages_jsonl_path": f"{virtual_root}/pages.jsonl",
+            "sqlite_index_path": f"{virtual_root}/site_index.sqlite",
+            "first_pages": crawl["records"][:10],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "url_count": len(urls),
+        }
+
+
+@tool
+def search_houjin_bangou_by_name(
+    query: str,
+    match_type: str = "prefix",
+    include_closed: bool = True,
+    max_results: int = 20,
+    try_name_variants: bool = True,
+    respect_robots_txt: bool = True,
+) -> dict[str, Any]:
+    """Search Japan's official Corporate Number Publication Site by company name.
+
+    Use this for tasks that ask whether a Japanese corporation exists on the
+    National Tax Agency Corporate Number Publication Site. Prefer
+    match_type="prefix" for full legal names, and use "partial" for broader
+    candidate discovery. If try_name_variants is true and the exact query has
+    no hits, the tool may retry common normalized variants such as removing a
+    leading legal designator, while still judging exact_matches against the
+    original query. The result includes exact_matches, candidate rows, search
+    attempts, and saved audit artifacts under
+    /outputs/_official_search/houjin_bangou/.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        proxy_url = network_tool_proxy_url(
+            ["www.houjin-bangou.nta.go.jp"],
+            purpose="houjin-bangou-search",
+        )
+        result = run_houjin_bangou_search(
+            CONFIG.output_dir,
+            HoujinBangouSearchPolicy(
+                query=query,
+                match_type=match_type,
+                include_closed=include_closed,
+                max_results=max_results,
+                try_name_variants=try_name_variants,
+                respect_robots_txt=respect_robots_txt,
+                proxy_url=proxy_url,
+            ),
+        )
+        result["network_proxy_enabled"] = bool(proxy_url)
+        return result
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "query": query,
+            "match_type": match_type,
+        }
+
+
+def browser_use_run_id(task: str, allowed_domains: list[str]) -> str:
+    digest = hashlib.sha256(
+        (task + "|" + "|".join(sorted(allowed_domains))).encode("utf-8")
+    ).hexdigest()[:10]
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}_{digest}"
+
+
+def browser_tool_run_id(prefix: str, task: str, allowed_domains: list[str]) -> str:
+    digest = hashlib.sha256(
+        (task + "|" + "|".join(sorted(allowed_domains))).encode("utf-8")
+    ).hexdigest()[:10]
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_-]+", "_", prefix.strip() or "browser").strip("_")
+    return f"{safe_prefix}_{timestamp}_{digest}"
+
+
+def clamp_playwright_delay_ms(value: int | None, *, default_ms: int, max_ms: int) -> int:
+    if value is None:
+        return default_ms
+    try:
+        delay_ms = int(value)
+    except (TypeError, ValueError):
+        return default_ms
+    return max(0, min(delay_ms, max_ms))
+
+
+def playwright_domain_delay_key(allowed_domains: list[str]) -> str:
+    return "|".join(sorted(normalize_domain(domain) for domain in allowed_domains))
+
+
+def apply_playwright_domain_delay(allowed_domains: list[str], min_delay_ms: int) -> int:
+    if min_delay_ms <= 0:
+        return 0
+    import time
+
+    key = playwright_domain_delay_key(allowed_domains)
+    last_finish = PLAYWRIGHT_DOMAIN_LAST_FINISH.get(key)
+    if last_finish is None:
+        return 0
+    elapsed_ms = int((time.monotonic() - last_finish) * 1000)
+    wait_ms = max(0, min_delay_ms - elapsed_ms)
+    if wait_ms > 0:
+        time.sleep(wait_ms / 1000)
+    return wait_ms
+
+
+def record_playwright_domain_finish(allowed_domains: list[str]) -> None:
+    if not allowed_domains:
+        return
+    import time
+
+    PLAYWRIGHT_DOMAIN_LAST_FINISH[playwright_domain_delay_key(allowed_domains)] = time.monotonic()
+
+
+def normalize_browser_use_model(model: str) -> str:
+    cleaned = (model or "").strip()
+    if cleaned.startswith("openai:"):
+        return cleaned.split(":", 1)[1]
+    return cleaned or "gpt-5.2"
+
+
+def validate_browser_use_allowed_domains(allowed_domains: list[str] | None) -> list[str]:
+    if not allowed_domains:
+        raise ValueError("allowed_domains is required for browser-use tasks.")
+    normalized: list[str] = []
+    for item in allowed_domains:
+        raw = (item or "").strip()
+        if not raw:
+            continue
+        if "*" in raw and not raw.startswith("*.") and not raw.startswith("http*://"):
+            raise ValueError(f"Unsupported allowed domain wildcard: {raw}")
+        domain_part = raw
+        if "://" in domain_part:
+            parsed = urllib.parse.urlsplit(domain_part.replace("http*://", "https://", 1))
+            domain_part = parsed.hostname or ""
+        elif domain_part.startswith("*."):
+            domain_part = domain_part[2:]
+        if not domain_part:
+            raise ValueError(f"Invalid allowed domain: {raw}")
+        normalized_domain = normalize_domain(domain_part)
+        if is_private_or_local_host(normalized_domain):
+            raise ValueError(f"Private/local domains are not allowed for browser-use: {raw}")
+        normalized.append(raw)
+    if not normalized:
+        raise ValueError("allowed_domains is empty after normalization.")
+    return normalized
+
+
+def validate_public_allowed_domains(
+    allowed_domains: list[str] | None,
+    *,
+    tool_name: str,
+) -> list[str]:
+    if not allowed_domains:
+        raise ValueError(f"allowed_domains is required for {tool_name} tasks.")
+    normalized: list[str] = []
+    for item in allowed_domains:
+        raw = (item or "").strip()
+        if not raw:
+            continue
+        if "*" in raw and not raw.startswith("*.") and not raw.startswith("http*://"):
+            raise ValueError(f"Unsupported allowed domain wildcard: {raw}")
+        domain_part = raw
+        if "://" in domain_part:
+            parsed = urllib.parse.urlsplit(domain_part.replace("http*://", "https://", 1))
+            domain_part = parsed.hostname or ""
+        elif domain_part.startswith("*."):
+            domain_part = domain_part[2:]
+        if not domain_part:
+            raise ValueError(f"Invalid allowed domain: {raw}")
+        normalized_domain = normalize_domain(domain_part)
+        if is_private_or_local_host(normalized_domain):
+            raise ValueError(f"Private/local domains are not allowed for {tool_name}: {raw}")
+        normalized.append(raw)
+    if not normalized:
+        raise ValueError("allowed_domains is empty after normalization.")
+    return normalized
+
+
+def default_allowed_domains_for_url(
+    url: str,
+    allowed_domains: list[str] | None,
+    *,
+    tool_name: str,
+) -> list[str]:
+    if allowed_domains:
+        return validate_public_allowed_domains(allowed_domains, tool_name=tool_name)
+    parsed = urllib.parse.urlsplit(url if "://" in url else f"https://{url}")
+    host = parsed.hostname or ""
+    return validate_public_allowed_domains([host], tool_name=tool_name)
+
+
+def network_tool_proxy_url(allowed_domains: list[str], *, purpose: str) -> str:
+    if CONFIG is None or not CONFIG.egress_proxy_url:
+        return ""
+    if not CONFIG.egress_proxy_signing_secret:
+        raise ValueError(
+            "EGRESS_PROXY_URL is configured but EGRESS_PROXY_SIGNING_SECRET is missing."
+        )
+    token = create_egress_token(
+        allowed_domains=allowed_domains,
+        secret=CONFIG.egress_proxy_signing_secret,
+        purpose=purpose,
+        ttl_seconds=900,
+    )
+    parsed = urllib.parse.urlsplit(CONFIG.egress_proxy_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Invalid EGRESS_PROXY_URL: {CONFIG.egress_proxy_url}")
+    username = urllib.parse.quote(token, safe="")
+    password = urllib.parse.quote("x", safe="")
+    netloc = f"{username}:{password}@{parsed.hostname}"
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path or "", "", ""))
+
+
+def playwright_proxy_settings(proxy_url: str) -> dict[str, str] | None:
+    if not proxy_url:
+        return None
+    parsed = urllib.parse.urlsplit(proxy_url)
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("proxy URL host is required")
+    netloc = host
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    settings: dict[str, str] = {
+        "server": urllib.parse.urlunsplit((parsed.scheme or "http", netloc, "", "", "")),
+    }
+    if parsed.username is not None:
+        settings["username"] = urllib.parse.unquote(parsed.username)
+    if parsed.password is not None:
+        settings["password"] = urllib.parse.unquote(parsed.password)
+    return settings
+
+
+def allowed_domain_matches(hostname: str, allowed_domain: str) -> bool:
+    raw = allowed_domain.strip().lower()
+    if "://" in raw:
+        parsed = urllib.parse.urlsplit(raw.replace("http*://", "https://", 1))
+        raw = parsed.hostname or ""
+    wildcard = raw.startswith("*.")
+    if wildcard:
+        raw = raw[2:]
+    host = normalize_domain(hostname)
+    domain = normalize_domain(raw)
+    if wildcard:
+        return host == domain or host.endswith("." + domain)
+    return host == domain
+
+
+def is_url_allowed_by_domains(url: str, allowed_domains: list[str]) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    hostname = parsed.hostname or ""
+    if not hostname or is_private_or_local_host(normalize_domain(hostname)):
+        return False
+    return any(allowed_domain_matches(hostname, domain) for domain in allowed_domains)
+
+
+def normalize_playwright_start_url(start_url: str, allowed_domains: list[str]) -> str:
+    url = (start_url or "").strip()
+    if not url:
+        raise ValueError("start_url is required.")
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Only http/https URLs are supported: {start_url}")
+    if not is_url_allowed_by_domains(url, allowed_domains):
+        raise ValueError(f"start_url is outside allowed_domains: {start_url}")
+    return url
+
+
+def limited_jsonable(value: Any, *, max_items: int = 30, max_chars: int = 4000) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:max_chars]
+    if isinstance(value, (list, tuple)):
+        return [limited_jsonable(item, max_items=max_items, max_chars=max_chars) for item in value[:max_items]]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_items:
+                break
+            result[str(key)] = limited_jsonable(item, max_items=max_items, max_chars=max_chars)
+        return result
+    return str(value)[:max_chars]
+
+
+def call_history_method(history: Any, name: str) -> Any:
+    method = getattr(history, name, None)
+    if not callable(method):
+        return None
+    try:
+        return limited_jsonable(method())
+    except Exception as exc:
+        return f"{exc.__class__.__name__}: {exc}"
+
+
+def compact_text(value: str, *, max_chars: int = 12000) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()[:max_chars]
+
+
+PLAYWRIGHT_MAX_FILL_CHARS = 120
+PLAYWRIGHT_MAX_SELECT_CHARS = 120
+PLAYWRIGHT_MAX_URL_CHARS = 2000
+PLAYWRIGHT_MAX_URL_QUERY_CHARS = 600
+PLAYWRIGHT_MAX_URL_VALUE_CHARS = 180
+PLAYWRIGHT_MAX_POST_CHARS = 5000
+PLAYWRIGHT_SAFE_KEYS = {
+    "Enter",
+    "Tab",
+    "Escape",
+    "Backspace",
+    "Delete",
+    "Space",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    "ArrowUp",
+    "Home",
+    "End",
+    "PageDown",
+    "PageUp",
+}
+PLAYWRIGHT_SECRET_PATTERNS = [
+    re.compile(pattern, re.I)
+    for pattern in (
+        r"-----BEGIN [A-Z ]{0,40}(PRIVATE KEY|SECRET|TOKEN)",
+        r"\b(sk|sk-proj|ghp|github_pat|xox[baprs])-[-_A-Za-z0-9]{20,}",
+        r"\b(AKIA|ASIA)[A-Z0-9]{16}\b",
+        r"\b(openai|api|access|refresh|secret|private|password|passwd|token|credential)[-_ ]?(key|token|secret|password)?\b\s*[:=]",
+        r"\b(input|outputs|workspace)/[^ \t\r\n]+",
+        r"[A-Za-z]:\\[^ \t\r\n]+",
+    )
+]
+
+
+def shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    counts: dict[str, int] = {}
+    for char in value:
+        counts[char] = counts.get(char, 0) + 1
+    total = len(value)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def looks_like_encoded_secret(value: str) -> bool:
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) < 32:
+        return False
+    if re.fullmatch(r"[A-Fa-f0-9]{48,}", compact):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9+/_=-]{48,}", compact) and shannon_entropy(compact) >= 4.4:
+        return True
+    if len(compact) >= 48 and shannon_entropy(compact) >= 4.8:
+        return True
+    return False
+
+
+def validate_playwright_egress_text(
+    value: Any,
+    *,
+    context: str,
+    max_chars: int,
+    allow_multiline: bool = False,
+) -> str:
+    text = "" if value is None else str(value)
+    if len(text) > max_chars:
+        raise ValueError(
+            f"Egress guard rejected {context}: value length {len(text)} exceeds {max_chars}."
+        )
+    if not allow_multiline and ("\n" in text or "\r" in text):
+        raise ValueError(f"Egress guard rejected {context}: multiline values are not allowed.")
+    if any(ord(char) < 32 and char not in "\t\n\r" for char in text):
+        raise ValueError(f"Egress guard rejected {context}: control characters are not allowed.")
+    stripped = text.strip()
+    if len(stripped) > 40 and stripped[0:1] in {"{", "[", "<"}:
+        raise ValueError(f"Egress guard rejected {context}: structured payload-like value.")
+    for pattern in PLAYWRIGHT_SECRET_PATTERNS:
+        if pattern.search(text):
+            raise ValueError(f"Egress guard rejected {context}: secret/path-like value.")
+    if looks_like_encoded_secret(text):
+        raise ValueError(f"Egress guard rejected {context}: encoded/high-entropy value.")
+    return text
+
+
+def validate_playwright_url_egress(url: str, *, context: str) -> None:
+    if len(url) > PLAYWRIGHT_MAX_URL_CHARS:
+        raise ValueError(
+            f"Egress guard rejected {context}: URL length {len(url)} exceeds {PLAYWRIGHT_MAX_URL_CHARS}."
+        )
+    parsed = urllib.parse.urlsplit(url)
+    query = parsed.query or ""
+    fragment = parsed.fragment or ""
+    if len(query) > PLAYWRIGHT_MAX_URL_QUERY_CHARS:
+        raise ValueError(
+            f"Egress guard rejected {context}: query length {len(query)} exceeds {PLAYWRIGHT_MAX_URL_QUERY_CHARS}."
+        )
+    if len(fragment) > PLAYWRIGHT_MAX_URL_VALUE_CHARS:
+        raise ValueError(
+            f"Egress guard rejected {context}: fragment length {len(fragment)} exceeds {PLAYWRIGHT_MAX_URL_VALUE_CHARS}."
+        )
+    if fragment:
+        validate_playwright_egress_text(
+            fragment,
+            context=f"{context} fragment",
+            max_chars=PLAYWRIGHT_MAX_URL_VALUE_CHARS,
+        )
+    for segment in parsed.path.split("/"):
+        if not segment:
+            continue
+        validate_playwright_egress_text(
+            urllib.parse.unquote_plus(segment),
+            context=f"{context} path segment",
+            max_chars=PLAYWRIGHT_MAX_URL_VALUE_CHARS,
+        )
+    for key, value in urllib.parse.parse_qsl(query, keep_blank_values=True):
+        validate_playwright_egress_text(
+            key,
+            context=f"{context} query key",
+            max_chars=80,
+        )
+        validate_playwright_egress_text(
+            value,
+            context=f"{context} query value",
+            max_chars=PLAYWRIGHT_MAX_URL_VALUE_CHARS,
+        )
+
+
+def step_fill_value(step: dict[str, Any]) -> Any:
+    value_source = step.get("value")
+    if value_source is None and step.get("input_text") is not None:
+        value_source = step.get("input_text")
+    if value_source is None and any(
+        step.get(key_name)
+        for key_name in (
+            "selector",
+            "role",
+            "label",
+            "placeholder",
+            "alt_text",
+            "title",
+        )
+    ):
+        value_source = step.get("text")
+    return value_source
+
+
+def validate_playwright_step_egress(
+    step: dict[str, Any],
+    *,
+    allowed_domains: list[str],
+    step_index: int,
+) -> None:
+    action = str(step.get("action") or "").strip().lower()
+    if action == "goto":
+        url = normalize_playwright_start_url(str(step.get("url") or ""), allowed_domains)
+        validate_playwright_url_egress(url, context=f"step {step_index} goto")
+    elif action == "fill":
+        validate_playwright_egress_text(
+            step_fill_value(step),
+            context=f"step {step_index} fill",
+            max_chars=PLAYWRIGHT_MAX_FILL_CHARS,
+        )
+    elif action == "select":
+        for key in ("value", "option_label"):
+            if step.get(key) is not None:
+                validate_playwright_egress_text(
+                    step.get(key),
+                    context=f"step {step_index} select {key}",
+                    max_chars=PLAYWRIGHT_MAX_SELECT_CHARS,
+                )
+    elif action == "press":
+        key = str(step.get("key") or "").strip()
+        if key and key not in PLAYWRIGHT_SAFE_KEYS:
+            raise ValueError(f"Egress guard rejected step {step_index}: unsupported key {key!r}.")
+
+
+def validate_playwright_steps_egress(
+    steps: list[dict[str, Any]],
+    *,
+    allowed_domains: list[str],
+) -> None:
+    for index, step in enumerate(steps, start=1):
+        validate_playwright_step_egress(
+            dict(step or {}),
+            allowed_domains=allowed_domains,
+            step_index=index,
+        )
+
+
+def playwright_locator(page: Any, target: dict[str, Any]) -> Any:
+    selector = str(target.get("selector") or "").strip()
+    if selector:
+        return page.locator(selector).first
+    role = str(target.get("role") or "").strip()
+    name = str(target.get("name") or "").strip()
+    if role and name:
+        return page.get_by_role(role, name=name, exact=False).first
+    label = str(target.get("label") or "").strip()
+    if label:
+        return page.get_by_label(label, exact=False).first
+    placeholder = str(target.get("placeholder") or "").strip()
+    if placeholder:
+        return page.get_by_placeholder(placeholder, exact=False).first
+    text = str(target.get("text") or "").strip()
+    if text:
+        return page.get_by_text(text, exact=False).first
+    alt_text = str(target.get("alt_text") or "").strip()
+    if alt_text:
+        return page.get_by_alt_text(alt_text, exact=False).first
+    title = str(target.get("title") or "").strip()
+    if title:
+        return page.get_by_title(title, exact=False).first
+    raise ValueError("Action target requires selector, role+name, label, placeholder, text, alt_text, or title.")
+
+
+def playwright_extract_page_state(page: Any, *, max_text_chars: int = 12000) -> dict[str, Any]:
+    def eval_all(selector: str, script: str, *, timeout_ms: int = 3000) -> Any:
+        try:
+            page.locator(selector).first.wait_for(state="attached", timeout=timeout_ms)
+        except Exception:
+            pass
+        try:
+            return limited_jsonable(page.locator(selector).evaluate_all(script), max_items=100)
+        except Exception as exc:
+            return {"error": f"{exc.__class__.__name__}: {exc}"}
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=4000)
+    except Exception:
+        body_text = ""
+
+    return {
+        "url": page.url,
+        "title": page.title(),
+        "text_preview": compact_text(body_text, max_chars=max_text_chars),
+        "links": eval_all(
+            "a",
+            """
+            els => els.slice(0, 120).map(a => ({
+              text: (a.innerText || a.textContent || '').trim().slice(0, 180),
+              href: a.href || a.getAttribute('href') || '',
+              title: a.getAttribute('title') || ''
+            }))
+            """,
+        ),
+        "inputs": eval_all(
+            "input, textarea, select",
+            """
+            els => els.slice(0, 120).map(el => ({
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type') || '',
+              name: el.getAttribute('name') || '',
+              id: el.getAttribute('id') || '',
+              placeholder: el.getAttribute('placeholder') || '',
+              aria_label: el.getAttribute('aria-label') || '',
+              value: el.value || '',
+              label: (() => {
+                if (el.labels && el.labels.length) {
+                  return Array.from(el.labels).map(l => l.innerText || l.textContent || '').join(' ').trim();
+                }
+                return '';
+              })()
+            }))
+            """,
+        ),
+        "buttons": eval_all(
+            "button, input[type=button], input[type=submit], input[type=reset], a[role=button]",
+            """
+            els => els.slice(0, 80).map(el => ({
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type') || '',
+              name: el.getAttribute('name') || '',
+              id: el.getAttribute('id') || '',
+              text: (el.innerText || el.value || el.textContent || '').trim().slice(0, 180),
+              aria_label: el.getAttribute('aria-label') || ''
+            }))
+            """,
+        ),
+        "forms": eval_all(
+            "form",
+            """
+            els => els.slice(0, 20).map(form => ({
+              method: form.getAttribute('method') || 'get',
+              action: form.action || form.getAttribute('action') || '',
+              text: (form.innerText || form.textContent || '').trim().slice(0, 500),
+              inputs: Array.from(form.querySelectorAll('input, textarea, select')).slice(0, 60).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                type: el.getAttribute('type') || '',
+                name: el.getAttribute('name') || '',
+                id: el.getAttribute('id') || '',
+                placeholder: el.getAttribute('placeholder') || '',
+                value: el.value || ''
+              })),
+              buttons: Array.from(form.querySelectorAll('button, input[type=submit], input[type=button]')).slice(0, 30).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                type: el.getAttribute('type') || '',
+                text: (el.innerText || el.value || el.textContent || '').trim().slice(0, 180)
+              }))
+            }))
+            """,
+        ),
+        "tables": eval_all(
+            "table",
+            """
+            els => els.slice(0, 20).map(table => Array.from(table.querySelectorAll('tr')).slice(0, 12).map(row =>
+              Array.from(row.querySelectorAll('th,td')).slice(0, 12).map(cell =>
+                (cell.innerText || cell.textContent || '').trim().slice(0, 160)
+              )
+            ))
+            """,
+        ),
+    }
+
+
+def playwright_page_shows_rate_limit(page: Any) -> bool:
+    try:
+        title = str(page.title() or "")
+    except Exception:
+        title = ""
+    try:
+        body = str(page.locator("body").inner_text(timeout=2000) or "")
+    except Exception:
+        body = ""
+    probe = f"{title}\n{body[:1000]}".lower()
+    return "too many requests" in probe or bool(re.search(r"\b429\b", probe))
+
+
+def run_playwright_steps(
+    *,
+    start_url: str,
+    allowed_domains: list[str],
+    steps: list[dict[str, Any]],
+    output_dir: Path,
+    timeout_seconds: int,
+    capture_screenshot: bool,
+    max_text_chars: int,
+    min_action_delay_ms: int,
+    rate_limit_backoff_ms: int,
+    proxy_url: str = "",
+) -> dict[str, Any]:
+    import time
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError(
+            "playwright is not installed in the runner environment. "
+            "Install playwright and rebuild the agent image."
+        ) from exc
+
+    action_log: list[dict[str, Any]] = []
+    blocked_urls: list[str] = []
+    screenshots: list[str] = []
+    rate_limit_events: list[dict[str, Any]] = []
+    started = time.monotonic()
+    safe_timeout_ms = max(10, min(timeout_seconds, 240)) * 1000
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context_kwargs: dict[str, Any] = {
+            "locale": "ja-JP",
+            "timezone_id": "Asia/Tokyo",
+            "viewport": {"width": 1365, "height": 900},
+        }
+        proxy_settings = playwright_proxy_settings(proxy_url)
+        if proxy_settings:
+            context_kwargs["proxy"] = proxy_settings
+        context = browser.new_context(**context_kwargs)
+        page = context.new_page()
+        page.set_default_timeout(min(safe_timeout_ms, 30000))
+
+        def route_handler(route: Any) -> None:
+            request_url = route.request.url
+            if request_url.startswith(("data:", "blob:", "about:")):
+                route.continue_()
+                return
+            if is_url_allowed_by_domains(request_url, allowed_domains):
+                try:
+                    validate_playwright_url_egress(
+                        request_url,
+                        context=f"{route.request.method} request",
+                    )
+                    method = str(route.request.method or "GET").upper()
+                    if method not in {"GET", "HEAD", "OPTIONS"}:
+                        post_data = route.request.post_data or ""
+                        if len(post_data) > PLAYWRIGHT_MAX_POST_CHARS:
+                            raise ValueError(
+                                f"POST body length {len(post_data)} exceeds {PLAYWRIGHT_MAX_POST_CHARS}."
+                            )
+                except Exception as exc:
+                    blocked_urls.append(f"{request_url} [egress_guard: {exc}]")
+                    route.abort()
+                    return
+                route.continue_()
+                return
+            blocked_urls.append(request_url)
+            route.abort()
+
+        page.route("**/*", route_handler)
+
+        def apply_action_delay(log_item: dict[str, Any]) -> None:
+            if min_action_delay_ms <= 0:
+                return
+            page.wait_for_timeout(min_action_delay_ms)
+            log_item["politeness_delay_ms"] = min_action_delay_ms
+
+        def apply_rate_limit_backoff(log_item: dict[str, Any]) -> None:
+            status = log_item.get("http_status")
+            detected = status == 429 or playwright_page_shows_rate_limit(page)
+            if not detected:
+                return
+            event = {
+                "step": log_item.get("step", 0),
+                "action": log_item.get("action", ""),
+                "url": page.url,
+                "http_status": status,
+                "backoff_ms": rate_limit_backoff_ms,
+            }
+            rate_limit_events.append(event)
+            log_item["rate_limit_detected"] = True
+            log_item["rate_limit_backoff_ms"] = rate_limit_backoff_ms
+            if rate_limit_backoff_ms > 0:
+                page.wait_for_timeout(rate_limit_backoff_ms)
+
+        try:
+            response = page.goto(start_url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            initial_log: dict[str, Any] = {"action": "goto", "url": start_url, "ok": True}
+            if response is not None:
+                initial_log["http_status"] = response.status
+            apply_rate_limit_backoff(initial_log)
+            apply_action_delay(initial_log)
+            action_log.append(initial_log)
+
+            for index, raw_step in enumerate(steps[:20], start=1):
+                step = dict(raw_step or {})
+                action = str(step.get("action") or "").strip().lower()
+                if not action:
+                    raise ValueError(f"Step {index} missing action.")
+                log_item: dict[str, Any] = {"step": index, "action": action}
+                if action == "goto":
+                    url = normalize_playwright_start_url(str(step.get("url") or ""), allowed_domains)
+                    response = page.goto(url, wait_until="domcontentloaded", timeout=safe_timeout_ms)
+                    log_item["url"] = url
+                    if response is not None:
+                        log_item["http_status"] = response.status
+                elif action == "click":
+                    locator = playwright_locator(page, step)
+                    locator.click(timeout=min(safe_timeout_ms, 15000))
+                    log_item["target"] = limited_jsonable(step)
+                elif action == "fill":
+                    locator = playwright_locator(page, step)
+                    value = validate_playwright_egress_text(
+                        step_fill_value(step),
+                        context=f"step {index} fill",
+                        max_chars=PLAYWRIGHT_MAX_FILL_CHARS,
+                    )
+                    locator.fill(value, timeout=min(safe_timeout_ms, 15000))
+                    log_item["target"] = limited_jsonable({k: v for k, v in step.items() if k != "value"})
+                    log_item["value_length"] = len(value)
+                elif action == "press":
+                    key = str(step.get("key") or "").strip()
+                    if not key:
+                        raise ValueError(f"Step {index} press action requires key.")
+                    if any(step.get(key_name) for key_name in ("selector", "role", "label", "placeholder", "text", "alt_text", "title")):
+                        playwright_locator(page, step).press(key, timeout=min(safe_timeout_ms, 15000))
+                    else:
+                        page.keyboard.press(key)
+                    log_item["key"] = key
+                elif action == "select":
+                    locator = playwright_locator(page, step)
+                    value = step.get("value")
+                    label = step.get("option_label")
+                    index_value = step.get("option_index")
+                    if label is not None:
+                        selected = locator.select_option(label=str(label), timeout=min(safe_timeout_ms, 15000))
+                    elif index_value is not None:
+                        selected = locator.select_option(index=int(index_value), timeout=min(safe_timeout_ms, 15000))
+                    else:
+                        selected = locator.select_option(value=str(value), timeout=min(safe_timeout_ms, 15000))
+                    log_item["selected"] = limited_jsonable(selected)
+                elif action == "wait":
+                    milliseconds = int(step.get("milliseconds") or 1000)
+                    page.wait_for_timeout(max(0, min(milliseconds, 10000)))
+                    log_item["milliseconds"] = milliseconds
+                elif action == "wait_for_selector":
+                    selector = str(step.get("selector") or "").strip()
+                    if not selector:
+                        raise ValueError(f"Step {index} wait_for_selector requires selector.")
+                    page.locator(selector).first.wait_for(timeout=min(safe_timeout_ms, 15000))
+                    log_item["selector"] = selector
+                elif action == "wait_for_text":
+                    text = str(step.get("text") or "").strip()
+                    if not text:
+                        raise ValueError(f"Step {index} wait_for_text requires text.")
+                    page.get_by_text(text, exact=False).first.wait_for(timeout=min(safe_timeout_ms, 15000))
+                    log_item["text"] = text
+                elif action == "screenshot":
+                    screenshot_name = f"screenshot_{index:02d}.png"
+                    page.screenshot(path=str(output_dir / screenshot_name), full_page=bool(step.get("full_page", True)))
+                    screenshots.append(screenshot_name)
+                    log_item["screenshot"] = screenshot_name
+                elif action == "extract_text":
+                    if any(step.get(key_name) for key_name in ("selector", "role", "label", "placeholder", "text", "alt_text", "title")):
+                        extracted = playwright_locator(page, step).inner_text(timeout=min(safe_timeout_ms, 15000))
+                    else:
+                        extracted = page.locator("body").inner_text(timeout=min(safe_timeout_ms, 15000))
+                    log_item["text_preview"] = compact_text(extracted, max_chars=4000)
+                else:
+                    raise ValueError(f"Unsupported Playwright action: {action}")
+
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=3000)
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                apply_rate_limit_backoff(log_item)
+                if action != "wait":
+                    apply_action_delay(log_item)
+                log_item["ok"] = True
+                log_item["url"] = page.url
+                action_log.append(log_item)
+
+            if capture_screenshot:
+                screenshot_name = "final.png"
+                page.screenshot(path=str(output_dir / screenshot_name), full_page=True)
+                screenshots.append(screenshot_name)
+
+            page_state = playwright_extract_page_state(page, max_text_chars=max_text_chars)
+        finally:
+            context.close()
+            browser.close()
+
+    return {
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "actions": action_log,
+        "blocked_urls": blocked_urls[:200],
+        "blocked_url_count": len(blocked_urls),
+        "rate_limit_events": rate_limit_events[:50],
+        "rate_limit_event_count": len(rate_limit_events),
+        "screenshots": screenshots,
+        "page": page_state,
+    }
+
+
+@tool
+def run_playwright_task(
+    task: str,
+    start_url: str,
+    allowed_domains: list[str],
+    steps: list[dict[str, Any]] | None = None,
+    timeout_seconds: int = 120,
+    capture_screenshot: bool = False,
+    max_text_chars: int = 12000,
+    min_action_delay_ms: int = PLAYWRIGHT_DEFAULT_MIN_ACTION_DELAY_MS,
+    rate_limit_backoff_ms: int = PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS,
+) -> dict[str, Any]:
+    """Run a deterministic Playwright browser task with restricted actions.
+
+    Use this for interactive public sites. It is not arbitrary code execution
+    and it is not broad web search. Provide a start_url and explicit
+    allowed_domains. Optional steps may include:
+    goto, click, fill, press, select, wait, wait_for_selector, wait_for_text,
+    extract_text, and screenshot. Targets can use selector, role+name, label,
+    placeholder, text, alt_text, or title. For fill actions, pass value or
+    input_text; text is also accepted as the fill value when another target
+    field such as selector or placeholder is present. Egress guard rejects long
+    values, secret/path-like strings, high-entropy encoded payloads, structured
+    payload-like values, and long URL query/fragment values. File upload actions
+    are not supported.
+
+    Generic rate-limit avoidance is enabled by default: min_action_delay_ms
+    defaults to 1000 and is applied after browser actions and between browser
+    tool calls for the same allowed domain set. If a page appears to be rate
+    limited (HTTP 429 or "Too Many Requests"), rate_limit_backoff_ms is applied
+    before returning the observed page state. Results are saved under
+    /outputs/_playwright/<run_id>/result.json and summary.md.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    run_id = ""
+    safe_domains: list[str] = []
+    try:
+        safe_domains = validate_public_allowed_domains(allowed_domains, tool_name="Playwright")
+        safe_start_url = normalize_playwright_start_url(start_url, safe_domains)
+        validate_playwright_url_egress(safe_start_url, context="start_url")
+        limited_steps = list(steps or [])[:20]
+        validate_playwright_steps_egress(limited_steps, allowed_domains=safe_domains)
+        safe_min_action_delay_ms = clamp_playwright_delay_ms(
+            min_action_delay_ms,
+            default_ms=PLAYWRIGHT_DEFAULT_MIN_ACTION_DELAY_MS,
+            max_ms=PLAYWRIGHT_MAX_MIN_ACTION_DELAY_MS,
+        )
+        safe_rate_limit_backoff_ms = clamp_playwright_delay_ms(
+            rate_limit_backoff_ms,
+            default_ms=PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS,
+            max_ms=PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS,
+        )
+        proxy_url = network_tool_proxy_url(safe_domains, purpose="playwright")
+        domain_wait_ms = apply_playwright_domain_delay(safe_domains, safe_min_action_delay_ms)
+        run_id = browser_tool_run_id("playwright", task + "|" + safe_start_url, safe_domains)
+        playwright_dir = CONFIG.output_dir / "_playwright" / run_id
+        playwright_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            result = run_playwright_steps(
+                start_url=safe_start_url,
+                allowed_domains=safe_domains,
+                steps=limited_steps,
+                output_dir=playwright_dir,
+                timeout_seconds=timeout_seconds,
+                capture_screenshot=capture_screenshot,
+                max_text_chars=max(1000, min(max_text_chars, 30000)),
+                min_action_delay_ms=safe_min_action_delay_ms,
+                rate_limit_backoff_ms=safe_rate_limit_backoff_ms,
+                proxy_url=proxy_url,
+            )
+        finally:
+            record_playwright_domain_finish(safe_domains)
+        virtual_root = f"/outputs/_playwright/{run_id}"
+        saved_result: dict[str, Any] = {
+            "ok": True,
+            "run_id": run_id,
+            "task": task,
+            "start_url": safe_start_url,
+            "allowed_domains": safe_domains,
+            "timeout_seconds": timeout_seconds,
+            "capture_screenshot": capture_screenshot,
+            "min_action_delay_ms": safe_min_action_delay_ms,
+            "rate_limit_backoff_ms": safe_rate_limit_backoff_ms,
+            "domain_wait_ms": domain_wait_ms,
+            "network_proxy_enabled": bool(proxy_url),
+            "virtual_root": virtual_root,
+            **result,
+        }
+        (playwright_dir / "result.json").write_text(
+            json.dumps(saved_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        page = saved_result.get("page") or {}
+        summary = [
+            "# Playwright Task Summary",
+            "",
+            f"- Run ID: {run_id}",
+            f"- Start URL: {safe_start_url}",
+            f"- Current URL: {page.get('url') or ''}",
+            f"- Title: {page.get('title') or ''}",
+            f"- Allowed domains: {', '.join(safe_domains)}",
+            f"- Elapsed seconds: {saved_result.get('elapsed_seconds')}",
+            f"- Actions: {len(saved_result.get('actions') or [])}",
+            f"- Blocked external requests: {saved_result.get('blocked_url_count')}",
+            f"- Min action delay ms: {saved_result.get('min_action_delay_ms')}",
+            f"- Domain wait ms before start: {saved_result.get('domain_wait_ms')}",
+            f"- Network proxy enabled: {saved_result.get('network_proxy_enabled')}",
+            f"- Rate-limit events: {saved_result.get('rate_limit_event_count')}",
+            "",
+            "## Text Preview",
+            "",
+            str(page.get("text_preview") or "")[:12000],
+        ]
+        (playwright_dir / "summary.md").write_text("\n".join(summary), encoding="utf-8")
+        return {
+            **saved_result,
+            "result_json_path": f"{virtual_root}/result.json",
+            "summary_path": f"{virtual_root}/summary.md",
+            "screenshot_paths": [
+                f"{virtual_root}/{name}" for name in saved_result.get("screenshots", [])
+            ],
+        }
+    except Exception as exc:
+        if CONFIG is not None and run_id:
+            error_dir = CONFIG.output_dir / "_playwright" / run_id
+            error_dir.mkdir(parents=True, exist_ok=True)
+            (error_dir / "error.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                        "task": task,
+                        "start_url": start_url,
+                        "allowed_domains": allowed_domains,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "task": task[:1000],
+            "start_url": start_url,
+            "allowed_domains": allowed_domains,
+        }
+
+
+async def run_browser_use_agent_async(
+    *,
+    task: str,
+    allowed_domains: list[str],
+    model: str,
+    max_steps: int,
+    timeout_seconds: int,
+    use_vision: bool,
+) -> dict[str, Any]:
+    import asyncio
+
+    try:
+        from browser_use import Agent, ChatOpenAI
+    except Exception as exc:
+        raise RuntimeError(
+            "browser-use is not installed in the runner environment. "
+            "Install browser-use[core] and rebuild the agent image."
+        ) from exc
+    try:
+        from browser_use import Browser
+    except Exception:
+        Browser = None  # type: ignore[assignment]
+    try:
+        from browser_use import BrowserSession
+    except Exception:
+        BrowserSession = None  # type: ignore[assignment]
+
+    llm = ChatOpenAI(model=normalize_browser_use_model(model))
+    browser_obj: Any | None = None
+    agent_kwargs: dict[str, Any] = {
+        "task": task,
+        "llm": llm,
+        "use_vision": use_vision,
+    }
+    try:
+        if Browser is None:
+            raise RuntimeError("Browser export unavailable")
+        browser_obj = Browser(headless=True, allowed_domains=allowed_domains)
+        agent_kwargs["browser"] = browser_obj
+    except Exception:
+        if BrowserSession is None:
+            raise RuntimeError("browser-use Browser/BrowserSession exports are unavailable")
+        browser_obj = BrowserSession(headless=True, allowed_domains=allowed_domains)
+        agent_kwargs["browser_session"] = browser_obj
+    agent = Agent(**agent_kwargs)
+    history = None
+    try:
+        history = await asyncio.wait_for(
+            agent.run(max_steps=max(1, min(max_steps, 60))),
+            timeout=max(30, min(timeout_seconds, 240)),
+        )
+    finally:
+        close_target = getattr(agent, "browser_session", None) or browser_obj
+        close_method = getattr(close_target, "close", None)
+        if callable(close_method):
+            try:
+                maybe_result = close_method()
+                if hasattr(maybe_result, "__await__"):
+                    await maybe_result
+            except Exception:
+                pass
+    return {
+        "final_result": call_history_method(history, "final_result") if history is not None else "",
+        "is_done": call_history_method(history, "is_done") if history is not None else None,
+        "is_successful": call_history_method(history, "is_successful") if history is not None else None,
+        "urls": call_history_method(history, "urls") if history is not None else [],
+        "action_names": call_history_method(history, "action_names") if history is not None else [],
+        "errors": call_history_method(history, "errors") if history is not None else [],
+        "extracted_content": call_history_method(history, "extracted_content") if history is not None else [],
+        "model_actions": call_history_method(history, "model_actions") if history is not None else [],
+        "model_outputs": call_history_method(history, "model_outputs") if history is not None else [],
+    }
+
+
+@tool
+def run_browser_use_task(
+    task: str,
+    allowed_domains: list[str],
+    max_steps: int = 10,
+    timeout_seconds: int = 180,
+    model: str = "",
+    use_vision: bool = False,
+) -> dict[str, Any]:
+    """Run a generic browser-use autonomous browser task with domain restrictions.
+
+    Use this for interactive public websites that require a rendered browser,
+    JavaScript, forms, CSRF tokens, clicks, or table extraction. This is not a
+    broad web search tool: allowed_domains is required and is passed to
+    browser-use as a navigation allowlist. The full run summary is saved under
+    /outputs/_browser_use/<run_id>/result.json and summary.md.
+    """
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    run_id = ""
+    try:
+        import asyncio
+        import time
+
+        safe_domains = validate_browser_use_allowed_domains(allowed_domains)
+        run_id = browser_use_run_id(task, safe_domains)
+        browser_dir = CONFIG.output_dir / "_browser_use" / run_id
+        browser_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        browser_result = asyncio.run(
+            run_browser_use_agent_async(
+                task=task,
+                allowed_domains=safe_domains,
+                model=model or CONFIG.deep_model,
+                max_steps=max_steps,
+                timeout_seconds=timeout_seconds,
+                use_vision=use_vision,
+            )
+        )
+        elapsed = time.monotonic() - started
+        result: dict[str, Any] = {
+            "ok": True,
+            "run_id": run_id,
+            "task": task,
+            "allowed_domains": safe_domains,
+            "model": normalize_browser_use_model(model or CONFIG.deep_model),
+            "max_steps": max_steps,
+            "timeout_seconds": timeout_seconds,
+            "use_vision": use_vision,
+            "elapsed_seconds": round(elapsed, 3),
+            **browser_result,
+        }
+        (browser_dir / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary = [
+            "# Browser Use Task Summary",
+            "",
+            f"- Run ID: {run_id}",
+            f"- Allowed domains: {', '.join(safe_domains)}",
+            f"- Model: {result['model']}",
+            f"- Elapsed seconds: {result['elapsed_seconds']}",
+            f"- Successful: {result.get('is_successful')}",
+            "",
+            "## Final Result",
+            "",
+            str(result.get("final_result") or "")[:12000],
+            "",
+            "## URLs",
+            "",
+        ]
+        for url in result.get("urls") or []:
+            summary.append(f"- {url}")
+        (browser_dir / "summary.md").write_text("\n".join(summary), encoding="utf-8")
+        virtual_root = f"/outputs/_browser_use/{run_id}"
+        return {
+            **result,
+            "virtual_root": virtual_root,
+            "result_json_path": f"{virtual_root}/result.json",
+            "summary_path": f"{virtual_root}/summary.md",
+        }
+    except Exception as exc:
+        if CONFIG is not None and run_id:
+            error_dir = CONFIG.output_dir / "_browser_use" / run_id
+            error_dir.mkdir(parents=True, exist_ok=True)
+            (error_dir / "error.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                        "task": task,
+                        "allowed_domains": allowed_domains,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "task": task[:1000],
+            "allowed_domains": allowed_domains,
+        }
+
+
+@tool
+def search_site_crawl(
+    query: str,
+    crawl_id: str = "",
+    max_results: int = 8,
+) -> dict[str, Any]:
+    """Search a previously created site crawl by keyword and return sourced snippets."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        result = search_site_crawl_index(
+            CONFIG.output_dir,
+            query=query,
+            crawl_id=crawl_id or None,
+            max_results=max_results,
+        )
+        for item in result["results"]:
+            item["virtual_path"] = f"/outputs/_site_crawl/{result['crawl_id']}/{item['text_path']}"
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "query": query,
+            "crawl_id": crawl_id,
+        }
+
+
+@tool
+def read_crawled_page(
+    page: str,
+    crawl_id: str = "",
+    max_chars: int = 12000,
+) -> dict[str, Any]:
+    """Read one page from a site crawl by page_id or URL."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        result = read_site_crawl_page(
+            CONFIG.output_dir,
+            page=page,
+            crawl_id=crawl_id or None,
+            max_chars=max(1000, min(max_chars, 50000)),
+        )
+        result["virtual_path"] = (
+            f"/outputs/_site_crawl/{result['crawl_id']}/{result['page']['text_path']}"
+        )
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "page": page,
+            "crawl_id": crawl_id,
+        }
+
+
+@tool
+def list_site_crawls(max_crawls: int = 10) -> dict[str, Any]:
+    """List site crawls created during this run."""
+    if CONFIG is None:
+        return {"ok": False, "error": "runner_config_missing"}
+    try:
+        result = list_site_crawl_runs(CONFIG.output_dir, max_crawls=max_crawls)
+        for item in result["crawls"]:
+            item["virtual_root"] = f"/outputs/_site_crawl/{item['crawl_id']}"
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
 
 
 def normalize_export_path(path: str | Path) -> tuple[str, Path]:
@@ -1607,6 +3479,7 @@ def default_deep_agent_profile() -> DeepAgentProfile:
         id="default",
         tool_name="run_deep_agent_task",
         description="Run the default sandboxed Deep Agent worker.",
+        toolsets=["review", "file_read", "image_inspect", "site_crawl", "browser"],
         skill_sources=CONFIG.skill_sources,
         image=CONFIG.image,
         deep_model=CONFIG.deep_model,
@@ -1624,21 +3497,91 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "Profile-specific instructions:\n"
             f"{profile.system_prompt.strip()}\n\n"
         )
+    toolset_lines = [
+        f"- {toolset}: {TOOLSET_DESCRIPTIONS[toolset]} "
+        f"({', '.join(TOOLSET_TOOL_NAMES[toolset])})"
+        for toolset in profile.toolsets
+    ]
+    toolset_block = (
+        "Available custom toolsets for this profile:\n"
+        + "\n".join(toolset_lines)
+        + "\n\n"
+    )
+    file_read_text = ""
+    if "file_read" in profile.toolsets:
+        image_suffix = (
+            " If `image_inspect` is also available, image questions can use vision; "
+            "otherwise image files return metadata only."
+            if "image_inspect" in profile.toolsets
+            else " Image files return metadata only because `image_inspect` is not available."
+        )
+        file_read_text = (
+            "Use read_sandbox_file when you need a type-aware read of /input or "
+            "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
+            f"metadata, and other supported files.{image_suffix} "
+        )
+    image_text = ""
+    if "image_inspect" in profile.toolsets:
+        image_text = (
+            "Use inspect_sandbox_image for focused visual review after creating "
+            "crops, contact sheets, plots, or screenshots. "
+        )
+    site_text = ""
+    if "site_crawl" in profile.toolsets:
+        site_text = (
+            "For website research, do not use arbitrary search or network access "
+            "from the sandbox. Instead, use the controlled site tools: "
+            "crawl_allowed_site, extract_allowed_site_links, crawl_allowed_urls, "
+            "search_site_crawl, read_crawled_page, and list_site_crawls. These "
+            "tools enforce allowed domains, page/depth limits, response-size "
+            "limits, and robots.txt before writing a local crawl index under "
+            "/outputs/_site_crawl. When completeness for dated articles or "
+            "collection pages matters, extract the listing links first, then "
+            "crawl that explicit URL set. "
+        )
+    browser_text = ""
+    if "browser" in profile.toolsets:
+        browser_text = (
+            "For interactive sites or local browser validation that require "
+            "JavaScript, rendered forms, clicks, DOM checks, screenshots, or "
+            "CSRF-managed browser flows, use run_playwright_task with explicit "
+            "allowed_domains. Browser tasks include an egress guard: keep inputs "
+            "short, search-like, and task-relevant; do not send file contents, "
+            "secrets, or structured payloads through browser fields or URLs. "
+            "The browser tool applies generic rate-limit avoidance by default: "
+            "keep min_action_delay_ms at least 1000 unless a slower pace is "
+            "needed, avoid opening many detail pages in rapid succession, and if "
+            "HTTP 429 or Too Many Requests appears, back off and report the "
+            "limitation rather than increasing request volume. "
+        )
+    if profile.input_access == "all":
+        input_text = "Read task inputs only from /input and write final artifacts under /outputs. "
+    elif profile.input_access == "skills_only":
+        input_text = (
+            "No user task input files are mounted in this profile. /input contains "
+            "profile skills only; do not treat it as task evidence. Write final "
+            "artifacts under /outputs. "
+        )
+    else:
+        input_text = (
+            "No user task input files are mounted in this profile. Write final "
+            "artifacts under /outputs. "
+        )
     return (
         profile_block
+        + toolset_block
         + "You are a task execution agent running in an isolated sandbox. "
-        "Read inputs only from /input and write final artifacts under /outputs. "
-        f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
+        + input_text
+        + f"Review/export artifacts may only use these extensions: {ALLOWED_EXPORT_EXTENSIONS_TEXT}. "
         "Do not include helper scripts, images, PDFs, or other non-allowed "
         "files in request_parent_review. "
         "Save larger scripts under /outputs before executing them. "
         "Do not use the network from the sandbox. Use installed local libraries when helpful. "
-        "Use read_sandbox_file when you need a type-aware read of /input or "
-        "/outputs files: it can preview text, CSV, JSON, Excel, PDFs, image "
-        "metadata, and can perform a vision read of images when you pass a "
-        "question. You may still call inspect_sandbox_image directly for focused "
-        "visual review after creating crops, contact sheets, plots, or screenshots. "
-        "Cite inspected file paths and any uncertainty in your artifacts. "
+        + file_read_text
+        + image_text
+        + site_text
+        + browser_text
+        + "Cite inspected file paths and any uncertainty in your artifacts. "
         "Before requesting parent review, you must perform an autonomous self-check. "
         "This self-check is task-specific and you must design it yourself; do not "
         "wait for a prebuilt validator. Required self-check artifacts: "
@@ -1667,6 +3610,53 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
     )
 
 
+def deep_agent_tools_for_profile(profile: DeepAgentProfile) -> list[Any]:
+    tools_by_toolset: dict[str, list[Any]] = {
+        "review": [request_parent_review],
+        "file_read": [read_sandbox_file],
+        "image_inspect": [inspect_sandbox_image],
+        "site_crawl": [
+            crawl_allowed_site,
+            extract_allowed_site_links,
+            crawl_allowed_urls,
+            search_site_crawl,
+            read_crawled_page,
+            list_site_crawls,
+        ],
+        "browser": [run_playwright_task],
+    }
+    selected: list[Any] = []
+    seen_names: set[str] = set()
+    for toolset in profile.toolsets:
+        for item in tools_by_toolset[toolset]:
+            name = getattr(item, "name", None) or getattr(item, "__name__", str(item))
+            if name in seen_names:
+                continue
+            selected.append(item)
+            seen_names.add(name)
+    return selected
+
+
+def graceful_finalize_thresholds(recursion_limit: int) -> dict[str, int]:
+    finalize_model_calls = max(8, min(30, recursion_limit // 4))
+    warning_model_calls = max(4, int(finalize_model_calls * 0.75))
+    finalize_tool_calls = max(8, min(24, recursion_limit // 5))
+    warning_tool_calls = max(4, int(finalize_tool_calls * 0.75))
+    warning_message_count = max(12, int(recursion_limit * 0.55))
+    finalize_message_count = max(
+        warning_message_count + 4,
+        int(recursion_limit * 0.70),
+    )
+    return {
+        "warning_model_calls": warning_model_calls,
+        "finalize_model_calls": finalize_model_calls,
+        "warning_tool_calls": warning_tool_calls,
+        "finalize_tool_calls": finalize_tool_calls,
+        "warning_message_count": warning_message_count,
+        "finalize_message_count": finalize_message_count,
+    }
+
+
 def execute_deep_agent_task(
     task: str,
     expected_artifacts: list[str],
@@ -1688,6 +3678,7 @@ def execute_deep_agent_task(
     effective_recursion_limit = profile.deep_recursion_limit or CONFIG.deep_recursion_limit
     effective_max_review_rounds = profile.max_review_rounds or CONFIG.max_review_rounds
     effective_skill_sources = profile.skill_sources or []
+    effective_input_dir = profile_input_dir(profile)
     try:
         effective_expected_artifacts = normalize_tool_expected_artifacts(expected_artifacts)
     except Exception as exc:
@@ -1762,17 +3753,32 @@ def execute_deep_agent_task(
         )
         return evaluation
 
-    backend = create_configured_backend(effective_image)
+    backend = create_configured_backend(effective_image, input_dir=effective_input_dir)
+    selected_deep_tools = deep_agent_tools_for_profile(profile)
+    selected_deep_tool_names = [
+        getattr(item, "name", None) or getattr(item, "__name__", str(item))
+        for item in selected_deep_tools
+    ]
+    graceful_finalize_config = graceful_finalize_thresholds(effective_recursion_limit)
 
     deep_error: dict[str, Any] | None = None
     DEEP_AGENT_TRACE.clear()
+    global ACTIVE_DEEP_AGENT_TOOLSETS
     try:
+        ACTIVE_DEEP_AGENT_TOOLSETS = set(profile.toolsets)
         deep_agent = create_deep_agent(
             model=effective_model,
-            tools=[request_parent_review, read_sandbox_file, inspect_sandbox_image],
+            tools=selected_deep_tools,
             backend=backend,
             skills=effective_skill_sources or None,
             system_prompt=build_deep_agent_system_prompt(profile),
+            middleware=[
+                GracefulFinalizeMiddleware(
+                    profile_id=profile.id,
+                    expected_artifacts=effective_expected_artifacts,
+                    **graceful_finalize_config,
+                )
+            ],
         )
         deep_result = deep_agent.invoke(
             {"messages": [{"role": "user", "content": task_with_contract}]},
@@ -1804,6 +3810,7 @@ def execute_deep_agent_task(
             encoding="utf-8",
         )
     finally:
+        ACTIVE_DEEP_AGENT_TOOLSETS = set()
         workspace_dir = backend.workspace_dir
         backend.cleanup()
         workspace_exists = workspace_dir.exists()
@@ -1847,10 +3854,14 @@ def execute_deep_agent_task(
             "id": profile.id,
             "tool_name": profile.tool_name,
             "description": profile.description,
+            "toolsets": profile.toolsets,
+            "available_tools": selected_deep_tool_names,
+            "graceful_finalize": graceful_finalize_config,
             "image": effective_image,
             "deep_model": effective_model,
             "deep_recursion_limit": effective_recursion_limit,
             "skill_sources": effective_skill_sources,
+            "input_access": profile.input_access,
         },
         "runtime": {
             "host_os": CONFIG.host_os,
@@ -1859,6 +3870,7 @@ def execute_deep_agent_task(
             "podman_bin": CONFIG.podman_bin,
             "wsl_distro": CONFIG.wsl_distro if CONFIG.host_os == "windows" else None,
             "selinux_relabel": CONFIG.selinux_relabel,
+            "egress_proxy_enabled": bool(CONFIG.egress_proxy_url),
         },
         "expected_artifacts": effective_expected_artifacts,
         "configured_final_artifacts": CONFIG.expected_artifacts,
@@ -1920,13 +3932,19 @@ def make_deep_agent_profile_tool(profile: DeepAgentProfile) -> Any:
     run_profile_deep_agent.__name__ = profile.tool_name
     run_profile_deep_agent.__doc__ = (
         f"{profile.description}\n\n"
+        f"Available toolsets: {', '.join(profile.toolsets)}. "
+        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}.\n\n"
         "Run this sandboxed Deep Agent profile for allowed /outputs artifacts. "
         "expected_artifacts must be files under /outputs using only output-gate "
         "allowed extensions: .csv, .html, .json, .md, .xlsx, .yaml, .yml. "
         "Do not request .py, .js, .png, .pdf, .docx, .pptx, .xlsm, or directory "
         "artifacts as review/export artifacts."
     )
-    return tool(profile.tool_name, description=profile.description)(run_profile_deep_agent)
+    tool_description = (
+        f"{profile.description} Available toolsets: {', '.join(profile.toolsets)}. "
+        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}."
+    )
+    return tool(profile.tool_name, description=tool_description)(run_profile_deep_agent)
 
 
 def active_deep_agent_tools() -> list[Any]:
@@ -1987,6 +4005,12 @@ def run_parent_agent() -> dict[str, Any]:
                 inspect_sandbox_image,
                 inspect_expected_artifacts,
                 inspect_self_check_artifacts,
+                crawl_allowed_site,
+                extract_allowed_site_links,
+                crawl_allowed_urls,
+                search_site_crawl,
+                read_crawled_page,
+                list_site_crawls,
             ]
         )
 
@@ -1998,10 +4022,14 @@ def run_parent_agent() -> dict[str, Any]:
             "implementation and must explicitly request parent review by calling its "
             "request_parent_review tool. Do not edit files yourself and do not perform the "
             f"implementation yourself. Required workflow: (1) call {deep_tool_instruction}, "
-            f"passing only output-gate allowed expected artifacts ({ALLOWED_EXPORT_EXTENSIONS_TEXT}), "
+            f"passing the configured final artifacts as expected_artifacts and only "
+            f"output-gate allowed paths ({ALLOWED_EXPORT_EXTENSIONS_TEXT}); do not add "
+            "root-level self-check files to expected_artifacts, "
             "(2) check whether its result has review_requested=true, (3) if review was "
-            "requested, call run_output_gate for the declared review artifacts before "
-            "reading any produced files, (4) inspect the gate manifest and only read clean "
+            "requested, call run_output_gate with no explicit artifact override so the "
+            "latest request_parent_review artifact list is gated, including self-check "
+            "plan/report files, before reading any produced files, (4) inspect the gate "
+            "manifest and only read clean "
             "exports with inspect_exported_artifacts, read_exported_file, or list_exported_files. "
             "Do not read raw /outputs in production mode. If the gate rejects files, use "
             "inspect_gate_manifest and list_quarantine_metadata to cite concrete findings, "
@@ -2192,6 +4220,19 @@ def parse_args() -> argparse.Namespace:
         help="Bearer token for sandbox-controller, if configured.",
     )
     parser.add_argument(
+        "--egress-proxy-url",
+        default=os.getenv("EGRESS_PROXY_URL", ""),
+        help=(
+            "Optional HTTP proxy URL used by network-enabled tools. When set, "
+            "browser/crawler tools receive a signed per-call allowlist token."
+        ),
+    )
+    parser.add_argument(
+        "--egress-proxy-signing-secret",
+        default=os.getenv("EGRESS_PROXY_SIGNING_SECRET", ""),
+        help="Shared signing secret for per-tool egress proxy tokens.",
+    )
+    parser.add_argument(
         "--host-os",
         choices=["auto", "windows", "linux"],
         default="auto",
@@ -2318,6 +4359,8 @@ def main() -> None:
         sandbox_backend=args.sandbox_backend,
         sandbox_controller_url=args.sandbox_controller_url,
         sandbox_controller_token=args.sandbox_controller_token,
+        egress_proxy_url=args.egress_proxy_url,
+        egress_proxy_signing_secret=args.egress_proxy_signing_secret,
         xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
         deep_agent_profiles=deep_agent_profiles,
     )
