@@ -92,8 +92,6 @@ services:
     build:
       context: outputs
       dockerfile: Containerfile.python-data-sandbox
-    profiles:
-      - sandbox-image
     command: ["python", "-V"]
 
   browser-sandbox:
@@ -101,8 +99,6 @@ services:
     build:
       context: outputs
       dockerfile: Containerfile.browser-sandbox
-    profiles:
-      - sandbox-image
     command: ["python", "-c", "from playwright.sync_api import sync_playwright; print('playwright ready')"]
 
 networks:
