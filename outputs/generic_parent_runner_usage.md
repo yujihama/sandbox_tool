@@ -11,9 +11,10 @@ The runner does:
 - Ask the parent agent to call `run_deep_agent_task`, or the most appropriate
   profile-specific Deep Agent tool when profiles are configured.
 - Run the Deep Agent in the Podman sandbox.
-- Give the Deep Agent a `request_parent_review` HITL tool.
-- Require the Deep Agent to create and run task-specific self-check artifacts
-  before requesting parent review.
+- Give artifact-result Deep Agent profiles a `request_parent_review` HITL tool.
+- Let profile configuration choose artifact review mode or inline result mode.
+- Let profile configuration choose scripted, checklist-only, or no self-check
+  artifacts.
 - Give the parent output-gate tools for final artifacts and clean export
   inspection.
 - Optionally give the parent raw file-inspection tools for `/input` and
@@ -60,19 +61,19 @@ The runner uses a three-zone artifact layout under `--output-dir`:
 - `gate_logs/`: deterministic gate manifests.
 - `runner_logs/`: parent/deep traces and evaluation metadata.
 
-The Deep Agent is instructed to call `request_parent_review` after it has produced
-or updated the expected artifacts and completed self-check. The required
-self-check artifacts are:
+Artifact-result profiles are instructed to call `request_parent_review` after
+they have produced or updated the expected artifacts and completed the
+profile-appropriate self-check. Scripted and checklist self-check policies use:
 
-- `/outputs/self_check_plan.md`
-- `/outputs/self_check_report.md`
+- `/outputs/subtasks/self_check_plan.md`
+- `/outputs/subtasks/self_check_report.md`
 
-The Deep Agent designs and executes checks itself for the task, but executable
-self-check scripts are not final export artifacts. The parent calls
-`run_output_gate` for declared final artifacts, then reads generic file facts
-from `/exports`. It decides whether the artifact still materially fails the user
-task and, if so, sends corrective instructions back to the Deep Agent. The
-parent is still not allowed to edit files directly.
+When `self_check_policy=script`, the Deep Agent designs and executes checks
+itself for the task, but executable self-check scripts are not final export
+artifacts. When `self_check_policy=checklist`, it writes the plan/report without
+an extra executable check unless the task explicitly needs one. Inline-result
+profiles return the answer directly, do not call `request_parent_review`, and do
+not run output gate. The parent is still not allowed to edit files directly.
 
 For image-understanding tasks, the Deep Agent can call `read_sandbox_file` with
 a `question` on an image path, or call `inspect_sandbox_image` directly after it
@@ -144,6 +145,7 @@ docker compose --env-file .env.local exec agent-app \
 - `--deep-agent-profile-dir`: repeatable directory containing `.json`, `.yaml`,
   or `.yml` profile files. Files are loaded in sorted order.
 - `--expected-artifact`: repeatable expected artifact path under `/outputs`.
+  Required for artifact-result tasks; omit it for inline-only profile runs.
 - `--output-dir`: host output directory under this workspace's `outputs/`.
   This is now the run root; raw output is stored in `raw_outputs/`, clean output
   in `clean_exports/`, and logs in `runner_logs/` and `gate_logs/`.
@@ -347,8 +349,6 @@ python outputs/generic_parent_runner.py `
   --input "C:\Users\nyham\Downloads\test02.png=/input/test02.png" `
   --input "C:\Users\nyham\Downloads\test03.png=/input/test03.png" `
   --skill-source outputs/skills=/input/skills `
-  --expected-artifact /outputs/seal_surname_identification_report.md `
-  --expected-artifact /outputs/seal_surname_identification_summary.csv `
   --output-dir outputs/seal_surname_identification_with_skill `
   --max-review-rounds 2
 ```

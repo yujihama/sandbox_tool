@@ -38,6 +38,8 @@ class DeepAgentProfileTests(unittest.TestCase):
                         "deep_model: openai:gpt-5.2",
                         "deep_recursion_limit: 42",
                         "max_review_rounds: 3",
+                        "result_mode: inline",
+                        "self_check_policy: checklist",
                     ]
                 ),
                 encoding="utf-8",
@@ -54,6 +56,8 @@ class DeepAgentProfileTests(unittest.TestCase):
             self.assertEqual(profile.deep_model, "openai:gpt-5.2")
             self.assertEqual(profile.deep_recursion_limit, 42)
             self.assertEqual(profile.max_review_rounds, 3)
+            self.assertEqual(profile.result_mode, "inline")
+            self.assertEqual(profile.self_check_policy, "checklist")
 
     def test_profile_skill_sources_are_staged_relative_to_profile_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -169,6 +173,43 @@ class DeepAgentProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "review toolset"):
                 runner.load_deep_agent_profile(no_review_path)
 
+    def test_profile_rejects_unknown_result_mode_and_self_check_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bad_mode = root / "bad_mode.yaml"
+            bad_mode.write_text(
+                "\n".join(
+                    [
+                        "id: bad-mode",
+                        "description: Bad mode.",
+                        "result_mode: sidecar",
+                        "toolsets:",
+                        "  - review",
+                        "  - file_read",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            bad_policy = root / "bad_policy.yaml"
+            bad_policy.write_text(
+                "\n".join(
+                    [
+                        "id: bad-policy",
+                        "description: Bad policy.",
+                        "self_check_policy: exhaustive",
+                        "toolsets:",
+                        "  - review",
+                        "  - file_read",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "result_mode"):
+                runner.load_deep_agent_profile(bad_mode)
+            with self.assertRaisesRegex(ValueError, "self_check_policy"):
+                runner.load_deep_agent_profile(bad_policy)
+
     def test_profile_disallows_file_read_without_full_input_access(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -209,6 +250,7 @@ class DeepAgentProfileTests(unittest.TestCase):
             tool_name="run_seal_agent",
             description="Seal profile.",
             toolsets=["review", "file_read", "image_inspect"],
+            result_mode="inline",
         )
 
         site_tools = {tool.name for tool in runner.deep_agent_tools_for_profile(site_profile)}
@@ -222,8 +264,25 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertIn("run_playwright_task", browser_tools)
         self.assertNotIn("crawl_allowed_site", browser_tools)
         self.assertIn("inspect_sandbox_image", seal_tools)
+        self.assertNotIn("request_parent_review", seal_tools)
         self.assertNotIn("crawl_allowed_site", seal_tools)
         self.assertNotIn("run_playwright_task", seal_tools)
+
+    def test_inline_profile_system_prompt_disables_review_contract(self) -> None:
+        profile = runner.DeepAgentProfile(
+            id="seal",
+            tool_name="run_seal_agent",
+            description="Seal profile.",
+            toolsets=["review", "file_read", "image_inspect"],
+            result_mode="inline",
+            self_check_policy="checklist",
+        )
+
+        prompt = runner.build_deep_agent_system_prompt(profile)
+
+        self.assertIn("disabled for inline result mode", prompt)
+        self.assertIn("Do not create final reviewed artifacts", prompt)
+        self.assertIn("do not call request_parent_review", prompt)
 
     def test_graceful_finalize_filters_to_completion_tools(self) -> None:
         middleware = runner.GracefulFinalizeMiddleware(
@@ -271,6 +330,26 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertIn("request_parent_review", instruction)
         self.assertIn("Do not perform new crawling", instruction)
 
+    def test_graceful_finalize_instruction_supports_inline_result_mode(self) -> None:
+        middleware = runner.GracefulFinalizeMiddleware(
+            profile_id="seal_vision",
+            expected_artifacts=[],
+            result_mode="inline",
+            self_check_policy="checklist",
+            warning_model_calls=3,
+            finalize_model_calls=4,
+            warning_tool_calls=3,
+            finalize_tool_calls=4,
+            warning_message_count=10,
+            finalize_message_count=12,
+        )
+
+        instruction = middleware.finalize_instruction(model_calls=4, message_count=12)
+
+        self.assertIn("inline answer", instruction)
+        self.assertIn("Do not create final reviewed artifacts", instruction)
+        self.assertIn("do not call request_parent_review", instruction)
+
     def test_graceful_finalize_blocks_exploration_tool_calls(self) -> None:
         middleware = runner.GracefulFinalizeMiddleware(
             profile_id="web_research",
@@ -305,6 +384,20 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertEqual(thresholds["finalize_tool_calls"], 24)
         self.assertEqual(thresholds["warning_message_count"], 66)
         self.assertEqual(thresholds["finalize_message_count"], 84)
+
+    def test_expected_artifacts_can_be_empty_only_when_allowed(self) -> None:
+        old_config = runner.CONFIG
+        try:
+            runner.CONFIG = SimpleNamespace(expected_artifacts=["/outputs/result.md"])
+
+            self.assertEqual(
+                runner.normalize_tool_expected_artifacts([], allow_empty=True),
+                [],
+            )
+            with self.assertRaisesRegex(ValueError, "at least one artifact"):
+                runner.normalize_tool_expected_artifacts([], allow_empty=False)
+        finally:
+            runner.CONFIG = old_config
 
     def test_hidden_profiles_are_skipped_from_profile_dir_but_explicit_load_works(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -375,6 +468,12 @@ class DeepAgentProfileTests(unittest.TestCase):
             by_id["quick_eval"].toolsets,
             ["review", "file_read", "image_inspect"],
         )
+        self.assertEqual(by_id["quick_eval"].result_mode, "inline")
+        self.assertEqual(by_id["quick_eval"].self_check_policy, "checklist")
+        self.assertNotIn("request_parent_review", runner.tool_names_for_profile(by_id["quick_eval"]))
+        self.assertEqual(by_id["seal_vision"].result_mode, "inline")
+        self.assertEqual(by_id["seal_vision"].self_check_policy, "checklist")
+        self.assertNotIn("request_parent_review", runner.tool_names_for_profile(by_id["seal_vision"]))
         self.assertEqual(
             by_id["document_artifact"].toolsets,
             ["review", "file_read", "image_inspect"],
@@ -388,6 +487,8 @@ class DeepAgentProfileTests(unittest.TestCase):
             ["review", "site_crawl", "browser"],
         )
         self.assertEqual(by_id["web_research"].input_access, "skills_only")
+        self.assertEqual(by_id["web_research"].result_mode, "artifact")
+        self.assertEqual(by_id["web_research"].self_check_policy, "checklist")
         self.assertEqual(by_id["browser_validation"].input_access, "none")
         self.assertEqual(
             by_id["web_research"].tool_name,

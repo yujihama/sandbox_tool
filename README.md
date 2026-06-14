@@ -176,6 +176,11 @@ Each profile can define:
 - `input_access`: `all`, `skills_only`, or `none`. Network-enabled profiles
   should use `skills_only` or `none` so user `/input` files are not mounted into
   a profile that can use browser/crawler tools.
+- `result_mode`: `artifact` for reviewed output files, or `inline` for direct
+  answers that skip output gate and parent review.
+- `self_check_policy`: `script`, `checklist`, or `none`. Use `checklist` for
+  lighter profile runs that still leave a reviewable plan/report in artifact
+  mode.
 - `image`, `deep_model`, `deep_recursion_limit`, `max_review_rounds`: optional
   overrides for that worker profile.
 

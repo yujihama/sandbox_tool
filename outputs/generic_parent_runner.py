@@ -91,6 +91,8 @@ class DeepAgentProfile:
     deep_model: str = ""
     deep_recursion_limit: int | None = None
     max_review_rounds: int | None = None
+    result_mode: str = "artifact"
+    self_check_policy: str = "script"
     source_path: str = ""
 
 
@@ -198,9 +200,13 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
         warning_message_count: int,
         finalize_message_count: int,
         finalize_tool_allowlist: set[str] | None = None,
+        result_mode: str = "artifact",
+        self_check_policy: str = "script",
     ) -> None:
         self.profile_id = profile_id
         self.expected_artifacts = expected_artifacts
+        self.result_mode = result_mode
+        self.self_check_policy = self_check_policy
         self.warning_model_calls = max(1, warning_model_calls)
         self.finalize_model_calls = max(self.warning_model_calls + 1, finalize_model_calls)
         self.warning_tool_calls = max(1, warning_tool_calls)
@@ -280,8 +286,8 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
                         "tool": tool_name,
                         "message": (
                             "Execution budget is near the hard recursion limit. "
-                            "Exploration tools are disabled; finalize artifacts, "
-                            "run self-check, and request parent review."
+                            "Exploration tools are disabled; finalize with the "
+                            "current profile's completion contract."
                         ),
                     },
                     ensure_ascii=False,
@@ -350,18 +356,52 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             f"messages={message_count}). Stop broad "
             "exploration now: do not start new crawls/browser searches unless a "
             "specific required URL is already identified. Prefer existing collected "
-            "evidence, narrow candidates, and move toward artifact creation, "
-            "self-check, and request_parent_review."
+            "evidence, narrow candidates, and move toward the profile's final "
+            "answer/review contract."
         )
 
     def finalize_instruction(self, model_calls: int, message_count: int) -> str:
+        if self.result_mode == "inline":
+            return (
+                "[Graceful finalize mode]\n"
+                f"Profile `{self.profile_id}` is near its execution budget "
+                f"(model_calls={model_calls}, tool_calls={self.tool_calls}, "
+                f"messages={message_count}). Stop exploration and return the "
+                "best supported inline answer now.\n\n"
+                "Rules:\n"
+                "- Do not perform new crawling, browser actions, broad searches, "
+                "or new candidate discovery.\n"
+                "- Do not create final reviewed artifacts and do not call "
+                "request_parent_review.\n"
+                "- Use only already collected evidence and files currently "
+                "available in /outputs or /input.\n"
+                "- Include a concise self-check checklist, uncertainty, and "
+                "limitations directly in the final answer."
+            )
         expected_text = "\n".join(f"- {path}" for path in self.expected_artifacts)
-        review_artifacts = list(dict.fromkeys([
-            *self.expected_artifacts,
-            "/outputs/subtasks/self_check_plan.md",
-            "/outputs/subtasks/self_check_report.md",
-        ]))
+        review_artifacts = [*self.expected_artifacts]
+        if self.self_check_policy in {"script", "checklist"}:
+            review_artifacts.extend(
+                [
+                    "/outputs/subtasks/self_check_plan.md",
+                    "/outputs/subtasks/self_check_report.md",
+                ]
+            )
+        review_artifacts = list(dict.fromkeys(review_artifacts))
         review_text = "\n".join(f"- {path}" for path in review_artifacts)
+        self_check_text = (
+            "Create or update `/outputs/subtasks/self_check_plan.md` and "
+            "`/outputs/subtasks/self_check_report.md`. Run a small self-check with "
+            "`execute` if possible; if not, write the limitation in the report.\n\n"
+            if self.self_check_policy == "script"
+            else (
+                "Create or update `/outputs/subtasks/self_check_plan.md` and "
+                "`/outputs/subtasks/self_check_report.md` with a concise checklist "
+                "self-check. Do not create or execute a separate self-check script.\n\n"
+                if self.self_check_policy == "checklist"
+                else "No self-check artifacts are required for this profile.\n\n"
+            )
+        )
         return (
             "[Graceful finalize mode]\n"
             f"Profile `{self.profile_id}` is near its execution budget "
@@ -379,9 +419,7 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             "in the requested format rather than continuing exploration.\n\n"
             "Required expected artifacts:\n"
             f"{expected_text}\n\n"
-            "Create or update `/outputs/subtasks/self_check_plan.md` and "
-            "`/outputs/subtasks/self_check_report.md`. Run a small self-check with "
-            "`execute` if possible; if not, write the limitation in the report.\n\n"
+            f"{self_check_text}"
             "Then call request_parent_review with exactly these review artifacts:\n"
             f"{review_text}\n\n"
             "After request_parent_review returns, stop."
@@ -461,6 +499,29 @@ def normalize_profile_input_access(value: Any, profile_path: Path) -> str:
     return access
 
 
+def normalize_profile_result_mode(value: Any, profile_path: Path) -> str:
+    if value is None or value == "":
+        return "artifact"
+    mode = str(value).strip().lower().replace("-", "_")
+    if mode not in {"artifact", "inline"}:
+        raise ValueError(
+            f"Deep Agent profile result_mode must be artifact or inline: {profile_path}"
+        )
+    return mode
+
+
+def normalize_profile_self_check_policy(value: Any, profile_path: Path) -> str:
+    if value is None or value == "":
+        return "script"
+    policy = str(value).strip().lower().replace("-", "_")
+    if policy not in {"script", "checklist", "none"}:
+        raise ValueError(
+            "Deep Agent profile self_check_policy must be script, checklist, "
+            f"or none: {profile_path}"
+        )
+    return policy
+
+
 def read_profile_document(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
@@ -505,6 +566,10 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
 
     toolsets = validate_profile_toolsets(data.get("toolsets"), profile_path)
     input_access = normalize_profile_input_access(data.get("input_access"), profile_path)
+    result_mode = normalize_profile_result_mode(data.get("result_mode"), profile_path)
+    self_check_policy = normalize_profile_self_check_policy(
+        data.get("self_check_policy"), profile_path
+    )
     if input_access != "all" and "file_read" in toolsets:
         raise ValueError(
             "Profiles with input_access other than all must not include the "
@@ -527,6 +592,8 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
         deep_model=str(data.get("deep_model") or "").strip(),
         deep_recursion_limit=optional_int("deep_recursion_limit"),
         max_review_rounds=optional_int("max_review_rounds"),
+        result_mode=result_mode,
+        self_check_policy=self_check_policy,
         source_path=str(profile_path),
     )
 
@@ -632,12 +699,18 @@ def normalize_expected_artifact(path: str) -> str:
     return normalized
 
 
-def normalize_tool_expected_artifacts(paths: list[str]) -> list[str]:
+def normalize_tool_expected_artifacts(
+    paths: list[str],
+    *,
+    allow_empty: bool = False,
+) -> list[str]:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
     normalized = [normalize_expected_artifact(path) for path in paths]
-    if not normalized:
+    if not normalized and not allow_empty:
         raise ValueError("expected_artifacts must include at least one artifact")
+    if not normalized:
+        return []
     allowed_final = set(CONFIG.expected_artifacts)
     invalid = [
         path
@@ -1045,12 +1118,19 @@ def tool_names_for_toolsets(toolsets: list[str]) -> list[str]:
     return names
 
 
+def tool_names_for_profile(profile: DeepAgentProfile) -> list[str]:
+    names = tool_names_for_toolsets(profile.toolsets)
+    if profile.result_mode == "inline":
+        names = [name for name in names if name != "request_parent_review"]
+    return names
+
+
 def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     model_note = f"; model={profile.deep_model}" if profile.deep_model else ""
     image_note = f"; image={profile.image}" if profile.image else ""
     toolset_note = f"; toolsets={', '.join(profile.toolsets)}" if profile.toolsets else ""
     tools_note = (
-        f"; custom_tools={', '.join(tool_names_for_toolsets(profile.toolsets))}"
+        f"; custom_tools={', '.join(tool_names_for_profile(profile))}"
         if profile.toolsets
         else ""
     )
@@ -1060,13 +1140,15 @@ def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
         else ""
     )
     input_note = f"; input_access={profile.input_access}"
+    result_note = f"; result_mode={profile.result_mode}"
+    self_check_note = f"; self_check_policy={profile.self_check_policy}"
     skill_note = (
         f"; skills={', '.join(profile.skill_sources)}" if profile.skill_sources else ""
     )
     return (
         f"- {profile.tool_name}: {profile.description} "
         f"(profile_id={profile.id}{toolset_note}{tools_note}{model_note}"
-        f"{image_note}{rounds_note}{input_note}{skill_note})"
+        f"{image_note}{rounds_note}{input_note}{result_note}{self_check_note}{skill_note})"
     )
 
 
@@ -1108,23 +1190,30 @@ def build_parent_prompt() -> str:
         if CONFIG.deep_agent_profiles
         else f"Maximum Deep Agent attempts allowed: {CONFIG.max_review_rounds}"
     )
+    expected_text = "\n".join(f"- {path}" for path in CONFIG.expected_artifacts)
+    if not expected_text:
+        expected_text = "(none configured; inline-result profiles may be used)"
     return (
-        f"Run this task by delegating to {delegate_text}. The Deep Agent must request "
-        "parent review through its request_parent_review tool before the parent can close "
-        "the task.\n\n"
+        f"Run this task by delegating to {delegate_text}. Artifact-result profiles must "
+        "request parent review through request_parent_review before the parent can close "
+        "the task. Inline-result profiles do not create final artifacts, do not request "
+        "parent review, and should be closed from their inline_result when the tool "
+        "returns ok=true.\n\n"
         "Inputs available in the sandbox:\n"
         + "\n".join(f"- {item.sandbox_path}" for item in CONFIG.input_mappings)
         + "\n\nExpected artifacts:\n"
-        + "\n".join(f"- {path}" for path in CONFIG.expected_artifacts)
+        + expected_text
         + "\n\nOutput-gate allowed review/export extensions:\n"
         + ALLOWED_EXPORT_EXTENSIONS_TEXT
         + "\nDo not ask the Deep Agent to create final or review artifacts with any "
         "other extension. Helper scripts or working files may exist under /outputs, "
         "but they must not be passed as expected_artifacts or request_parent_review artifacts. "
-        "When you call a Deep Agent profile tool, pass the configured final artifacts "
-        "exactly as expected_artifacts. If you ask for additional self-check plan/report "
-        "review artifacts, place them under /outputs/subtasks/ and include them in the "
-        "Deep Agent task text, not as root-level expected_artifacts."
+        "When you call an artifact-result Deep Agent profile tool, pass the configured "
+        "final artifacts exactly as expected_artifacts. When you call an inline-result "
+        "profile tool, pass expected_artifacts=[] and do not run output gate afterward. "
+        "If you ask an artifact profile for additional self-check plan/report review "
+        "artifacts, place them under /outputs/subtasks/ and include them in the Deep "
+        "Agent task text, not as root-level expected_artifacts."
         + deep_agent_profile_prompt_section()
         + f"\n\n{attempt_limit_text}"
         + "\n\nUser task:\n"
@@ -3157,22 +3246,23 @@ def inspect_self_check_artifacts(max_chars: int = 16000) -> dict[str, Any]:
         return {"ok": False, "error": "runner_config_missing"}
 
     output_dir = CONFIG.output_dir
+    self_check_dir = output_dir / "subtasks"
     script_candidates = sorted(
         [
             path
-            for path in output_dir.glob("self_check.*")
+            for path in self_check_dir.glob("self_check.*")
             if path.name not in {"self_check_plan.md", "self_check_report.md"}
             and path.is_file()
         ],
         key=lambda path: path.name.lower(),
     )
     paths = [
-        "/outputs/self_check_plan.md",
+        "/outputs/subtasks/self_check_plan.md",
         *[
             "/outputs/" + path.relative_to(output_dir).as_posix()
             for path in script_candidates[:10]
         ],
-        "/outputs/self_check_report.md",
+        "/outputs/subtasks/self_check_report.md",
     ]
     inspections = [
         read_sandbox_file.invoke(
@@ -3180,10 +3270,18 @@ def inspect_self_check_artifacts(max_chars: int = 16000) -> dict[str, Any]:
         )
         for path in paths
     ]
-    plan_exists = (output_dir / "self_check_plan.md").exists()
-    report_exists = (output_dir / "self_check_report.md").exists()
+    plan_exists = (self_check_dir / "self_check_plan.md").exists()
+    report_exists = (self_check_dir / "self_check_report.md").exists()
+    latest_policy = (
+        DEEP_AGENT_EVALUATIONS[-1].get("profile", {}).get("self_check_policy", "script")
+        if DEEP_AGENT_EVALUATIONS
+        else "script"
+    )
+    script_required = latest_policy == "script"
     return {
-        "ok": plan_exists and report_exists and bool(script_candidates),
+        "ok": plan_exists and report_exists and (not script_required or bool(script_candidates)),
+        "self_check_policy": latest_policy,
+        "script_required": script_required,
         "plan_exists": plan_exists,
         "report_exists": report_exists,
         "script_candidates": [path.name for path in script_candidates],
@@ -3264,11 +3362,13 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "Profile-specific instructions:\n"
             f"{profile.system_prompt.strip()}\n\n"
         )
-    toolset_lines = [
-        f"- {toolset}: {TOOLSET_DESCRIPTIONS[toolset]} "
-        f"({', '.join(TOOLSET_TOOL_NAMES[toolset])})"
-        for toolset in profile.toolsets
-    ]
+    toolset_lines: list[str] = []
+    for toolset in profile.toolsets:
+        names = list(TOOLSET_TOOL_NAMES[toolset])
+        if profile.result_mode == "inline" and toolset == "review":
+            names = []
+        suffix = f"({', '.join(names)})" if names else "(disabled for inline result mode)"
+        toolset_lines.append(f"- {toolset}: {TOOLSET_DESCRIPTIONS[toolset]} {suffix}")
     toolset_block = (
         "Available custom toolsets for this profile:\n"
         + "\n".join(toolset_lines)
@@ -3321,18 +3421,79 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "HTTP 429 or Too Many Requests appears, back off and report the "
             "limitation rather than increasing request volume. "
         )
+    if profile.result_mode == "inline":
+        output_text = (
+            "Return the final answer directly; use /outputs only for temporary helper "
+            "files if needed. "
+        )
+    else:
+        output_text = "Write final artifacts under /outputs. "
     if profile.input_access == "all":
-        input_text = "Read task inputs only from /input and write final artifacts under /outputs. "
+        input_text = "Read task inputs only from /input. " + output_text
     elif profile.input_access == "skills_only":
         input_text = (
             "No user task input files are mounted in this profile. /input contains "
-            "profile skills only; do not treat it as task evidence. Write final "
-            "artifacts under /outputs. "
+            "profile skills only; do not treat it as task evidence. " + output_text
         )
     else:
         input_text = (
-            "No user task input files are mounted in this profile. Write final "
-            "artifacts under /outputs. "
+            "No user task input files are mounted in this profile. " + output_text
+        )
+    if profile.result_mode == "inline":
+        completion_contract = (
+            "This profile uses inline result mode. Do not create final reviewed "
+            "artifacts unless they are purely temporary helper files, and do not call "
+            "request_parent_review. Return the final answer directly in your last "
+            "message. Keep it concise but include the answer, confidence, evidence "
+            "used, uncertainty/limitations, and a short self-check checklist. "
+        )
+    elif profile.self_check_policy == "script":
+        completion_contract = (
+            "Before requesting parent review, you must perform an autonomous self-check. "
+            "This self-check is task-specific and you must design it yourself; do not "
+            "wait for a prebuilt validator. Required self-check artifacts: "
+            "`/outputs/subtasks/self_check_plan.md`, one executable check script such as "
+            "`/outputs/subtasks/self_check.py` or `/outputs/subtasks/self_check.js`, and "
+            "`/outputs/subtasks/self_check_report.md`. The plan must explain what you will verify "
+            "against the user task. The script must inspect the generated artifacts and, "
+            "when relevant, execute code, parse files, load workbooks, validate CSV/JSON, "
+            "or run smoke tests using available local tools. If a headless browser is "
+            "available for HTML tasks, use it; otherwise run the strongest available "
+            "syntax/reference checks and state the limitation. Execute the self-check "
+            "script with the `execute` tool. If it fails, fix the artifact and rerun the "
+            "self-check before requesting review. The report must include command(s) run, "
+            "pass/fail status, checked files, limitations, and remaining known issues. "
+            "When you believe the expected artifacts are ready for review, you must "
+            "call request_parent_review with the final artifact paths, a concise summary of "
+            "what you produced, and any known issues. Include `/outputs/subtasks/self_check_plan.md` "
+            "and `/outputs/subtasks/self_check_report.md` in the review request artifacts list, but "
+            "do not include the executable self-check script because code is not an allowed "
+            "export format. Call review after creating or updating "
+            "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
+            "for this attempt and respond concisely with the paths awaiting review. "
+            "If this invocation contains parent correction feedback from a previous "
+            "review, fix the issues first, rerun self-check, then call "
+            "request_parent_review again."
+        )
+    elif profile.self_check_policy == "checklist":
+        completion_contract = (
+            "Before requesting parent review, perform a lightweight autonomous "
+            "checklist self-check. Create `/outputs/subtasks/self_check_plan.md` "
+            "and `/outputs/subtasks/self_check_report.md`, but do not create or "
+            "execute a separate self-check script unless the task explicitly needs "
+            "one. The report must state pass/fail status, checked evidence/files, "
+            "limitations, and remaining known issues. When expected artifacts are "
+            "ready, call request_parent_review with the final artifact paths plus "
+            "`/outputs/subtasks/self_check_plan.md` and "
+            "`/outputs/subtasks/self_check_report.md`. After the review request "
+            "tool returns, stop work."
+        )
+    else:
+        completion_contract = (
+            "This profile does not require self-check artifacts. When expected "
+            "artifacts are ready, call request_parent_review with the final artifact "
+            "paths, a concise summary, and known issues. After the review request "
+            "tool returns, stop work."
         )
     return (
         profile_block
@@ -3349,31 +3510,7 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
         + site_text
         + browser_text
         + "Cite inspected file paths and any uncertainty in your artifacts. "
-        "Before requesting parent review, you must perform an autonomous self-check. "
-        "This self-check is task-specific and you must design it yourself; do not "
-        "wait for a prebuilt validator. Required self-check artifacts: "
-        "`/outputs/self_check_plan.md`, one executable check script such as "
-        "`/outputs/self_check.py` or `/outputs/self_check.js`, and "
-        "`/outputs/self_check_report.md`. The plan must explain what you will verify "
-        "against the user task. The script must inspect the generated artifacts and, "
-        "when relevant, execute code, parse files, load workbooks, validate CSV/JSON, "
-        "or run smoke tests using available local tools. If a headless browser is "
-        "available for HTML tasks, use it; otherwise run the strongest available "
-        "syntax/reference checks and state the limitation. Execute the self-check "
-        "script with the `execute` tool. If it fails, fix the artifact and rerun the "
-        "self-check before requesting review. The report must include command(s) run, "
-        "pass/fail status, checked files, limitations, and remaining known issues. "
-        "When you believe the expected artifacts are ready for review, you must "
-        "call request_parent_review with the final artifact paths, a concise summary of "
-        "what you produced, and any known issues. Include `/outputs/self_check_plan.md` "
-        "and `/outputs/self_check_report.md` in the review request artifacts list, but "
-        "do not include the executable self-check script because code is not an allowed "
-        "export format. Call review after creating or updating "
-        "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
-        "for this attempt and respond concisely with the paths awaiting review. "
-        "If this invocation contains parent correction feedback from a previous "
-        "review, fix the issues first, rerun self-check, then call "
-        "request_parent_review again."
+        + completion_contract
     )
 
 
@@ -3395,6 +3532,8 @@ def deep_agent_tools_for_profile(profile: DeepAgentProfile) -> list[Any]:
     selected: list[Any] = []
     seen_names: set[str] = set()
     for toolset in profile.toolsets:
+        if profile.result_mode == "inline" and toolset == "review":
+            continue
         for item in tools_by_toolset[toolset]:
             name = getattr(item, "name", None) or getattr(item, "__name__", str(item))
             if name in seen_names:
@@ -3447,7 +3586,24 @@ def execute_deep_agent_task(
     effective_skill_sources = profile.skill_sources or []
     effective_input_dir = profile_input_dir(profile)
     try:
-        effective_expected_artifacts = normalize_tool_expected_artifacts(expected_artifacts)
+        effective_expected_artifacts = normalize_tool_expected_artifacts(
+            expected_artifacts,
+            allow_empty=profile.result_mode == "inline",
+        )
+        if profile.result_mode == "inline" and effective_expected_artifacts:
+            return {
+                "ok": False,
+                "error": "inline_profile_does_not_accept_expected_artifacts",
+                "message": (
+                    "This profile returns an inline result. Call it with "
+                    "expected_artifacts=[] and do not run output gate."
+                ),
+                "profile": {
+                    "id": profile.id,
+                    "tool_name": profile.tool_name,
+                    "result_mode": profile.result_mode,
+                },
+            }
     except Exception as exc:
         return {
             "ok": False,
@@ -3480,17 +3636,29 @@ def execute_deep_agent_task(
     latest_cleanup_path = log_dir / "cleanup_report.json"
     latest_evaluation_path = log_dir / "parent_tool_evaluation.json"
 
-    task_with_contract = (
-        "Expected review/export artifacts for this invocation:\n"
-        + "\n".join(f"- {path}" for path in effective_expected_artifacts)
-        + "\n\nAllowed review/export extensions: "
-        + ALLOWED_EXPORT_EXTENSIONS_TEXT
-        + "\nDo not pass helper scripts, images, PDFs, or other non-allowed files "
-        "to request_parent_review. If structured data is needed as a reviewed artifact, "
-        "write CSV/XLSX/JSON/YAML or include it in a Markdown report.\n\n"
-        "Task instructions:\n"
-        + task
-    )
+    if profile.result_mode == "inline":
+        task_with_contract = (
+            "This invocation uses inline result mode.\n"
+            "- Expected review/export artifacts: none.\n"
+            "- Do not create final reviewed files unless they are temporary helper files.\n"
+            "- Do not call request_parent_review.\n"
+            "- Return the final answer directly in your last message with confidence, "
+            "evidence, uncertainty/limitations, and a short self-check checklist.\n\n"
+            "Task instructions:\n"
+            + task
+        )
+    else:
+        task_with_contract = (
+            "Expected review/export artifacts for this invocation:\n"
+            + "\n".join(f"- {path}" for path in effective_expected_artifacts)
+            + "\n\nAllowed review/export extensions: "
+            + ALLOWED_EXPORT_EXTENSIONS_TEXT
+            + "\nDo not pass helper scripts, images, PDFs, or other non-allowed files "
+            "to request_parent_review. If structured data is needed as a reviewed artifact, "
+            "write CSV/XLSX/JSON/YAML or include it in a Markdown report.\n\n"
+            "Task instructions:\n"
+            + task
+        )
 
     deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
     latest_deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
@@ -3529,6 +3697,7 @@ def execute_deep_agent_task(
     graceful_finalize_config = graceful_finalize_thresholds(effective_recursion_limit)
 
     deep_error: dict[str, Any] | None = None
+    inline_result = ""
     DEEP_AGENT_TRACE.clear()
     global ACTIVE_DEEP_AGENT_TOOLSETS
     try:
@@ -3543,6 +3712,8 @@ def execute_deep_agent_task(
                 GracefulFinalizeMiddleware(
                     profile_id=profile.id,
                     expected_artifacts=effective_expected_artifacts,
+                    result_mode=profile.result_mode,
+                    self_check_policy=profile.self_check_policy,
                     **graceful_finalize_config,
                 )
             ],
@@ -3557,6 +3728,7 @@ def execute_deep_agent_task(
             },
         )
         messages = deep_result["messages"]
+        inline_result = content_text(getattr(messages[-1], "content", ""))
         DEEP_AGENT_TRACE.extend(trace_messages(messages, content_limit=2600))
         deep_trace_path.write_text(
             json.dumps(DEEP_AGENT_TRACE, ensure_ascii=False, indent=2),
@@ -3603,13 +3775,18 @@ def execute_deep_agent_task(
             encoding="utf-8",
         )
 
-    artifact_check = check_expected_artifacts(effective_expected_artifacts)
+    artifact_check = (
+        {"artifacts": [], "ok": True, "missing": []}
+        if profile.result_mode == "inline"
+        else check_expected_artifacts(effective_expected_artifacts)
+    )
     cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
     attempt_review_requests = DEEP_REVIEW_REQUESTS[review_start:]
+    self_check_dir = CONFIG.output_dir / "subtasks"
     self_check_scripts = sorted(
         [
-            path.name
-            for path in CONFIG.output_dir.glob("self_check.*")
+            path.relative_to(CONFIG.output_dir).as_posix()
+            for path in self_check_dir.glob("self_check.*")
             if path.name not in {"self_check_plan.md", "self_check_report.md"}
             and path.is_file()
         ]
@@ -3622,6 +3799,8 @@ def execute_deep_agent_task(
             "tool_name": profile.tool_name,
             "description": profile.description,
             "toolsets": profile.toolsets,
+            "result_mode": profile.result_mode,
+            "self_check_policy": profile.self_check_policy,
             "available_tools": selected_deep_tool_names,
             "graceful_finalize": graceful_finalize_config,
             "image": effective_image,
@@ -3647,9 +3826,10 @@ def execute_deep_agent_task(
         "cleanup": cleanup,
         "review_requested": bool(attempt_review_requests),
         "review_requests": attempt_review_requests,
+        "inline_result": inline_result if profile.result_mode == "inline" else "",
         "self_check": {
-            "plan_exists": (CONFIG.output_dir / "self_check_plan.md").exists(),
-            "report_exists": (CONFIG.output_dir / "self_check_report.md").exists(),
+            "plan_exists": (self_check_dir / "self_check_plan.md").exists(),
+            "report_exists": (self_check_dir / "self_check_report.md").exists(),
             "script_candidates": self_check_scripts,
         },
         "deep_tool_calls": [
@@ -3660,6 +3840,7 @@ def execute_deep_agent_task(
         artifact_check["ok"]
         and deep_error is None
         and cleanup.get("cleanup_ok") is True
+        and (profile.result_mode != "inline" or bool(inline_result.strip()))
     )
     evaluation_path.write_text(
         json.dumps(evaluation, ensure_ascii=False, indent=2),
@@ -3697,19 +3878,35 @@ def make_deep_agent_profile_tool(profile: DeepAgentProfile) -> Any:
         return execute_deep_agent_task(task, expected_artifacts, profile)
 
     run_profile_deep_agent.__name__ = profile.tool_name
+    available_tools = ", ".join(tool_names_for_profile(profile)) or "none"
+    if profile.result_mode == "inline":
+        mode_contract = (
+            "This profile returns an inline result. Call it with "
+            "expected_artifacts=[]; it will not request parent review and the "
+            "parent must not run output gate for this call. Inspect the returned "
+            "inline_result and retry only if it materially fails the task."
+        )
+    else:
+        mode_contract = (
+            "This profile returns reviewed artifacts. expected_artifacts must be "
+            "files under /outputs using only output-gate allowed extensions: "
+            ".csv, .html, .json, .md, .xlsx, .yaml, .yml. Run output gate only "
+            "after the tool reports review_requested=true."
+        )
     run_profile_deep_agent.__doc__ = (
         f"{profile.description}\n\n"
         f"Available toolsets: {', '.join(profile.toolsets)}. "
-        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}.\n\n"
-        "Run this sandboxed Deep Agent profile for allowed /outputs artifacts. "
-        "expected_artifacts must be files under /outputs using only output-gate "
-        "allowed extensions: .csv, .html, .json, .md, .xlsx, .yaml, .yml. "
+        f"Available custom tools: {available_tools}. "
+        f"result_mode={profile.result_mode}; "
+        f"self_check_policy={profile.self_check_policy}.\n\n"
+        f"{mode_contract} "
         "Do not request .py, .js, .png, .pdf, .docx, .pptx, .xlsm, or directory "
         "artifacts as review/export artifacts."
     )
     tool_description = (
         f"{profile.description} Available toolsets: {', '.join(profile.toolsets)}. "
-        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}."
+        f"Available custom tools: {available_tools}. "
+        f"result_mode={profile.result_mode}; self_check_policy={profile.self_check_policy}."
     )
     return tool(profile.tool_name, description=tool_description)(run_profile_deep_agent)
 
@@ -3786,35 +3983,41 @@ def run_parent_agent() -> dict[str, Any]:
         tools=parent_tools,
         system_prompt=(
             "You are a parent HITL reviewer and orchestrator. The Deep Agent does the "
-            "implementation and must explicitly request parent review by calling its "
-            "request_parent_review tool. Do not edit files yourself and do not perform the "
-            f"implementation yourself. Required workflow: (1) call {deep_tool_instruction}, "
-            f"passing the configured final artifacts as expected_artifacts and only "
-            f"output-gate allowed paths ({ALLOWED_EXPORT_EXTENSIONS_TEXT}); do not add "
-            "root-level self-check files to expected_artifacts, "
-            "(2) check whether its result has review_requested=true, (3) if review was "
-            "requested, call run_output_gate with no explicit artifact override so the "
-            "latest request_parent_review artifact list is gated, including self-check "
-            "plan/report files, before reading any produced files, (4) inspect the gate "
-            "manifest and only read clean "
-            "exports with inspect_exported_artifacts, read_exported_file, or list_exported_files. "
-            "Do not read raw /outputs in production mode. If the gate rejects files, use "
+            "implementation. Do not edit files yourself and do not perform the "
+            f"implementation yourself. Required workflow: (1) choose and call {deep_tool_instruction}. "
+            "The selected tool description states its result_mode. For result_mode=inline, "
+            "pass expected_artifacts=[], do not run output gate, inspect the returned "
+            "inline_result directly, and close when ok=true and the inline result materially "
+            "answers the user task; retry with concise correction instructions only if a "
+            "material issue remains and attempts remain. For result_mode=artifact, pass the "
+            f"configured final artifacts as expected_artifacts using only output-gate allowed "
+            f"paths ({ALLOWED_EXPORT_EXTENSIONS_TEXT}); do not add root-level self-check files "
+            "to expected_artifacts. (2) For artifact-result calls, check whether the result "
+            "has review_requested=true. If review was requested, call run_output_gate with "
+            "no explicit artifact override so the latest request_parent_review artifact list "
+            "is gated, including any self-check plan/report files, before reading produced "
+            "files. (3) Inspect the gate manifest and only read clean exports with "
+            "inspect_exported_artifacts, read_exported_file, or list_exported_files. Do not "
+            "read raw /outputs in production mode. If the gate rejects files, use "
             "inspect_gate_manifest and list_quarantine_metadata to cite concrete findings, "
-            "then ask the Deep Agent to repair them. (5) If self-check report/plan are missing "
-            "from clean exports, the self-check did not execute, gate failures were ignored, "
-            "or the inspected clean artifact materially fails the user task, and at least one "
-            "Deep Agent attempt remains, "
-            f"call {deep_tool_instruction} again with concise correction instructions that include "
-            "your findings, (6) run the output gate and inspect again after every review "
-            "request, and close only when no material issues remain or no attempts remain. "
-            "If the Deep Agent does not request review, treat that as a material protocol "
-            f"issue; if attempts remain, call {deep_tool_instruction} again instructing it to "
-            "produce/update artifacts, run self-check, and call request_parent_review. "
+            "then ask the Deep Agent to repair them. (4) If required artifact files are "
+            "missing from clean exports, required self-check plan/report files are missing "
+            "for a profile that uses script/checklist self_check_policy, gate failures were "
+            "ignored, or the inspected clean artifact materially fails the user task, and "
+            f"at least one Deep Agent attempt remains, call {deep_tool_instruction} again with "
+            "concise correction instructions that include your findings. (5) Run output gate "
+            "and inspect again after every artifact-result review request, and close only "
+            "when no material issues remain or no attempts remain. If an artifact-result "
+            "Deep Agent does not request review, treat that as a material protocol issue; "
+            f"if attempts remain, call {deep_tool_instruction} again instructing it to produce/update "
+            "artifacts, run the profile-appropriate self-check, and call request_parent_review. "
             f"{attempts_instruction} "
             "In the final response, report attempts used, files inspected, material findings, "
-            "gate status, self-check status, remaining issues if any, whether the last Deep "
-            "Agent attempt requested review, and clean export paths. Keep claims tied to "
-            "gate manifest and inspected clean-export evidence."
+            "gate status when applicable, self-check status when applicable, inline_result "
+            "status when applicable, remaining issues if any, whether the last Deep Agent "
+            "attempt requested review for artifact-result profiles, and clean export paths "
+            "when applicable. Keep claims tied to gate manifest, inspected clean-export "
+            "evidence, or the returned inline_result depending on the selected profile."
         ),
     )
     parent_result = parent_agent.invoke(
@@ -3860,6 +4063,10 @@ def run_parent_agent() -> dict[str, Any]:
                     "id": profile.id,
                     "tool_name": profile.tool_name,
                     "description": profile.description,
+                    "toolsets": profile.toolsets,
+                    "input_access": profile.input_access,
+                    "result_mode": profile.result_mode,
+                    "self_check_policy": profile.self_check_policy,
                     "image": profile.image or CONFIG.image,
                     "deep_model": profile.deep_model or CONFIG.deep_model,
                     "skill_sources": profile.skill_sources,
@@ -3871,6 +4078,10 @@ def run_parent_agent() -> dict[str, Any]:
                     "id": "default",
                     "tool_name": "run_deep_agent_task",
                     "description": "Default sandboxed Deep Agent worker.",
+                    "toolsets": default_deep_agent_profile().toolsets,
+                    "input_access": "all",
+                    "result_mode": "artifact",
+                    "self_check_policy": "script",
                     "image": CONFIG.image,
                     "deep_model": CONFIG.deep_model,
                     "skill_sources": CONFIG.skill_sources,
@@ -3923,8 +4134,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generic parent-agent runner: stage inputs, delegate one task to a Deep Agent "
-            "through a tool, wait for a Deep Agent review request, inspect produced artifacts, "
-            "and optionally ask for bounded repairs."
+            "through a tool, inspect reviewed artifacts or inline results, and optionally "
+            "ask for bounded repairs."
         )
     )
     prompt_group = parser.add_mutually_exclusive_group(required=True)
@@ -3939,7 +4150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-artifact",
         action="append",
-        required=True,
+        default=[],
         help="Expected output path under /outputs. Repeat for multiple artifacts.",
     )
     parser.add_argument(
@@ -4091,9 +4302,7 @@ def main() -> None:
         args.deep_agent_profile_dir,
     )
     materialize_deep_agent_profiles(deep_agent_profiles, input_dir, skill_sources)
-    expected_artifacts = [
-        normalize_expected_artifact(path) for path in args.expected_artifact
-    ]
+    expected_artifacts = [normalize_expected_artifact(path) for path in args.expected_artifact]
     host_os = resolve_host_os(args.host_os)
 
     CONFIG = RunnerConfig(
