@@ -42,6 +42,9 @@ class DeepAgentProfileTests(unittest.TestCase):
                         "vision_model: openai:gpt-5.5",
                         "deep_recursion_limit: 42",
                         "max_review_rounds: 3",
+                        "graceful_finalize:",
+                        "  finalize_message_count: 20",
+                        "  strict_finalize_after_model_calls: 1",
                         "result_mode: inline",
                         "self_check_policy: checklist",
                     ]
@@ -61,6 +64,13 @@ class DeepAgentProfileTests(unittest.TestCase):
             self.assertEqual(profile.vision_model, "openai:gpt-5.5")
             self.assertEqual(profile.deep_recursion_limit, 42)
             self.assertEqual(profile.max_review_rounds, 3)
+            self.assertEqual(
+                profile.graceful_finalize,
+                {
+                    "finalize_message_count": 20,
+                    "strict_finalize_after_model_calls": 1,
+                },
+            )
             self.assertEqual(profile.result_mode, "inline")
             self.assertEqual(profile.self_check_policy, "checklist")
 
@@ -314,6 +324,48 @@ class DeepAgentProfileTests(unittest.TestCase):
         kept_names = [middleware._tool_name(item) for item in kept]
 
         self.assertEqual(kept_names, ["write_file", "execute", "request_parent_review"])
+        middleware.finalize_model_calls_seen = 2
+        strict_kept = middleware.filter_finalize_tools(
+            tools,
+            allowlist=middleware.current_finalize_tool_allowlist(),
+        )
+        strict_names = [middleware._tool_name(item) for item in strict_kept]
+        self.assertEqual(strict_names, ["write_file", "execute"])
+
+    def test_graceful_finalize_switches_to_review_only_when_artifacts_ready(self) -> None:
+        old_config = runner.CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                output_dir = Path(temp) / "outputs"
+                output_dir.mkdir()
+                (output_dir / "result.md").write_text("done", encoding="utf-8")
+                subtasks = output_dir / "subtasks"
+                subtasks.mkdir()
+                (subtasks / "self_check_plan.md").write_text(
+                    "Check script tag safely as &lt;script&gt;.", encoding="utf-8"
+                )
+                (subtasks / "self_check_report.md").write_text(
+                    "Status: PASS\nCommand run: python self_check.py", encoding="utf-8"
+                )
+                runner.CONFIG = SimpleNamespace(output_dir=output_dir)
+                middleware = runner.GracefulFinalizeMiddleware(
+                    profile_id="web_research",
+                    expected_artifacts=["/outputs/result.md"],
+                    warning_model_calls=3,
+                    finalize_model_calls=4,
+                    warning_tool_calls=3,
+                    finalize_tool_calls=4,
+                    warning_message_count=10,
+                    finalize_message_count=12,
+                )
+                middleware.finalize_model_calls_seen = 2
+
+                self.assertEqual(
+                    middleware.current_finalize_tool_allowlist(),
+                    {"request_parent_review"},
+                )
+        finally:
+            runner.CONFIG = old_config
 
     def test_graceful_finalize_instruction_names_artifacts_and_review(self) -> None:
         middleware = runner.GracefulFinalizeMiddleware(
@@ -383,12 +435,95 @@ class DeepAgentProfileTests(unittest.TestCase):
     def test_graceful_finalize_thresholds_are_derived_from_recursion_limit(self) -> None:
         thresholds = runner.graceful_finalize_thresholds(120)
 
-        self.assertEqual(thresholds["warning_model_calls"], 22)
-        self.assertEqual(thresholds["finalize_model_calls"], 30)
-        self.assertEqual(thresholds["warning_tool_calls"], 18)
-        self.assertEqual(thresholds["finalize_tool_calls"], 24)
-        self.assertEqual(thresholds["warning_message_count"], 66)
-        self.assertEqual(thresholds["finalize_message_count"], 84)
+        self.assertEqual(thresholds["warning_model_calls"], 13)
+        self.assertEqual(thresholds["finalize_model_calls"], 19)
+        self.assertEqual(thresholds["warning_tool_calls"], 9)
+        self.assertEqual(thresholds["finalize_tool_calls"], 14)
+        self.assertEqual(thresholds["warning_message_count"], 31)
+        self.assertEqual(thresholds["finalize_message_count"], 45)
+        self.assertEqual(thresholds["strict_finalize_after_model_calls"], 2)
+
+    def test_graceful_finalize_thresholds_accept_profile_overrides(self) -> None:
+        thresholds = runner.graceful_finalize_thresholds(
+            120,
+            {"finalize_message_count": 25, "strict_finalize_after_model_calls": 1},
+        )
+
+        self.assertEqual(thresholds["finalize_message_count"], 25)
+        self.assertEqual(thresholds["strict_finalize_after_model_calls"], 1)
+
+    def test_unreviewed_artifact_salvage_marks_candidates_not_gateable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            self_check_dir = Path(temp) / "subtasks"
+            self_check_dir.mkdir()
+            (self_check_dir / "self_check_plan.md").write_text("plan", encoding="utf-8")
+            (self_check_dir / "self_check_report.md").write_text("report", encoding="utf-8")
+
+            salvage = runner.build_unreviewed_artifact_salvage(
+                profile=runner.DeepAgentProfile(
+                    id="heavy",
+                    tool_name="run_heavy_agent",
+                    description="Heavy.",
+                    result_mode="artifact",
+                ),
+                effective_expected_artifacts=["/outputs/result.html"],
+                artifact_check={
+                    "artifacts": [
+                        {
+                            "sandbox_path": "/outputs/result.html",
+                            "exists": True,
+                            "is_file": True,
+                        }
+                    ]
+                },
+                deep_error={"type": "GraphRecursionError", "message": "limit"},
+                review_requested=False,
+                self_check_dir=self_check_dir,
+            )
+
+            self.assertTrue(salvage["available"])
+            self.assertFalse(salvage["gate_allowed"])
+            self.assertFalse(salvage["review_requested"])
+            self.assertEqual(
+                salvage["candidate_review_artifacts"],
+                [
+                    "/outputs/result.html",
+                    "/outputs/subtasks/self_check_plan.md",
+                    "/outputs/subtasks/self_check_report.md",
+                ],
+            )
+
+    def test_review_preflight_rejects_pending_report_and_literal_script(self) -> None:
+        old_config = runner.CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                output_dir = Path(temp) / "outputs"
+                output_dir.mkdir()
+                subtasks = output_dir / "subtasks"
+                subtasks.mkdir()
+                (output_dir / "result.html").write_text("<!doctype html>", encoding="utf-8")
+                (subtasks / "self_check_plan.md").write_text(
+                    "Confirm there is no <script> tag.", encoding="utf-8"
+                )
+                (subtasks / "self_check_report.md").write_text(
+                    "Overall status: PENDING\nCommand run: not yet executed",
+                    encoding="utf-8",
+                )
+                runner.CONFIG = SimpleNamespace(output_dir=output_dir)
+
+                findings = runner.validate_review_artifact_preflight(
+                    [
+                        "/outputs/result.html",
+                        "/outputs/subtasks/self_check_plan.md",
+                        "/outputs/subtasks/self_check_report.md",
+                    ]
+                )
+
+                codes = {finding["code"] for finding in findings}
+                self.assertIn("literal_script_tag", codes)
+                self.assertIn("self_check_report_pending", codes)
+        finally:
+            runner.CONFIG = old_config
 
     def test_expected_artifacts_can_be_empty_only_when_allowed(self) -> None:
         old_config = runner.CONFIG

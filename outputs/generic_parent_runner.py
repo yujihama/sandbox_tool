@@ -94,6 +94,7 @@ class DeepAgentProfile:
     vision_model: str = ""
     deep_recursion_limit: int | None = None
     max_review_rounds: int | None = None
+    graceful_finalize: dict[str, int] = field(default_factory=dict)
     result_mode: str = "artifact"
     self_check_policy: str = "script"
     source_path: str = ""
@@ -181,12 +182,26 @@ TOOLSET_DESCRIPTIONS: dict[str, str] = {
 ALLOWED_TOOLSETS = set(TOOLSET_TOOL_NAMES)
 FINALIZE_TOOL_ALLOWLIST = {
     "request_parent_review",
-    "read_sandbox_file",
-    "read_file",
     "write_file",
     "edit_file",
     "execute",
-    "ls",
+}
+STRICT_FINALIZE_TOOL_ALLOWLIST = {
+    "request_parent_review",
+}
+REPAIR_FINALIZE_TOOL_ALLOWLIST = {
+    "write_file",
+    "edit_file",
+    "execute",
+}
+GRACEFUL_FINALIZE_CONFIG_FIELDS = {
+    "warning_model_calls",
+    "finalize_model_calls",
+    "warning_tool_calls",
+    "finalize_tool_calls",
+    "warning_message_count",
+    "finalize_message_count",
+    "strict_finalize_after_model_calls",
 }
 
 
@@ -211,6 +226,7 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
         finalize_tool_calls: int,
         warning_message_count: int,
         finalize_message_count: int,
+        strict_finalize_after_model_calls: int = 2,
         finalize_tool_allowlist: set[str] | None = None,
         result_mode: str = "artifact",
         self_check_policy: str = "script",
@@ -228,8 +244,11 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             self.warning_message_count + 1,
             finalize_message_count,
         )
+        self.strict_finalize_after_model_calls = max(1, strict_finalize_after_model_calls)
         self.finalize_tool_allowlist = finalize_tool_allowlist or FINALIZE_TOOL_ALLOWLIST
+        self.strict_finalize_tool_allowlist = STRICT_FINALIZE_TOOL_ALLOWLIST
         self.tool_calls = 0
+        self.finalize_model_calls_seen = 0
 
     def before_model(
         self, state: GracefulFinalizeState, runtime: Any
@@ -251,9 +270,13 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
         mode = self._mode_for_state(count, message_count, self.tool_calls)
 
         if mode == "finalize":
+            self.finalize_model_calls_seen += 1
             return handler(
                 request.override(
-                    tools=self.filter_finalize_tools(request.tools),
+                    tools=self.filter_finalize_tools(
+                        request.tools,
+                        allowlist=self.current_finalize_tool_allowlist(),
+                    ),
                     system_message=self._append_system_instruction(
                         request.system_message,
                         self.finalize_instruction(count, message_count),
@@ -287,7 +310,7 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             len(request.state.get("messages", [])),
             self.tool_calls,
         )
-        if mode == "finalize" and tool_name not in self.finalize_tool_allowlist:
+        if mode == "finalize" and tool_name not in self.current_finalize_tool_allowlist():
             tool_call = getattr(request, "tool_call", {}) or {}
             tool_call_id = str(tool_call.get("id") or tool_call.get("tool_call_id") or "")
             return ToolMessage(
@@ -353,11 +376,66 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
                 return str(item["name"])
         return str(getattr(item, "name", None) or getattr(item, "__name__", ""))
 
-    def filter_finalize_tools(self, tools: list[Any]) -> list[Any]:
+    def current_finalize_tool_allowlist(self) -> set[str]:
+        if self.finalize_model_calls_seen >= self.strict_finalize_after_model_calls:
+            if self.review_artifacts_look_ready():
+                return self.strict_finalize_tool_allowlist
+            return REPAIR_FINALIZE_TOOL_ALLOWLIST
+        return self.finalize_tool_allowlist
+
+    def review_artifacts_look_ready(self) -> bool:
+        if self.result_mode != "artifact":
+            return False
+        try:
+            for artifact in self.expected_artifacts:
+                path = resolve_sandbox_path(artifact)
+                if not path.is_file() or path.stat().st_size == 0:
+                    return False
+            if self.self_check_policy not in {"script", "checklist"}:
+                return True
+            plan_path = resolve_sandbox_path("/outputs/subtasks/self_check_plan.md")
+            report_path = resolve_sandbox_path("/outputs/subtasks/self_check_report.md")
+            if not plan_path.is_file() or not report_path.is_file():
+                return False
+            plan_text = plan_path.read_text(encoding="utf-8", errors="replace")
+            report_text = report_path.read_text(encoding="utf-8", errors="replace")
+            if review_markdown_blockers(plan_text, "self_check_plan.md"):
+                return False
+            report_findings = review_markdown_blockers(
+                report_text,
+                "self_check_report.md",
+            )
+            if report_findings:
+                return False
+            if self.self_check_policy == "script":
+                lower = report_text.lower()
+                if any(
+                    marker in lower
+                    for marker in (
+                        "pending",
+                        "not yet executed",
+                        "not executed",
+                        "未実行",
+                    )
+                ):
+                    return False
+                if not re.search(r"\b(?:pass|passed|self_check_pass)\b", lower):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def filter_finalize_tools(
+        self,
+        tools: list[Any],
+        *,
+        allowlist: set[str] | None = None,
+    ) -> list[Any]:
+        effective_allowlist = allowlist or self.finalize_tool_allowlist
         return [
             item
             for item in tools
-            if self._tool_name(item) in self.finalize_tool_allowlist
+            if self._tool_name(item) in effective_allowlist
         ]
 
     def warning_instruction(self, model_calls: int, message_count: int) -> str:
@@ -432,6 +510,13 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             "Required expected artifacts:\n"
             f"{expected_text}\n\n"
             f"{self_check_text}"
+            "When documenting active-content checks in Markdown, escape raw HTML "
+            "tag examples such as `&lt;script&gt;`; do not write literal script "
+            "tags in Markdown review artifacts because the output gate rejects "
+            "active-content strings. Do not submit a placeholder or PENDING "
+            "self-check report; request_parent_review will reject it. If a "
+            "script self-check is required, execute the script and update the "
+            "report with a final pass/fail result before requesting review.\n\n"
             "Then call request_parent_review with exactly these review artifacts:\n"
             f"{review_text}\n\n"
             "After request_parent_review returns, stop."
@@ -534,6 +619,29 @@ def normalize_profile_self_check_policy(value: Any, profile_path: Path) -> str:
     return policy
 
 
+def normalize_profile_graceful_finalize(value: Any, profile_path: Path) -> dict[str, int]:
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"graceful_finalize must be an object: {profile_path}")
+    normalized: dict[str, int] = {}
+    unknown = sorted(set(value) - GRACEFUL_FINALIZE_CONFIG_FIELDS)
+    if unknown:
+        raise ValueError(
+            "Unsupported graceful_finalize field(s) "
+            f"{', '.join(unknown)} in {profile_path}"
+        )
+    for key in GRACEFUL_FINALIZE_CONFIG_FIELDS:
+        raw = value.get(key)
+        if raw is None or raw == "":
+            continue
+        parsed = int(raw)
+        if parsed <= 0:
+            raise ValueError(f"graceful_finalize.{key} must be positive: {profile_path}")
+        normalized[key] = parsed
+    return normalized
+
+
 def read_profile_document(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
@@ -605,6 +713,9 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
         vision_model=str(data.get("vision_model") or "").strip(),
         deep_recursion_limit=optional_int("deep_recursion_limit"),
         max_review_rounds=optional_int("max_review_rounds"),
+        graceful_finalize=normalize_profile_graceful_finalize(
+            data.get("graceful_finalize"), profile_path
+        ),
         result_mode=result_mode,
         self_check_policy=self_check_policy,
         source_path=str(profile_path),
@@ -933,6 +1044,139 @@ def check_expected_artifacts(paths: list[str | Path]) -> dict[str, Any]:
     }
 
 
+def review_markdown_blockers(text: str, artifact_name: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    active_patterns = [
+        (r"<\s*/?\s*script\b", "literal_script_tag"),
+        (r"<\s*iframe\b", "literal_iframe_tag"),
+        (r"<\s*object\b", "literal_object_tag"),
+        (r"<\s*embed\b", "literal_embed_tag"),
+        (r"javascript\s*:", "javascript_url"),
+    ]
+    for pattern, code in active_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            line = text[: match.start()].count("\n") + 1
+            findings.append(
+                {
+                    "artifact": artifact_name,
+                    "code": code,
+                    "line": line,
+                    "message": (
+                        "Markdown review artifacts must escape active-content "
+                        "examples, e.g. use &lt;script&gt; or plain 'script tag'."
+                    ),
+                }
+            )
+    return findings
+
+
+def validate_review_artifact_preflight(artifacts: list[str]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        try:
+            path = resolve_sandbox_path(artifact)
+        except Exception as exc:
+            findings.append(
+                {
+                    "artifact": artifact,
+                    "code": "invalid_path",
+                    "message": str(exc),
+                }
+            )
+            continue
+        if not path.is_file():
+            findings.append(
+                {
+                    "artifact": artifact,
+                    "code": "missing_review_artifact",
+                    "message": "Review artifact does not exist or is not a file.",
+                }
+            )
+            continue
+        if path.stat().st_size == 0:
+            findings.append(
+                {
+                    "artifact": artifact,
+                    "code": "empty_review_artifact",
+                    "message": "Review artifact is empty.",
+                }
+            )
+            continue
+        if path.suffix.lower() == ".md":
+            text = path.read_text(encoding="utf-8", errors="replace")
+            findings.extend(review_markdown_blockers(text, path.name))
+            if path.name == "self_check_report.md":
+                lower = text.lower()
+                if any(
+                    marker in lower
+                    for marker in (
+                        "pending",
+                        "not yet executed",
+                        "not executed",
+                        "未実行",
+                    )
+                ):
+                    findings.append(
+                        {
+                            "artifact": artifact,
+                            "code": "self_check_report_pending",
+                            "message": (
+                                "Self-check report appears pending or not executed. "
+                                "Run the self-check and update the report before review."
+                            ),
+                        }
+                    )
+    return findings
+
+
+def build_unreviewed_artifact_salvage(
+    *,
+    profile: DeepAgentProfile,
+    effective_expected_artifacts: list[str],
+    artifact_check: dict[str, Any],
+    deep_error: dict[str, Any] | None,
+    review_requested: bool,
+    self_check_dir: Path,
+) -> dict[str, Any]:
+    if profile.result_mode == "inline" or deep_error is None or review_requested:
+        return {"available": False}
+    existing_expected = [
+        item.get("sandbox_path")
+        for item in artifact_check.get("artifacts", [])
+        if item.get("exists") and item.get("is_file")
+    ]
+    self_check_candidates: list[str] = []
+    for name in ("self_check_plan.md", "self_check_report.md"):
+        if (self_check_dir / name).exists():
+            self_check_candidates.append(f"/outputs/subtasks/{name}")
+    candidate_review_artifacts = list(
+        dict.fromkeys(
+            [
+                *(path for path in effective_expected_artifacts if path in existing_expected),
+                *self_check_candidates,
+            ]
+        )
+    )
+    if not candidate_review_artifacts:
+        return {"available": False}
+    return {
+        "available": True,
+        "reason": "deep_agent_error_before_parent_review",
+        "deep_error": deep_error,
+        "existing_expected_artifacts": existing_expected,
+        "self_check_artifacts": self_check_candidates,
+        "candidate_review_artifacts": candidate_review_artifacts,
+        "review_requested": False,
+        "gate_allowed": False,
+        "message": (
+            "Artifacts exist after a Deep Agent error, but request_parent_review "
+            "was not called. Treat them as unreviewed candidates only. Do not run "
+            "output gate until a later Deep Agent attempt explicitly requests review."
+        ),
+    }
+
+
 def wsl_podman_image_available(image: str, distro: str) -> bool:
     if shutil.which("wsl") is None:
         return False
@@ -1231,6 +1475,11 @@ def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     input_note = f"; input_access={profile.input_access}"
     result_note = f"; result_mode={profile.result_mode}"
     self_check_note = f"; self_check_policy={profile.self_check_policy}"
+    graceful_note = (
+        f"; graceful_finalize={json.dumps(profile.graceful_finalize, ensure_ascii=False)}"
+        if profile.graceful_finalize
+        else ""
+    )
     skill_note = (
         f"; skills={', '.join(profile.skill_sources)}" if profile.skill_sources else ""
     )
@@ -1238,7 +1487,7 @@ def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
         f"- {profile.tool_name}: {profile.description} "
         f"(profile_id={profile.id}{toolset_note}{tools_note}{model_note}"
         f"{vision_model_note}{image_note}{rounds_note}{input_note}{result_note}"
-        f"{self_check_note}{skill_note})"
+        f"{self_check_note}{graceful_note}{skill_note})"
     )
 
 
@@ -3609,6 +3858,20 @@ def request_parent_review(
                 "images, PDFs, or other helper files in request_parent_review."
             ),
         }
+    preflight_findings = validate_review_artifact_preflight(normalized_artifacts)
+    if preflight_findings:
+        return {
+            "ok": False,
+            "review_requested": False,
+            "error": "review_preflight_failed",
+            "findings": preflight_findings,
+            "message": (
+                "Review artifacts are not ready. Fix the findings, rerun any "
+                "required self-check, update the report, then call "
+                "request_parent_review again. Do not submit placeholder or "
+                "pending self-check reports."
+            ),
+        }
     request = {
         "attempt": len(DEEP_AGENT_EVALUATIONS) + 1,
         "artifacts": normalized_artifacts,
@@ -3756,6 +4019,10 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "script with the `execute` tool. If it fails, fix the artifact and rerun the "
             "self-check before requesting review. The report must include command(s) run, "
             "pass/fail status, checked files, limitations, and remaining known issues. "
+            "When describing checks for active HTML content in Markdown artifacts, escape "
+            "raw tag examples such as `&lt;script&gt;`; do not write literal script tags "
+            "because the output gate rejects active-content strings. Do not submit a "
+            "placeholder or PENDING self-check report; request_parent_review will reject it. "
             "When you believe the expected artifacts are ready for review, you must "
             "call request_parent_review with the final artifact paths, a concise summary of "
             "what you produced, and any known issues. Include `/outputs/subtasks/self_check_plan.md` "
@@ -3836,24 +4103,38 @@ def deep_agent_tools_for_profile(profile: DeepAgentProfile) -> list[Any]:
     return selected
 
 
-def graceful_finalize_thresholds(recursion_limit: int) -> dict[str, int]:
-    finalize_model_calls = max(8, min(30, recursion_limit // 4))
-    warning_model_calls = max(4, int(finalize_model_calls * 0.75))
-    finalize_tool_calls = max(8, min(24, recursion_limit // 5))
-    warning_tool_calls = max(4, int(finalize_tool_calls * 0.75))
-    warning_message_count = max(12, int(recursion_limit * 0.55))
-    finalize_message_count = max(
-        warning_message_count + 4,
-        int(recursion_limit * 0.70),
-    )
-    return {
+def graceful_finalize_thresholds(
+    recursion_limit: int,
+    overrides: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """Choose conservative finalize thresholds before LangGraph's hard limit.
+
+    LangGraph's recursion_limit counts graph supersteps, not only visible model
+    or tool calls. Deep Agents add filesystem, todo, summarization, and tool
+    patching nodes, so visible message counts need to trigger finalization well
+    before the hard recursion limit.
+    """
+    safe_limit = max(10, recursion_limit)
+    finalize_model_calls = max(6, min(30, int(safe_limit * 0.16)))
+    warning_model_calls = max(4, int(finalize_model_calls * 0.70))
+    finalize_tool_calls = max(6, min(16, int(safe_limit * 0.12)))
+    warning_tool_calls = max(4, int(finalize_tool_calls * 0.70))
+    finalize_message_count = max(20, min(60, int(safe_limit * 0.38)))
+    warning_message_count = max(12, int(finalize_message_count * 0.70))
+    thresholds = {
         "warning_model_calls": warning_model_calls,
         "finalize_model_calls": finalize_model_calls,
         "warning_tool_calls": warning_tool_calls,
         "finalize_tool_calls": finalize_tool_calls,
         "warning_message_count": warning_message_count,
         "finalize_message_count": finalize_message_count,
+        "strict_finalize_after_model_calls": 2,
     }
+    for key, value in (overrides or {}).items():
+        if key not in GRACEFUL_FINALIZE_CONFIG_FIELDS:
+            raise ValueError(f"Unsupported graceful finalize override: {key}")
+        thresholds[key] = value
+    return thresholds
 
 
 def execute_deep_agent_task(
@@ -3988,7 +4269,10 @@ def execute_deep_agent_task(
         getattr(item, "name", None) or getattr(item, "__name__", str(item))
         for item in selected_deep_tools
     ]
-    graceful_finalize_config = graceful_finalize_thresholds(effective_recursion_limit)
+    graceful_finalize_config = graceful_finalize_thresholds(
+        effective_recursion_limit,
+        profile.graceful_finalize,
+    )
 
     deep_error: dict[str, Any] | None = None
     inline_result = ""
@@ -4013,18 +4297,28 @@ def execute_deep_agent_task(
                 )
             ],
         )
-        deep_result = deep_agent.invoke(
-            {"messages": [{"role": "user", "content": task_with_contract}]},
-            config={
-                "configurable": {
-                    "thread_id": f"deep-agent-{safe_tool_name(profile.id)}-task"
-                },
-                "recursion_limit": effective_recursion_limit,
+        latest_messages: list[Any] = []
+        stream_config = {
+            "configurable": {
+                "thread_id": f"deep-agent-{safe_tool_name(profile.id)}-task"
             },
-        )
-        messages = deep_result["messages"]
-        inline_result = content_text(getattr(messages[-1], "content", ""))
-        DEEP_AGENT_TRACE.extend(trace_messages(messages, content_limit=2600))
+            "recursion_limit": effective_recursion_limit,
+        }
+        for chunk in deep_agent.stream(
+            {"messages": [{"role": "user", "content": task_with_contract}]},
+            config=stream_config,
+            stream_mode="values",
+        ):
+            if isinstance(chunk, dict) and chunk.get("messages"):
+                latest_messages = list(chunk["messages"])
+                DEEP_AGENT_TRACE[:] = trace_messages(latest_messages, content_limit=2600)
+                latest_deep_trace_path.write_text(
+                    json.dumps(DEEP_AGENT_TRACE, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        if latest_messages:
+            inline_result = content_text(getattr(latest_messages[-1], "content", ""))
+            DEEP_AGENT_TRACE[:] = trace_messages(latest_messages, content_limit=2600)
         deep_trace_path.write_text(
             json.dumps(DEEP_AGENT_TRACE, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -4035,12 +4329,18 @@ def execute_deep_agent_task(
         )
     except Exception as exc:
         deep_error = {"type": exc.__class__.__name__, "message": str(exc)[:2000]}
+        error_trace: dict[str, Any] | list[dict[str, Any]]
+        error_trace = (
+            {"error": deep_error, "partial_trace": DEEP_AGENT_TRACE}
+            if DEEP_AGENT_TRACE
+            else {"error": deep_error}
+        )
         deep_trace_path.write_text(
-            json.dumps({"error": deep_error}, ensure_ascii=False, indent=2),
+            json.dumps(error_trace, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         latest_deep_trace_path.write_text(
-            json.dumps({"error": deep_error}, ensure_ascii=False, indent=2),
+            json.dumps(error_trace, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     finally:
@@ -4129,6 +4429,14 @@ def execute_deep_agent_task(
             "report_exists": (self_check_dir / "self_check_report.md").exists(),
             "script_candidates": self_check_scripts,
         },
+        "salvage": build_unreviewed_artifact_salvage(
+            profile=profile,
+            effective_expected_artifacts=effective_expected_artifacts,
+            artifact_check=artifact_check,
+            deep_error=deep_error,
+            review_requested=bool(attempt_review_requests),
+            self_check_dir=self_check_dir,
+        ),
         "deep_tool_calls": [
             name for item in DEEP_AGENT_TRACE for name in item.get("tool_calls", [])
         ],
@@ -4141,6 +4449,7 @@ def execute_deep_agent_task(
         artifact_check["ok"]
         and deep_error is None
         and cleanup.get("cleanup_ok") is True
+        and (profile.result_mode == "inline" or bool(attempt_review_requests))
         and (profile.result_mode != "inline" or bool(inline_result.strip()))
     )
     evaluation_path.write_text(
@@ -4310,6 +4619,10 @@ def run_parent_agent() -> dict[str, Any]:
             "and inspect again after every artifact-result review request, and close only "
             "when no material issues remain or no attempts remain. If an artifact-result "
             "Deep Agent does not request review, treat that as a material protocol issue; "
+            "if the tool result includes salvage.available=true, do not run output gate "
+            "on those unreviewed files, but use the salvage summary to ask the next "
+            "Deep Agent attempt to reuse the existing /outputs candidates, finish or "
+            "repair self-check artifacts, and call request_parent_review promptly. "
             f"if attempts remain, call {deep_tool_instruction} again instructing it to produce/update "
             "artifacts, run the profile-appropriate self-check, and call request_parent_review. "
             f"{attempts_instruction} "
@@ -4368,6 +4681,7 @@ def run_parent_agent() -> dict[str, Any]:
                     "input_access": profile.input_access,
                     "result_mode": profile.result_mode,
                     "self_check_policy": profile.self_check_policy,
+                    "graceful_finalize": profile.graceful_finalize,
                     "image": profile.image or CONFIG.image,
                     "deep_model": profile.deep_model or CONFIG.deep_model,
                     "vision_model": (

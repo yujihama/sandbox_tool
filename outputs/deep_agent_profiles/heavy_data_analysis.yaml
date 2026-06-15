@@ -13,3 +13,11 @@ system_prompt: |
   assumptions, uncertainty, and limitations in the final report.
 max_review_rounds: 2
 deep_recursion_limit: 120
+graceful_finalize:
+  warning_model_calls: 10
+  finalize_model_calls: 14
+  warning_tool_calls: 8
+  finalize_tool_calls: 12
+  warning_message_count: 28
+  finalize_message_count: 38
+  strict_finalize_after_model_calls: 2

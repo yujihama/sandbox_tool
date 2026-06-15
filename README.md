@@ -183,6 +183,13 @@ Each profile can define:
   mode.
 - `image`, `deep_model`, `deep_recursion_limit`, `max_review_rounds`: optional
   overrides for that worker profile.
+- `graceful_finalize`: optional per-profile overrides for early finalization
+  thresholds. Supported keys are `warning_model_calls`,
+  `finalize_model_calls`, `warning_tool_calls`, `finalize_tool_calls`,
+  `warning_message_count`, `finalize_message_count`, and
+  `strict_finalize_after_model_calls`. This is useful for heavy artifact tasks
+  where LangGraph graph steps can hit the hard recursion limit before visible
+  model/tool counts look high.
 
 The included examples cover quick checks, heavier statistical analysis,
 document/artifact generation, seal-image reading, local browser validation,
