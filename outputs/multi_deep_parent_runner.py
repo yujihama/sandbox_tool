@@ -383,6 +383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selinux-relabel", action="store_true")
     parser.add_argument("--parent-model", default="openai:gpt-5.2")
     parser.add_argument("--deep-model", default="openai:gpt-5.2")
+    parser.add_argument("--vision-model", default="")
     parser.add_argument("--parent-recursion-limit", type=int, default=28)
     parser.add_argument("--deep-recursion-limit", type=int, default=100)
     parser.add_argument("--max-deep-calls", type=int, default=5)
@@ -448,6 +449,7 @@ def main() -> None:
         wsl_distro=args.wsl_distro,
         parent_model=args.parent_model,
         deep_model=args.deep_model,
+        vision_model=args.vision_model,
         parent_recursion_limit=args.parent_recursion_limit,
         deep_recursion_limit=args.deep_recursion_limit,
         max_review_rounds=max(1, args.max_deep_calls),

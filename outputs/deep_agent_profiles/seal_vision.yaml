@@ -15,5 +15,7 @@ system_prompt: |
   under /input/skills. Avoid unsupported guesses; report uncertainty and
   plausible alternatives. Return the answer inline unless the user explicitly
   asks for a saved file artifact.
+deep_model: openai:gpt-5.4
+vision_model: openai:gpt-5.4
 max_review_rounds: 1
 deep_recursion_limit: 100

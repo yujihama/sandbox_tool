@@ -7,9 +7,13 @@ toolsets:
   - review
   - file_read
   - image_inspect
+skill_sources:
+  - ../skills/table-image-extraction=/input/profile-skills/table-image-extraction
 system_prompt: |
   Prefer direct, minimal processing. Use short scripts only when they reduce risk
   or make the result reproducible. Return compact inline answers by default and
-  include a concise self-check.
+  include a concise self-check. When profile skills are available and one
+  matches the task, read the relevant SKILL.md before using inspection tools or
+  returning the final answer.
 max_review_rounds: 1
 deep_recursion_limit: 50

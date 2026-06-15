@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+from io import BytesIO
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUTS = ROOT / "outputs"
@@ -36,6 +39,7 @@ class DeepAgentProfileTests(unittest.TestCase):
                         "system_prompt: Inline prompt.",
                         "system_prompt_file: prompt.txt",
                         "deep_model: openai:gpt-5.2",
+                        "vision_model: openai:gpt-5.5",
                         "deep_recursion_limit: 42",
                         "max_review_rounds: 3",
                         "result_mode: inline",
@@ -54,6 +58,7 @@ class DeepAgentProfileTests(unittest.TestCase):
             self.assertIn("Inline prompt.", profile.system_prompt)
             self.assertIn("Use this profile carefully.", profile.system_prompt)
             self.assertEqual(profile.deep_model, "openai:gpt-5.2")
+            self.assertEqual(profile.vision_model, "openai:gpt-5.5")
             self.assertEqual(profile.deep_recursion_limit, 42)
             self.assertEqual(profile.max_review_rounds, 3)
             self.assertEqual(profile.result_mode, "inline")
@@ -399,6 +404,231 @@ class DeepAgentProfileTests(unittest.TestCase):
         finally:
             runner.CONFIG = old_config
 
+    def test_inspect_sandbox_image_schema_hides_detail_and_sends_original(self) -> None:
+        from PIL import Image
+
+        schema = runner.inspect_sandbox_image.args_schema.model_json_schema()
+        self.assertNotIn("detail", schema["properties"])
+
+        old_config = runner.CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                input_dir = root / "input"
+                output_dir = root / "outputs"
+                export_dir = root / "exports"
+                input_dir.mkdir()
+                output_dir.mkdir()
+                export_dir.mkdir()
+                image_path = input_dir / "sample.png"
+                Image.new("RGB", (2, 2), "red").save(image_path)
+
+                runner.CONFIG = SimpleNamespace(
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    clean_export_dir=export_dir,
+                    deep_model="openai:gpt-5.4",
+                    vision_model="",
+                )
+
+                with patch.object(runner, "OpenAI") as openai_cls:
+                    client = openai_cls.return_value
+                    client.responses.create.return_value = SimpleNamespace(
+                        output_text="ok"
+                    )
+
+                    result = runner.inspect_sandbox_image.invoke(
+                        {
+                            "path": "/input/sample.png",
+                            "question": "read",
+                        }
+                    )
+
+                _, kwargs = client.responses.create.call_args
+                image_payload = kwargs["input"][0]["content"][1]
+                self.assertEqual(image_payload["detail"], "original")
+                self.assertEqual(result["detail"], "original")
+                self.assertNotIn("requested_detail", result)
+                self.assertNotIn("detail_source", result)
+        finally:
+            runner.CONFIG = old_config
+
+    def test_inspect_sandbox_image_adds_padding_before_send(self) -> None:
+        from PIL import Image
+
+        old_config = runner.CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                input_dir = root / "input"
+                output_dir = root / "outputs"
+                export_dir = root / "exports"
+                input_dir.mkdir()
+                output_dir.mkdir()
+                export_dir.mkdir()
+                image_path = input_dir / "tight.png"
+                Image.new("RGB", (4, 4), "black").save(image_path)
+
+                runner.CONFIG = SimpleNamespace(
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    clean_export_dir=export_dir,
+                    deep_model="openai:gpt-5.4",
+                    vision_model="",
+                )
+
+                with patch.object(runner, "OpenAI") as openai_cls:
+                    client = openai_cls.return_value
+                    client.responses.create.return_value = SimpleNamespace(
+                        output_text="ok"
+                    )
+
+                    result = runner.inspect_sandbox_image.invoke(
+                        {
+                            "path": "/input/tight.png",
+                            "question": "read",
+                        }
+                    )
+
+                _, kwargs = client.responses.create.call_args
+                image_payload = kwargs["input"][0]["content"][1]
+                prefix, encoded = image_payload["image_url"].split(",", 1)
+                self.assertEqual(prefix, "data:image/png;base64")
+                sent = Image.open(BytesIO(base64.b64decode(encoded)))
+                self.assertEqual(sent.size, (204, 204))
+                self.assertEqual(result["vision_transform"]["transform"], "pad_to_min_margin")
+                self.assertEqual(result["vision_transform"]["padding"]["min_margin"], 100)
+                self.assertEqual(result["vision_transform"]["padding"]["padding"]["left"], 100)
+                self.assertEqual(result["vision_transform"]["padding"]["padding"]["right"], 100)
+                self.assertEqual(result["vision_transform"]["sent_width"], 204)
+                self.assertEqual(result["vision_transform"]["sent_height"], 204)
+                self.assertTrue((output_dir / "_vision_prepared").exists())
+        finally:
+            runner.CONFIG = old_config
+
+    def test_inspect_sandbox_image_tiles_small_images_when_configured(self) -> None:
+        from PIL import Image
+
+        old_config = runner.CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                input_dir = root / "input"
+                output_dir = root / "outputs"
+                export_dir = root / "exports"
+                input_dir.mkdir()
+                output_dir.mkdir()
+                export_dir.mkdir()
+                image_path = input_dir / "tiny.png"
+                Image.new("RGB", (2, 3), "red").save(image_path)
+
+                runner.CONFIG = SimpleNamespace(
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    clean_export_dir=export_dir,
+                    deep_model="openai:gpt-5.4",
+                    vision_model="",
+                    tile_small_images_for_vision=True,
+                    vision_tile_max_side=16,
+                    vision_tile_grid=5,
+                )
+
+                with patch.object(runner, "OpenAI") as openai_cls:
+                    client = openai_cls.return_value
+                    client.responses.create.return_value = SimpleNamespace(
+                        output_text="ok"
+                    )
+
+                    result = runner.inspect_sandbox_image.invoke(
+                        {
+                            "path": "/input/tiny.png",
+                            "question": "read",
+                        }
+                    )
+
+                _, kwargs = client.responses.create.call_args
+                image_payload = kwargs["input"][0]["content"][1]
+                prefix, encoded = image_payload["image_url"].split(",", 1)
+                self.assertEqual(prefix, "data:image/png;base64")
+                sent = Image.open(BytesIO(base64.b64decode(encoded)))
+                self.assertEqual(sent.size, (1010, 1015))
+                self.assertEqual(image_payload["detail"], "original")
+                self.assertEqual(result["sent_mime"], "image/png")
+                self.assertEqual(result["vision_transform"]["transform"], "tile_5x5")
+                self.assertEqual(result["vision_transform"]["source_width"], 2)
+                self.assertEqual(result["vision_transform"]["source_height"], 3)
+                self.assertTrue(result["vision_transform"]["padding"]["applied"])
+                self.assertEqual(result["vision_transform"]["padding"]["min_margin"], 100)
+                self.assertEqual(result["vision_transform"]["padding"]["padded_width"], 202)
+                self.assertEqual(result["vision_transform"]["padding"]["padded_height"], 203)
+                self.assertEqual(result["vision_transform"]["sent_width"], 1010)
+                self.assertEqual(result["vision_transform"]["sent_height"], 1015)
+                self.assertTrue((output_dir / "_vision_tiles").exists())
+        finally:
+            runner.CONFIG = old_config
+
+    def test_extract_skill_usage_from_trace_detects_read_and_execute(self) -> None:
+        usage = runner.extract_skill_usage_from_trace(
+            [
+                {
+                    "index": 2,
+                    "tool_call_args": [
+                        {
+                            "name": "read_file",
+                            "args": {
+                                "file_path": "/input/skills/seal-surname-identification/SKILL.md"
+                            },
+                        }
+                    ],
+                },
+                {
+                    "index": 5,
+                    "tool_call_args": [
+                        {
+                            "name": "execute",
+                            "args": {
+                                "command": (
+                                    "python /input/skills/seal-surname-identification/"
+                                    "scripts/seal_preprocess.py /input/test05.png"
+                                )
+                            },
+                        }
+                    ],
+                },
+            ],
+            ["/input/skills"],
+        )
+
+        self.assertTrue(usage["configured"])
+        self.assertTrue(usage["referenced"])
+        self.assertTrue(usage["executed"])
+        self.assertEqual(usage["skill_names"], ["seal-surname-identification"])
+        self.assertEqual(
+            usage["references"][0]["path"],
+            "/input/skills/seal-surname-identification/SKILL.md",
+        )
+        self.assertIn("seal_preprocess.py", usage["executions"][0]["command"])
+
+    def test_active_vision_model_prefers_active_then_config_then_deep_model(self) -> None:
+        old_config = runner.CONFIG
+        old_active = runner.ACTIVE_DEEP_AGENT_VISION_MODEL
+        try:
+            runner.CONFIG = SimpleNamespace(
+                vision_model="openai:gpt-5.4",
+                deep_model="openai:gpt-5.2",
+            )
+            runner.ACTIVE_DEEP_AGENT_VISION_MODEL = "openai:gpt-5.5"
+            self.assertEqual(runner.active_vision_model_name(), "gpt-5.5")
+
+            runner.ACTIVE_DEEP_AGENT_VISION_MODEL = ""
+            self.assertEqual(runner.active_vision_model_name(), "gpt-5.4")
+
+            runner.CONFIG.vision_model = ""
+            self.assertEqual(runner.active_vision_model_name(), "gpt-5.2")
+        finally:
+            runner.CONFIG = old_config
+            runner.ACTIVE_DEEP_AGENT_VISION_MODEL = old_active
+
     def test_hidden_profiles_are_skipped_from_profile_dir_but_explicit_load_works(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -471,8 +701,16 @@ class DeepAgentProfileTests(unittest.TestCase):
         self.assertEqual(by_id["quick_eval"].result_mode, "inline")
         self.assertEqual(by_id["quick_eval"].self_check_policy, "checklist")
         self.assertNotIn("request_parent_review", runner.tool_names_for_profile(by_id["quick_eval"]))
+        self.assertEqual(
+            by_id["quick_eval"].skill_source_specs,
+            [
+                "../skills/table-image-extraction=/input/profile-skills/table-image-extraction"
+            ],
+        )
         self.assertEqual(by_id["seal_vision"].result_mode, "inline")
         self.assertEqual(by_id["seal_vision"].self_check_policy, "checklist")
+        self.assertEqual(by_id["seal_vision"].deep_model, "openai:gpt-5.4")
+        self.assertEqual(by_id["seal_vision"].vision_model, "openai:gpt-5.4")
         self.assertNotIn("request_parent_review", runner.tool_names_for_profile(by_id["seal_vision"]))
         self.assertEqual(
             by_id["document_artifact"].toolsets,
@@ -525,6 +763,18 @@ class DeepAgentProfileTests(unittest.TestCase):
             )
             runner.materialize_deep_agent_profiles(materialized_profiles, input_dir, [])
             materialized = {profile.id: profile for profile in materialized_profiles}
+            self.assertEqual(
+                materialized["quick_eval"].skill_sources,
+                ["/input/profile-skills"],
+            )
+            self.assertTrue(
+                (
+                    input_dir
+                    / "profile-skills"
+                    / "table-image-extraction"
+                    / "SKILL.md"
+                ).exists()
+            )
             self.assertEqual(
                 materialized["web_research"].skill_sources,
                 ["/input/profile-skills"],

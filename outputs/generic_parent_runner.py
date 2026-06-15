@@ -4,6 +4,7 @@ import argparse
 import base64
 import csv
 import hashlib
+from io import BytesIO
 import json
 import math
 import mimetypes
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest
@@ -89,6 +91,7 @@ class DeepAgentProfile:
     include_global_skills: bool = False
     image: str = ""
     deep_model: str = ""
+    vision_model: str = ""
     deep_recursion_limit: int | None = None
     max_review_rounds: int | None = None
     result_mode: str = "artifact"
@@ -114,6 +117,7 @@ class RunnerConfig:
     wsl_distro: str
     parent_model: str
     deep_model: str
+    vision_model: str
     parent_recursion_limit: int
     deep_recursion_limit: int
     max_review_rounds: int
@@ -130,6 +134,9 @@ class RunnerConfig:
     egress_proxy_url: str
     egress_proxy_signing_secret: str
     xlsx_dangerous_formula_action: str
+    tile_small_images_for_vision: bool = False
+    vision_tile_max_side: int = 128
+    vision_tile_grid: int = 5
     deep_agent_profiles: list[DeepAgentProfile] = field(default_factory=list)
 
 
@@ -144,6 +151,11 @@ PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS = 5000
 PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS = 60000
 PLAYWRIGHT_DOMAIN_LAST_FINISH: dict[str, float] = {}
 ACTIVE_DEEP_AGENT_TOOLSETS: set[str] = set()
+ACTIVE_DEEP_AGENT_VISION_MODEL = ""
+VISION_MIN_MARGIN_PX = 100
+SKILL_VIRTUAL_PATH_RE = re.compile(
+    r"(?P<path>/input/(?:skills|profile-skills)/(?P<skill>[^/\\\s\"'`]+)(?:/[^\\\s\"'`]+)*)"
+)
 
 TOOLSET_TOOL_NAMES: dict[str, list[str]] = {
     "review": ["request_parent_review"],
@@ -590,6 +602,7 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
         include_global_skills=bool(data.get("include_global_skills", False)),
         image=str(data.get("image") or "").strip(),
         deep_model=str(data.get("deep_model") or "").strip(),
+        vision_model=str(data.get("vision_model") or "").strip(),
         deep_recursion_limit=optional_int("deep_recursion_limit"),
         max_review_rounds=optional_int("max_review_rounds"),
         result_mode=result_mode,
@@ -1096,6 +1109,79 @@ def trace_messages(messages: list[Any], *, content_limit: int = 2200) -> list[di
     return trace
 
 
+def _skill_records_from_text(text: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in SKILL_VIRTUAL_PATH_RE.finditer(text):
+        path = match.group("path")
+        skill = match.group("skill")
+        key = (skill, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({"skill": skill, "path": path})
+    return records
+
+
+def extract_skill_usage_from_trace(
+    trace: list[dict[str, Any]],
+    configured_sources: list[str] | None = None,
+) -> dict[str, Any]:
+    """Summarize whether a Deep Agent actually referenced or executed skill files."""
+    references: list[dict[str, Any]] = []
+    executions: list[dict[str, Any]] = []
+    skill_names: set[str] = set()
+    seen_references: set[tuple[Any, str, str, str]] = set()
+    seen_executions: set[tuple[Any, str, str, str]] = set()
+
+    for item in trace:
+        trace_index = item.get("index")
+        for call in item.get("tool_call_args", []):
+            tool_name = str(call.get("name") or "")
+            args = call.get("args") if isinstance(call, dict) else {}
+            if isinstance(args, str):
+                scan_text = args
+                command = args if tool_name == "execute" else ""
+            else:
+                scan_text = json.dumps(args, ensure_ascii=False, default=str)
+                command = str(args.get("command") or "") if isinstance(args, dict) else ""
+
+            for record in _skill_records_from_text(scan_text):
+                skill_names.add(record["skill"])
+                base = {
+                    "trace_index": trace_index,
+                    "tool": tool_name,
+                    "skill": record["skill"],
+                    "path": record["path"],
+                }
+                if tool_name == "execute":
+                    execution = {**base, "command": command[:1000]}
+                    key = (
+                        trace_index,
+                        execution["tool"],
+                        execution["skill"],
+                        execution["path"],
+                    )
+                    if key not in seen_executions:
+                        seen_executions.add(key)
+                        executions.append(execution)
+                else:
+                    key = (trace_index, base["tool"], base["skill"], base["path"])
+                    if key not in seen_references:
+                        seen_references.add(key)
+                        references.append(base)
+
+    return {
+        "configured": bool(configured_sources),
+        "configured_sources": configured_sources or [],
+        "referenced": bool(references),
+        "executed": bool(executions),
+        "skill_names": sorted(skill_names),
+        "references": references[:50],
+        "executions": executions[:50],
+    }
+
+
 def input_manifest() -> list[dict[str, str]]:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
@@ -1127,6 +1213,9 @@ def tool_names_for_profile(profile: DeepAgentProfile) -> list[str]:
 
 def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     model_note = f"; model={profile.deep_model}" if profile.deep_model else ""
+    vision_model_note = (
+        f"; vision_model={profile.vision_model}" if profile.vision_model else ""
+    )
     image_note = f"; image={profile.image}" if profile.image else ""
     toolset_note = f"; toolsets={', '.join(profile.toolsets)}" if profile.toolsets else ""
     tools_note = (
@@ -1148,7 +1237,8 @@ def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     return (
         f"- {profile.tool_name}: {profile.description} "
         f"(profile_id={profile.id}{toolset_note}{tools_note}{model_note}"
-        f"{image_note}{rounds_note}{input_note}{result_note}{self_check_note}{skill_note})"
+        f"{vision_model_note}{image_note}{rounds_note}{input_note}{result_note}"
+        f"{self_check_note}{skill_note})"
     )
 
 
@@ -1636,17 +1726,205 @@ def image_mime_type(path: Path) -> str:
     return "application/octet-stream"
 
 
+def active_vision_model_name() -> str:
+    if CONFIG is None:
+        return ""
+    configured = ACTIVE_DEEP_AGENT_VISION_MODEL or CONFIG.vision_model or CONFIG.deep_model
+    return openai_model_name(configured)
+
+
+def build_tiled_vision_image(
+    source: "Image.Image",
+    source_digest: str,
+    normalized_path: str,
+    grid: int,
+) -> tuple[bytes, dict[str, Any]]:
+    from PIL import Image
+
+    width, height = source.size
+    source_rgb = source.convert("RGB")
+    tiled = Image.new("RGB", (width * grid, height * grid), "white")
+    for y in range(grid):
+        for x in range(grid):
+            tiled.paste(source_rgb, (x * width, y * height))
+
+    buffer = BytesIO()
+    tiled.save(buffer, format="PNG")
+    payload = buffer.getvalue()
+
+    digest = hashlib.sha256((normalized_path + source_digest).encode("utf-8")).hexdigest()
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(normalized_path).stem).strip("._") or "image"
+    tile_name = f"{safe_stem}_tile{grid}x{grid}_{digest[:12]}.png"
+    virtual_path = ""
+    if CONFIG is not None and getattr(CONFIG, "output_dir", None):
+        tile_dir = CONFIG.output_dir / "_vision_tiles"
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        tile_path = tile_dir / tile_name
+        tile_path.write_bytes(payload)
+        virtual_path = f"/outputs/_vision_tiles/{tile_name}"
+
+    return payload, {
+        "applied": True,
+        "transform": f"tile_{grid}x{grid}",
+        "sent_width": width * grid,
+        "sent_height": height * grid,
+        "virtual_path": virtual_path,
+    }
+
+
+def content_bbox_for_padding(image: "Image.Image", background_threshold: int = 245) -> tuple[int, int, int, int]:
+    rgba = image.convert("RGBA")
+    arr = np.asarray(rgba)
+    alpha = arr[:, :, 3]
+    rgb = arr[:, :, :3].astype(np.int16)
+    non_white = np.any(rgb < background_threshold, axis=2)
+    content = (alpha > 0) & non_white
+    ys, xs = np.where(content)
+    if len(xs) == 0 or len(ys) == 0:
+        return 0, 0, image.width, image.height
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def add_padding_if_needed(
+    image: "Image.Image",
+    min_margin: int = VISION_MIN_MARGIN_PX,
+) -> tuple["Image.Image", dict[str, Any]]:
+    from PIL import Image
+
+    source = image.convert("RGBA")
+    width, height = source.size
+    left, top, right, bottom = content_bbox_for_padding(source)
+    margins = {
+        "left": left,
+        "top": top,
+        "right": width - right,
+        "bottom": height - bottom,
+    }
+    padding = {
+        side: max(0, min_margin - margin)
+        for side, margin in margins.items()
+    }
+    applied = any(value > 0 for value in padding.values())
+    if not applied:
+        return source.convert("RGB"), {
+            "applied": False,
+            "min_margin": min_margin,
+            "content_bbox": [left, top, right, bottom],
+            "margins": margins,
+        }
+
+    padded_rgba = Image.new(
+        "RGBA",
+        (width + padding["left"] + padding["right"], height + padding["top"] + padding["bottom"]),
+        (255, 255, 255, 255),
+    )
+    padded_rgba.paste(source, (padding["left"], padding["top"]), source)
+    padded = padded_rgba.convert("RGB")
+    return padded, {
+        "applied": True,
+        "min_margin": min_margin,
+        "content_bbox": [left, top, right, bottom],
+        "margins": margins,
+        "padding": padding,
+        "padded_width": padded.width,
+        "padded_height": padded.height,
+    }
+
+
+def save_prepared_vision_image(
+    image: "Image.Image",
+    normalized_path: str,
+    source_digest: str,
+    suffix: str,
+) -> str:
+    if CONFIG is None or not getattr(CONFIG, "output_dir", None):
+        return ""
+    digest = hashlib.sha256((normalized_path + source_digest + suffix).encode("utf-8")).hexdigest()
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(normalized_path).stem).strip("._") or "image"
+    file_name = f"{safe_stem}_{suffix}_{digest[:12]}.png"
+    prepared_dir = CONFIG.output_dir / "_vision_prepared"
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    path = prepared_dir / file_name
+    image.convert("RGB").save(path)
+    return f"/outputs/_vision_prepared/{file_name}"
+
+
+def prepare_vision_payload_bytes(
+    host_path: Path,
+    normalized_path: str,
+    mime: str,
+) -> tuple[bytes, str, dict[str, Any]]:
+    try:
+        from PIL import Image
+
+        with Image.open(host_path) as image:
+            original = image.convert("RGBA")
+        source_digest = sha256_file(host_path)
+        original_width, original_height = original.size
+        padded, padding_info = add_padding_if_needed(original)
+        transform: dict[str, Any] = {
+            "applied": bool(padding_info.get("applied")),
+            "source_width": original_width,
+            "source_height": original_height,
+            "padding": padding_info,
+        }
+
+        if CONFIG is not None and getattr(CONFIG, "tile_small_images_for_vision", False):
+            max_side = max(1, int(getattr(CONFIG, "vision_tile_max_side", 128)))
+            grid = max(2, min(int(getattr(CONFIG, "vision_tile_grid", 5)), 10))
+            if max(original_width, original_height) <= max_side:
+                tiled_bytes, tile_info = build_tiled_vision_image(
+                    padded,
+                    source_digest,
+                    normalized_path,
+                    grid,
+                )
+                transform.update(tile_info)
+                transform["applied"] = True
+                transform["max_side"] = max_side
+                return tiled_bytes, "image/png", transform
+            transform["reason"] = "image_not_small"
+            transform["max_side"] = max_side
+
+        if padding_info.get("applied"):
+            virtual_path = save_prepared_vision_image(
+                padded,
+                normalized_path,
+                source_digest,
+                "padded",
+            )
+            transform["transform"] = "pad_to_min_margin"
+            transform["sent_width"] = padded.width
+            transform["sent_height"] = padded.height
+            transform["virtual_path"] = virtual_path
+            buffer = BytesIO()
+            padded.save(buffer, format="PNG")
+            return buffer.getvalue(), "image/png", transform
+
+        original_bytes = host_path.read_bytes()
+        return original_bytes, mime, transform
+    except Exception as exc:
+        original_bytes = host_path.read_bytes()
+        return original_bytes, mime, {"applied": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
 @tool
 def inspect_sandbox_image(
     path: str,
     question: str,
     max_output_tokens: int = 1200,
 ) -> dict[str, Any]:
-    """Inspect an image under /input or /outputs using a vision-capable OpenAI model."""
+    """
+    Inspect an image under /input or /outputs using a vision-capable OpenAI model.
+
+    Image detail is fixed to OpenAI `original` internally and is not exposed as
+    a tool argument.
+    """
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     try:
         normalized, host_path = resolve_readable_virtual_path(path)
+        image_detail = "original"
         if not host_path.is_file():
             return {"ok": False, "path": normalized, "error": "not_a_file"}
         if host_path.stat().st_size > 20 * 1024 * 1024:
@@ -1661,13 +1939,19 @@ def inspect_sandbox_image(
             return {"ok": False, "path": normalized, "error": f"unsupported_mime:{mime}"}
 
         max_output_tokens = max(200, min(max_output_tokens, 4000))
-        data_url = (
-            f"data:{mime};base64,"
-            + base64.b64encode(host_path.read_bytes()).decode("ascii")
+        payload_bytes, sent_mime, vision_transform = prepare_vision_payload_bytes(
+            host_path,
+            normalized,
+            mime,
         )
+        data_url = (
+            f"data:{sent_mime};base64,"
+            + base64.b64encode(payload_bytes).decode("ascii")
+        )
+        vision_model = active_vision_model_name()
         client = OpenAI()
         response = client.responses.create(
-            model=openai_model_name(CONFIG.deep_model),
+            model=vision_model,
             input=[
                 {
                     "role": "user",
@@ -1681,7 +1965,11 @@ def inspect_sandbox_image(
                                 f"Question: {question}"
                             ),
                         },
-                        {"type": "input_image", "image_url": data_url},
+                        {
+                            "type": "input_image",
+                            "image_url": data_url,
+                            "detail": image_detail,
+                        },
                     ],
                 }
             ],
@@ -1692,8 +1980,11 @@ def inspect_sandbox_image(
             "ok": True,
             "path": normalized,
             "mime": mime,
+            "sent_mime": sent_mime,
             "bytes": host_path.stat().st_size,
-            "model": openai_model_name(CONFIG.deep_model),
+            "model": vision_model,
+            "detail": image_detail,
+            "vision_transform": vision_transform,
             "answer": text,
         }
     except Exception as exc:
@@ -3348,6 +3639,7 @@ def default_deep_agent_profile() -> DeepAgentProfile:
         skill_sources=CONFIG.skill_sources,
         image=CONFIG.image,
         deep_model=CONFIG.deep_model,
+        vision_model=CONFIG.vision_model,
         deep_recursion_limit=CONFIG.deep_recursion_limit,
         max_review_rounds=CONFIG.max_review_rounds,
     )
@@ -3391,7 +3683,8 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
     if "image_inspect" in profile.toolsets:
         image_text = (
             "Use inspect_sandbox_image for focused visual review after creating "
-            "crops, contact sheets, plots, or screenshots. "
+            "crops, contact sheets, plots, or screenshots. The tool uses "
+            "OpenAI image detail='original' internally for all vision reads. "
         )
     site_text = ""
     if "site_crawl" in profile.toolsets:
@@ -3581,6 +3874,7 @@ def execute_deep_agent_task(
         return {"ok": False, "error": "runner_config_missing"}
     effective_image = profile.image or CONFIG.image
     effective_model = profile.deep_model or CONFIG.deep_model
+    effective_vision_model = profile.vision_model or CONFIG.vision_model or effective_model
     effective_recursion_limit = profile.deep_recursion_limit or CONFIG.deep_recursion_limit
     effective_max_review_rounds = profile.max_review_rounds or CONFIG.max_review_rounds
     effective_skill_sources = profile.skill_sources or []
@@ -3699,9 +3993,10 @@ def execute_deep_agent_task(
     deep_error: dict[str, Any] | None = None
     inline_result = ""
     DEEP_AGENT_TRACE.clear()
-    global ACTIVE_DEEP_AGENT_TOOLSETS
+    global ACTIVE_DEEP_AGENT_TOOLSETS, ACTIVE_DEEP_AGENT_VISION_MODEL
     try:
         ACTIVE_DEEP_AGENT_TOOLSETS = set(profile.toolsets)
+        ACTIVE_DEEP_AGENT_VISION_MODEL = effective_vision_model
         deep_agent = create_deep_agent(
             model=effective_model,
             tools=selected_deep_tools,
@@ -3750,6 +4045,7 @@ def execute_deep_agent_task(
         )
     finally:
         ACTIVE_DEEP_AGENT_TOOLSETS = set()
+        ACTIVE_DEEP_AGENT_VISION_MODEL = ""
         workspace_dir = backend.workspace_dir
         backend.cleanup()
         workspace_exists = workspace_dir.exists()
@@ -3805,6 +4101,7 @@ def execute_deep_agent_task(
             "graceful_finalize": graceful_finalize_config,
             "image": effective_image,
             "deep_model": effective_model,
+            "vision_model": effective_vision_model,
             "deep_recursion_limit": effective_recursion_limit,
             "skill_sources": effective_skill_sources,
             "input_access": profile.input_access,
@@ -3835,6 +4132,10 @@ def execute_deep_agent_task(
         "deep_tool_calls": [
             name for item in DEEP_AGENT_TRACE for name in item.get("tool_calls", [])
         ],
+        "skill_usage": extract_skill_usage_from_trace(
+            DEEP_AGENT_TRACE,
+            effective_skill_sources,
+        ),
     }
     evaluation["ok"] = (
         artifact_check["ok"]
@@ -4069,6 +4370,12 @@ def run_parent_agent() -> dict[str, Any]:
                     "self_check_policy": profile.self_check_policy,
                     "image": profile.image or CONFIG.image,
                     "deep_model": profile.deep_model or CONFIG.deep_model,
+                    "vision_model": (
+                        profile.vision_model
+                        or CONFIG.vision_model
+                        or profile.deep_model
+                        or CONFIG.deep_model
+                    ),
                     "skill_sources": profile.skill_sources,
                 }
                 for profile in CONFIG.deep_agent_profiles
@@ -4084,6 +4391,7 @@ def run_parent_agent() -> dict[str, Any]:
                     "self_check_policy": "script",
                     "image": CONFIG.image,
                     "deep_model": CONFIG.deep_model,
+                    "vision_model": CONFIG.vision_model or CONFIG.deep_model,
                     "skill_sources": CONFIG.skill_sources,
                 }
             ],
@@ -4234,6 +4542,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--parent-model", default="openai:gpt-5.2")
     parser.add_argument("--deep-model", default="openai:gpt-5.2")
+    parser.add_argument(
+        "--vision-model",
+        default="",
+        help=(
+            "Optional model for inspect_sandbox_image/read_sandbox_file image vision. "
+            "Defaults to the active Deep Agent model. A profile-level vision_model "
+            "overrides this value."
+        ),
+    )
+    parser.add_argument(
+        "--tile-small-images-for-vision",
+        action="store_true",
+        help=(
+            "Experimental: when inspect_sandbox_image sends a small image to vision, "
+            "tile it into a repeated grid first. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--vision-tile-max-side",
+        type=int,
+        default=128,
+        help="Maximum image side in pixels for --tile-small-images-for-vision.",
+    )
+    parser.add_argument(
+        "--vision-tile-grid",
+        type=int,
+        default=5,
+        help="Grid size for --tile-small-images-for-vision. Default 5 makes 25 copies.",
+    )
     parser.add_argument("--parent-recursion-limit", type=int, default=12)
     parser.add_argument("--deep-recursion-limit", type=int, default=80)
     parser.add_argument(
@@ -4266,8 +4603,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_console_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def main() -> None:
     global CONFIG
+    configure_console_encoding()
     args = parse_args()
 
     load_dotenv(ROOT / ".env.local", override=False)
@@ -4322,6 +4670,7 @@ def main() -> None:
         wsl_distro=args.wsl_distro,
         parent_model=args.parent_model,
         deep_model=args.deep_model,
+        vision_model=args.vision_model,
         parent_recursion_limit=args.parent_recursion_limit,
         deep_recursion_limit=args.deep_recursion_limit,
         max_review_rounds=max(1, args.max_review_rounds),
@@ -4338,6 +4687,9 @@ def main() -> None:
         egress_proxy_url=args.egress_proxy_url,
         egress_proxy_signing_secret=args.egress_proxy_signing_secret,
         xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
+        tile_small_images_for_vision=args.tile_small_images_for_vision,
+        vision_tile_max_side=args.vision_tile_max_side,
+        vision_tile_grid=args.vision_tile_grid,
         deep_agent_profiles=deep_agent_profiles,
     )
 
