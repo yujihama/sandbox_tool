@@ -4,6 +4,7 @@ import argparse
 import base64
 import csv
 import hashlib
+from io import BytesIO
 import json
 import math
 import mimetypes
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest
@@ -89,8 +91,12 @@ class DeepAgentProfile:
     include_global_skills: bool = False
     image: str = ""
     deep_model: str = ""
+    vision_model: str = ""
     deep_recursion_limit: int | None = None
     max_review_rounds: int | None = None
+    graceful_finalize: dict[str, int] = field(default_factory=dict)
+    result_mode: str = "artifact"
+    self_check_policy: str = "script"
     source_path: str = ""
 
 
@@ -112,6 +118,7 @@ class RunnerConfig:
     wsl_distro: str
     parent_model: str
     deep_model: str
+    vision_model: str
     parent_recursion_limit: int
     deep_recursion_limit: int
     max_review_rounds: int
@@ -128,6 +135,9 @@ class RunnerConfig:
     egress_proxy_url: str
     egress_proxy_signing_secret: str
     xlsx_dangerous_formula_action: str
+    tile_small_images_for_vision: bool = False
+    vision_tile_max_side: int = 128
+    vision_tile_grid: int = 5
     deep_agent_profiles: list[DeepAgentProfile] = field(default_factory=list)
 
 
@@ -142,6 +152,11 @@ PLAYWRIGHT_DEFAULT_RATE_LIMIT_BACKOFF_MS = 5000
 PLAYWRIGHT_MAX_RATE_LIMIT_BACKOFF_MS = 60000
 PLAYWRIGHT_DOMAIN_LAST_FINISH: dict[str, float] = {}
 ACTIVE_DEEP_AGENT_TOOLSETS: set[str] = set()
+ACTIVE_DEEP_AGENT_VISION_MODEL = ""
+VISION_MIN_MARGIN_PX = 100
+SKILL_VIRTUAL_PATH_RE = re.compile(
+    r"(?P<path>/input/(?:skills|profile-skills)/(?P<skill>[^/\\\s\"'`]+)(?:/[^\\\s\"'`]+)*)"
+)
 
 TOOLSET_TOOL_NAMES: dict[str, list[str]] = {
     "review": ["request_parent_review"],
@@ -167,12 +182,26 @@ TOOLSET_DESCRIPTIONS: dict[str, str] = {
 ALLOWED_TOOLSETS = set(TOOLSET_TOOL_NAMES)
 FINALIZE_TOOL_ALLOWLIST = {
     "request_parent_review",
-    "read_sandbox_file",
-    "read_file",
     "write_file",
     "edit_file",
     "execute",
-    "ls",
+}
+STRICT_FINALIZE_TOOL_ALLOWLIST = {
+    "request_parent_review",
+}
+REPAIR_FINALIZE_TOOL_ALLOWLIST = {
+    "write_file",
+    "edit_file",
+    "execute",
+}
+GRACEFUL_FINALIZE_CONFIG_FIELDS = {
+    "warning_model_calls",
+    "finalize_model_calls",
+    "warning_tool_calls",
+    "finalize_tool_calls",
+    "warning_message_count",
+    "finalize_message_count",
+    "strict_finalize_after_model_calls",
 }
 
 
@@ -197,10 +226,15 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
         finalize_tool_calls: int,
         warning_message_count: int,
         finalize_message_count: int,
+        strict_finalize_after_model_calls: int = 2,
         finalize_tool_allowlist: set[str] | None = None,
+        result_mode: str = "artifact",
+        self_check_policy: str = "script",
     ) -> None:
         self.profile_id = profile_id
         self.expected_artifacts = expected_artifacts
+        self.result_mode = result_mode
+        self.self_check_policy = self_check_policy
         self.warning_model_calls = max(1, warning_model_calls)
         self.finalize_model_calls = max(self.warning_model_calls + 1, finalize_model_calls)
         self.warning_tool_calls = max(1, warning_tool_calls)
@@ -210,8 +244,11 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             self.warning_message_count + 1,
             finalize_message_count,
         )
+        self.strict_finalize_after_model_calls = max(1, strict_finalize_after_model_calls)
         self.finalize_tool_allowlist = finalize_tool_allowlist or FINALIZE_TOOL_ALLOWLIST
+        self.strict_finalize_tool_allowlist = STRICT_FINALIZE_TOOL_ALLOWLIST
         self.tool_calls = 0
+        self.finalize_model_calls_seen = 0
 
     def before_model(
         self, state: GracefulFinalizeState, runtime: Any
@@ -233,9 +270,13 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
         mode = self._mode_for_state(count, message_count, self.tool_calls)
 
         if mode == "finalize":
+            self.finalize_model_calls_seen += 1
             return handler(
                 request.override(
-                    tools=self.filter_finalize_tools(request.tools),
+                    tools=self.filter_finalize_tools(
+                        request.tools,
+                        allowlist=self.current_finalize_tool_allowlist(),
+                    ),
                     system_message=self._append_system_instruction(
                         request.system_message,
                         self.finalize_instruction(count, message_count),
@@ -269,7 +310,7 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             len(request.state.get("messages", [])),
             self.tool_calls,
         )
-        if mode == "finalize" and tool_name not in self.finalize_tool_allowlist:
+        if mode == "finalize" and tool_name not in self.current_finalize_tool_allowlist():
             tool_call = getattr(request, "tool_call", {}) or {}
             tool_call_id = str(tool_call.get("id") or tool_call.get("tool_call_id") or "")
             return ToolMessage(
@@ -280,8 +321,8 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
                         "tool": tool_name,
                         "message": (
                             "Execution budget is near the hard recursion limit. "
-                            "Exploration tools are disabled; finalize artifacts, "
-                            "run self-check, and request parent review."
+                            "Exploration tools are disabled; finalize with the "
+                            "current profile's completion contract."
                         ),
                     },
                     ensure_ascii=False,
@@ -335,11 +376,66 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
                 return str(item["name"])
         return str(getattr(item, "name", None) or getattr(item, "__name__", ""))
 
-    def filter_finalize_tools(self, tools: list[Any]) -> list[Any]:
+    def current_finalize_tool_allowlist(self) -> set[str]:
+        if self.finalize_model_calls_seen >= self.strict_finalize_after_model_calls:
+            if self.review_artifacts_look_ready():
+                return self.strict_finalize_tool_allowlist
+            return REPAIR_FINALIZE_TOOL_ALLOWLIST
+        return self.finalize_tool_allowlist
+
+    def review_artifacts_look_ready(self) -> bool:
+        if self.result_mode != "artifact":
+            return False
+        try:
+            for artifact in self.expected_artifacts:
+                path = resolve_sandbox_path(artifact)
+                if not path.is_file() or path.stat().st_size == 0:
+                    return False
+            if self.self_check_policy not in {"script", "checklist"}:
+                return True
+            plan_path = resolve_sandbox_path("/outputs/subtasks/self_check_plan.md")
+            report_path = resolve_sandbox_path("/outputs/subtasks/self_check_report.md")
+            if not plan_path.is_file() or not report_path.is_file():
+                return False
+            plan_text = plan_path.read_text(encoding="utf-8", errors="replace")
+            report_text = report_path.read_text(encoding="utf-8", errors="replace")
+            if review_markdown_blockers(plan_text, "self_check_plan.md"):
+                return False
+            report_findings = review_markdown_blockers(
+                report_text,
+                "self_check_report.md",
+            )
+            if report_findings:
+                return False
+            if self.self_check_policy == "script":
+                lower = report_text.lower()
+                if any(
+                    marker in lower
+                    for marker in (
+                        "pending",
+                        "not yet executed",
+                        "not executed",
+                        "未実行",
+                    )
+                ):
+                    return False
+                if not re.search(r"\b(?:pass|passed|self_check_pass)\b", lower):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def filter_finalize_tools(
+        self,
+        tools: list[Any],
+        *,
+        allowlist: set[str] | None = None,
+    ) -> list[Any]:
+        effective_allowlist = allowlist or self.finalize_tool_allowlist
         return [
             item
             for item in tools
-            if self._tool_name(item) in self.finalize_tool_allowlist
+            if self._tool_name(item) in effective_allowlist
         ]
 
     def warning_instruction(self, model_calls: int, message_count: int) -> str:
@@ -350,18 +446,52 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             f"messages={message_count}). Stop broad "
             "exploration now: do not start new crawls/browser searches unless a "
             "specific required URL is already identified. Prefer existing collected "
-            "evidence, narrow candidates, and move toward artifact creation, "
-            "self-check, and request_parent_review."
+            "evidence, narrow candidates, and move toward the profile's final "
+            "answer/review contract."
         )
 
     def finalize_instruction(self, model_calls: int, message_count: int) -> str:
+        if self.result_mode == "inline":
+            return (
+                "[Graceful finalize mode]\n"
+                f"Profile `{self.profile_id}` is near its execution budget "
+                f"(model_calls={model_calls}, tool_calls={self.tool_calls}, "
+                f"messages={message_count}). Stop exploration and return the "
+                "best supported inline answer now.\n\n"
+                "Rules:\n"
+                "- Do not perform new crawling, browser actions, broad searches, "
+                "or new candidate discovery.\n"
+                "- Do not create final reviewed artifacts and do not call "
+                "request_parent_review.\n"
+                "- Use only already collected evidence and files currently "
+                "available in /outputs or /input.\n"
+                "- Include a concise self-check checklist, uncertainty, and "
+                "limitations directly in the final answer."
+            )
         expected_text = "\n".join(f"- {path}" for path in self.expected_artifacts)
-        review_artifacts = list(dict.fromkeys([
-            *self.expected_artifacts,
-            "/outputs/subtasks/self_check_plan.md",
-            "/outputs/subtasks/self_check_report.md",
-        ]))
+        review_artifacts = [*self.expected_artifacts]
+        if self.self_check_policy in {"script", "checklist"}:
+            review_artifacts.extend(
+                [
+                    "/outputs/subtasks/self_check_plan.md",
+                    "/outputs/subtasks/self_check_report.md",
+                ]
+            )
+        review_artifacts = list(dict.fromkeys(review_artifacts))
         review_text = "\n".join(f"- {path}" for path in review_artifacts)
+        self_check_text = (
+            "Create or update `/outputs/subtasks/self_check_plan.md` and "
+            "`/outputs/subtasks/self_check_report.md`. Run a small self-check with "
+            "`execute` if possible; if not, write the limitation in the report.\n\n"
+            if self.self_check_policy == "script"
+            else (
+                "Create or update `/outputs/subtasks/self_check_plan.md` and "
+                "`/outputs/subtasks/self_check_report.md` with a concise checklist "
+                "self-check. Do not create or execute a separate self-check script.\n\n"
+                if self.self_check_policy == "checklist"
+                else "No self-check artifacts are required for this profile.\n\n"
+            )
+        )
         return (
             "[Graceful finalize mode]\n"
             f"Profile `{self.profile_id}` is near its execution budget "
@@ -379,9 +509,14 @@ class GracefulFinalizeMiddleware(AgentMiddleware[GracefulFinalizeState]):
             "in the requested format rather than continuing exploration.\n\n"
             "Required expected artifacts:\n"
             f"{expected_text}\n\n"
-            "Create or update `/outputs/subtasks/self_check_plan.md` and "
-            "`/outputs/subtasks/self_check_report.md`. Run a small self-check with "
-            "`execute` if possible; if not, write the limitation in the report.\n\n"
+            f"{self_check_text}"
+            "When documenting active-content checks in Markdown, escape raw HTML "
+            "tag examples such as `&lt;script&gt;`; do not write literal script "
+            "tags in Markdown review artifacts because the output gate rejects "
+            "active-content strings. Do not submit a placeholder or PENDING "
+            "self-check report; request_parent_review will reject it. If a "
+            "script self-check is required, execute the script and update the "
+            "report with a final pass/fail result before requesting review.\n\n"
             "Then call request_parent_review with exactly these review artifacts:\n"
             f"{review_text}\n\n"
             "After request_parent_review returns, stop."
@@ -461,6 +596,52 @@ def normalize_profile_input_access(value: Any, profile_path: Path) -> str:
     return access
 
 
+def normalize_profile_result_mode(value: Any, profile_path: Path) -> str:
+    if value is None or value == "":
+        return "artifact"
+    mode = str(value).strip().lower().replace("-", "_")
+    if mode not in {"artifact", "inline"}:
+        raise ValueError(
+            f"Deep Agent profile result_mode must be artifact or inline: {profile_path}"
+        )
+    return mode
+
+
+def normalize_profile_self_check_policy(value: Any, profile_path: Path) -> str:
+    if value is None or value == "":
+        return "script"
+    policy = str(value).strip().lower().replace("-", "_")
+    if policy not in {"script", "checklist", "none"}:
+        raise ValueError(
+            "Deep Agent profile self_check_policy must be script, checklist, "
+            f"or none: {profile_path}"
+        )
+    return policy
+
+
+def normalize_profile_graceful_finalize(value: Any, profile_path: Path) -> dict[str, int]:
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"graceful_finalize must be an object: {profile_path}")
+    normalized: dict[str, int] = {}
+    unknown = sorted(set(value) - GRACEFUL_FINALIZE_CONFIG_FIELDS)
+    if unknown:
+        raise ValueError(
+            "Unsupported graceful_finalize field(s) "
+            f"{', '.join(unknown)} in {profile_path}"
+        )
+    for key in GRACEFUL_FINALIZE_CONFIG_FIELDS:
+        raw = value.get(key)
+        if raw is None or raw == "":
+            continue
+        parsed = int(raw)
+        if parsed <= 0:
+            raise ValueError(f"graceful_finalize.{key} must be positive: {profile_path}")
+        normalized[key] = parsed
+    return normalized
+
+
 def read_profile_document(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
@@ -505,6 +686,10 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
 
     toolsets = validate_profile_toolsets(data.get("toolsets"), profile_path)
     input_access = normalize_profile_input_access(data.get("input_access"), profile_path)
+    result_mode = normalize_profile_result_mode(data.get("result_mode"), profile_path)
+    self_check_policy = normalize_profile_self_check_policy(
+        data.get("self_check_policy"), profile_path
+    )
     if input_access != "all" and "file_read" in toolsets:
         raise ValueError(
             "Profiles with input_access other than all must not include the "
@@ -525,8 +710,14 @@ def load_deep_agent_profile(path: str | Path) -> DeepAgentProfile:
         include_global_skills=bool(data.get("include_global_skills", False)),
         image=str(data.get("image") or "").strip(),
         deep_model=str(data.get("deep_model") or "").strip(),
+        vision_model=str(data.get("vision_model") or "").strip(),
         deep_recursion_limit=optional_int("deep_recursion_limit"),
         max_review_rounds=optional_int("max_review_rounds"),
+        graceful_finalize=normalize_profile_graceful_finalize(
+            data.get("graceful_finalize"), profile_path
+        ),
+        result_mode=result_mode,
+        self_check_policy=self_check_policy,
         source_path=str(profile_path),
     )
 
@@ -632,12 +823,18 @@ def normalize_expected_artifact(path: str) -> str:
     return normalized
 
 
-def normalize_tool_expected_artifacts(paths: list[str]) -> list[str]:
+def normalize_tool_expected_artifacts(
+    paths: list[str],
+    *,
+    allow_empty: bool = False,
+) -> list[str]:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
     normalized = [normalize_expected_artifact(path) for path in paths]
-    if not normalized:
+    if not normalized and not allow_empty:
         raise ValueError("expected_artifacts must include at least one artifact")
+    if not normalized:
+        return []
     allowed_final = set(CONFIG.expected_artifacts)
     invalid = [
         path
@@ -847,6 +1044,139 @@ def check_expected_artifacts(paths: list[str | Path]) -> dict[str, Any]:
     }
 
 
+def review_markdown_blockers(text: str, artifact_name: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    active_patterns = [
+        (r"<\s*/?\s*script\b", "literal_script_tag"),
+        (r"<\s*iframe\b", "literal_iframe_tag"),
+        (r"<\s*object\b", "literal_object_tag"),
+        (r"<\s*embed\b", "literal_embed_tag"),
+        (r"javascript\s*:", "javascript_url"),
+    ]
+    for pattern, code in active_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            line = text[: match.start()].count("\n") + 1
+            findings.append(
+                {
+                    "artifact": artifact_name,
+                    "code": code,
+                    "line": line,
+                    "message": (
+                        "Markdown review artifacts must escape active-content "
+                        "examples, e.g. use &lt;script&gt; or plain 'script tag'."
+                    ),
+                }
+            )
+    return findings
+
+
+def validate_review_artifact_preflight(artifacts: list[str]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        try:
+            path = resolve_sandbox_path(artifact)
+        except Exception as exc:
+            findings.append(
+                {
+                    "artifact": artifact,
+                    "code": "invalid_path",
+                    "message": str(exc),
+                }
+            )
+            continue
+        if not path.is_file():
+            findings.append(
+                {
+                    "artifact": artifact,
+                    "code": "missing_review_artifact",
+                    "message": "Review artifact does not exist or is not a file.",
+                }
+            )
+            continue
+        if path.stat().st_size == 0:
+            findings.append(
+                {
+                    "artifact": artifact,
+                    "code": "empty_review_artifact",
+                    "message": "Review artifact is empty.",
+                }
+            )
+            continue
+        if path.suffix.lower() == ".md":
+            text = path.read_text(encoding="utf-8", errors="replace")
+            findings.extend(review_markdown_blockers(text, path.name))
+            if path.name == "self_check_report.md":
+                lower = text.lower()
+                if any(
+                    marker in lower
+                    for marker in (
+                        "pending",
+                        "not yet executed",
+                        "not executed",
+                        "未実行",
+                    )
+                ):
+                    findings.append(
+                        {
+                            "artifact": artifact,
+                            "code": "self_check_report_pending",
+                            "message": (
+                                "Self-check report appears pending or not executed. "
+                                "Run the self-check and update the report before review."
+                            ),
+                        }
+                    )
+    return findings
+
+
+def build_unreviewed_artifact_salvage(
+    *,
+    profile: DeepAgentProfile,
+    effective_expected_artifacts: list[str],
+    artifact_check: dict[str, Any],
+    deep_error: dict[str, Any] | None,
+    review_requested: bool,
+    self_check_dir: Path,
+) -> dict[str, Any]:
+    if profile.result_mode == "inline" or deep_error is None or review_requested:
+        return {"available": False}
+    existing_expected = [
+        item.get("sandbox_path")
+        for item in artifact_check.get("artifacts", [])
+        if item.get("exists") and item.get("is_file")
+    ]
+    self_check_candidates: list[str] = []
+    for name in ("self_check_plan.md", "self_check_report.md"):
+        if (self_check_dir / name).exists():
+            self_check_candidates.append(f"/outputs/subtasks/{name}")
+    candidate_review_artifacts = list(
+        dict.fromkeys(
+            [
+                *(path for path in effective_expected_artifacts if path in existing_expected),
+                *self_check_candidates,
+            ]
+        )
+    )
+    if not candidate_review_artifacts:
+        return {"available": False}
+    return {
+        "available": True,
+        "reason": "deep_agent_error_before_parent_review",
+        "deep_error": deep_error,
+        "existing_expected_artifacts": existing_expected,
+        "self_check_artifacts": self_check_candidates,
+        "candidate_review_artifacts": candidate_review_artifacts,
+        "review_requested": False,
+        "gate_allowed": False,
+        "message": (
+            "Artifacts exist after a Deep Agent error, but request_parent_review "
+            "was not called. Treat them as unreviewed candidates only. Do not run "
+            "output gate until a later Deep Agent attempt explicitly requests review."
+        ),
+    }
+
+
 def wsl_podman_image_available(image: str, distro: str) -> bool:
     if shutil.which("wsl") is None:
         return False
@@ -1023,6 +1353,79 @@ def trace_messages(messages: list[Any], *, content_limit: int = 2200) -> list[di
     return trace
 
 
+def _skill_records_from_text(text: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in SKILL_VIRTUAL_PATH_RE.finditer(text):
+        path = match.group("path")
+        skill = match.group("skill")
+        key = (skill, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({"skill": skill, "path": path})
+    return records
+
+
+def extract_skill_usage_from_trace(
+    trace: list[dict[str, Any]],
+    configured_sources: list[str] | None = None,
+) -> dict[str, Any]:
+    """Summarize whether a Deep Agent actually referenced or executed skill files."""
+    references: list[dict[str, Any]] = []
+    executions: list[dict[str, Any]] = []
+    skill_names: set[str] = set()
+    seen_references: set[tuple[Any, str, str, str]] = set()
+    seen_executions: set[tuple[Any, str, str, str]] = set()
+
+    for item in trace:
+        trace_index = item.get("index")
+        for call in item.get("tool_call_args", []):
+            tool_name = str(call.get("name") or "")
+            args = call.get("args") if isinstance(call, dict) else {}
+            if isinstance(args, str):
+                scan_text = args
+                command = args if tool_name == "execute" else ""
+            else:
+                scan_text = json.dumps(args, ensure_ascii=False, default=str)
+                command = str(args.get("command") or "") if isinstance(args, dict) else ""
+
+            for record in _skill_records_from_text(scan_text):
+                skill_names.add(record["skill"])
+                base = {
+                    "trace_index": trace_index,
+                    "tool": tool_name,
+                    "skill": record["skill"],
+                    "path": record["path"],
+                }
+                if tool_name == "execute":
+                    execution = {**base, "command": command[:1000]}
+                    key = (
+                        trace_index,
+                        execution["tool"],
+                        execution["skill"],
+                        execution["path"],
+                    )
+                    if key not in seen_executions:
+                        seen_executions.add(key)
+                        executions.append(execution)
+                else:
+                    key = (trace_index, base["tool"], base["skill"], base["path"])
+                    if key not in seen_references:
+                        seen_references.add(key)
+                        references.append(base)
+
+    return {
+        "configured": bool(configured_sources),
+        "configured_sources": configured_sources or [],
+        "referenced": bool(references),
+        "executed": bool(executions),
+        "skill_names": sorted(skill_names),
+        "references": references[:50],
+        "executions": executions[:50],
+    }
+
+
 def input_manifest() -> list[dict[str, str]]:
     if CONFIG is None:
         raise RuntimeError("Runner config is not initialized.")
@@ -1045,12 +1448,22 @@ def tool_names_for_toolsets(toolsets: list[str]) -> list[str]:
     return names
 
 
+def tool_names_for_profile(profile: DeepAgentProfile) -> list[str]:
+    names = tool_names_for_toolsets(profile.toolsets)
+    if profile.result_mode == "inline":
+        names = [name for name in names if name != "request_parent_review"]
+    return names
+
+
 def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
     model_note = f"; model={profile.deep_model}" if profile.deep_model else ""
+    vision_model_note = (
+        f"; vision_model={profile.vision_model}" if profile.vision_model else ""
+    )
     image_note = f"; image={profile.image}" if profile.image else ""
     toolset_note = f"; toolsets={', '.join(profile.toolsets)}" if profile.toolsets else ""
     tools_note = (
-        f"; custom_tools={', '.join(tool_names_for_toolsets(profile.toolsets))}"
+        f"; custom_tools={', '.join(tool_names_for_profile(profile))}"
         if profile.toolsets
         else ""
     )
@@ -1060,13 +1473,21 @@ def profile_summary_for_prompt(profile: DeepAgentProfile) -> str:
         else ""
     )
     input_note = f"; input_access={profile.input_access}"
+    result_note = f"; result_mode={profile.result_mode}"
+    self_check_note = f"; self_check_policy={profile.self_check_policy}"
+    graceful_note = (
+        f"; graceful_finalize={json.dumps(profile.graceful_finalize, ensure_ascii=False)}"
+        if profile.graceful_finalize
+        else ""
+    )
     skill_note = (
         f"; skills={', '.join(profile.skill_sources)}" if profile.skill_sources else ""
     )
     return (
         f"- {profile.tool_name}: {profile.description} "
         f"(profile_id={profile.id}{toolset_note}{tools_note}{model_note}"
-        f"{image_note}{rounds_note}{input_note}{skill_note})"
+        f"{vision_model_note}{image_note}{rounds_note}{input_note}{result_note}"
+        f"{self_check_note}{graceful_note}{skill_note})"
     )
 
 
@@ -1108,23 +1529,30 @@ def build_parent_prompt() -> str:
         if CONFIG.deep_agent_profiles
         else f"Maximum Deep Agent attempts allowed: {CONFIG.max_review_rounds}"
     )
+    expected_text = "\n".join(f"- {path}" for path in CONFIG.expected_artifacts)
+    if not expected_text:
+        expected_text = "(none configured; inline-result profiles may be used)"
     return (
-        f"Run this task by delegating to {delegate_text}. The Deep Agent must request "
-        "parent review through its request_parent_review tool before the parent can close "
-        "the task.\n\n"
+        f"Run this task by delegating to {delegate_text}. Artifact-result profiles must "
+        "request parent review through request_parent_review before the parent can close "
+        "the task. Inline-result profiles do not create final artifacts, do not request "
+        "parent review, and should be closed from their inline_result when the tool "
+        "returns ok=true.\n\n"
         "Inputs available in the sandbox:\n"
         + "\n".join(f"- {item.sandbox_path}" for item in CONFIG.input_mappings)
         + "\n\nExpected artifacts:\n"
-        + "\n".join(f"- {path}" for path in CONFIG.expected_artifacts)
+        + expected_text
         + "\n\nOutput-gate allowed review/export extensions:\n"
         + ALLOWED_EXPORT_EXTENSIONS_TEXT
         + "\nDo not ask the Deep Agent to create final or review artifacts with any "
         "other extension. Helper scripts or working files may exist under /outputs, "
         "but they must not be passed as expected_artifacts or request_parent_review artifacts. "
-        "When you call a Deep Agent profile tool, pass the configured final artifacts "
-        "exactly as expected_artifacts. If you ask for additional self-check plan/report "
-        "review artifacts, place them under /outputs/subtasks/ and include them in the "
-        "Deep Agent task text, not as root-level expected_artifacts."
+        "When you call an artifact-result Deep Agent profile tool, pass the configured "
+        "final artifacts exactly as expected_artifacts. When you call an inline-result "
+        "profile tool, pass expected_artifacts=[] and do not run output gate afterward. "
+        "If you ask an artifact profile for additional self-check plan/report review "
+        "artifacts, place them under /outputs/subtasks/ and include them in the Deep "
+        "Agent task text, not as root-level expected_artifacts."
         + deep_agent_profile_prompt_section()
         + f"\n\n{attempt_limit_text}"
         + "\n\nUser task:\n"
@@ -1547,17 +1975,205 @@ def image_mime_type(path: Path) -> str:
     return "application/octet-stream"
 
 
+def active_vision_model_name() -> str:
+    if CONFIG is None:
+        return ""
+    configured = ACTIVE_DEEP_AGENT_VISION_MODEL or CONFIG.vision_model or CONFIG.deep_model
+    return openai_model_name(configured)
+
+
+def build_tiled_vision_image(
+    source: "Image.Image",
+    source_digest: str,
+    normalized_path: str,
+    grid: int,
+) -> tuple[bytes, dict[str, Any]]:
+    from PIL import Image
+
+    width, height = source.size
+    source_rgb = source.convert("RGB")
+    tiled = Image.new("RGB", (width * grid, height * grid), "white")
+    for y in range(grid):
+        for x in range(grid):
+            tiled.paste(source_rgb, (x * width, y * height))
+
+    buffer = BytesIO()
+    tiled.save(buffer, format="PNG")
+    payload = buffer.getvalue()
+
+    digest = hashlib.sha256((normalized_path + source_digest).encode("utf-8")).hexdigest()
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(normalized_path).stem).strip("._") or "image"
+    tile_name = f"{safe_stem}_tile{grid}x{grid}_{digest[:12]}.png"
+    virtual_path = ""
+    if CONFIG is not None and getattr(CONFIG, "output_dir", None):
+        tile_dir = CONFIG.output_dir / "_vision_tiles"
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        tile_path = tile_dir / tile_name
+        tile_path.write_bytes(payload)
+        virtual_path = f"/outputs/_vision_tiles/{tile_name}"
+
+    return payload, {
+        "applied": True,
+        "transform": f"tile_{grid}x{grid}",
+        "sent_width": width * grid,
+        "sent_height": height * grid,
+        "virtual_path": virtual_path,
+    }
+
+
+def content_bbox_for_padding(image: "Image.Image", background_threshold: int = 245) -> tuple[int, int, int, int]:
+    rgba = image.convert("RGBA")
+    arr = np.asarray(rgba)
+    alpha = arr[:, :, 3]
+    rgb = arr[:, :, :3].astype(np.int16)
+    non_white = np.any(rgb < background_threshold, axis=2)
+    content = (alpha > 0) & non_white
+    ys, xs = np.where(content)
+    if len(xs) == 0 or len(ys) == 0:
+        return 0, 0, image.width, image.height
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def add_padding_if_needed(
+    image: "Image.Image",
+    min_margin: int = VISION_MIN_MARGIN_PX,
+) -> tuple["Image.Image", dict[str, Any]]:
+    from PIL import Image
+
+    source = image.convert("RGBA")
+    width, height = source.size
+    left, top, right, bottom = content_bbox_for_padding(source)
+    margins = {
+        "left": left,
+        "top": top,
+        "right": width - right,
+        "bottom": height - bottom,
+    }
+    padding = {
+        side: max(0, min_margin - margin)
+        for side, margin in margins.items()
+    }
+    applied = any(value > 0 for value in padding.values())
+    if not applied:
+        return source.convert("RGB"), {
+            "applied": False,
+            "min_margin": min_margin,
+            "content_bbox": [left, top, right, bottom],
+            "margins": margins,
+        }
+
+    padded_rgba = Image.new(
+        "RGBA",
+        (width + padding["left"] + padding["right"], height + padding["top"] + padding["bottom"]),
+        (255, 255, 255, 255),
+    )
+    padded_rgba.paste(source, (padding["left"], padding["top"]), source)
+    padded = padded_rgba.convert("RGB")
+    return padded, {
+        "applied": True,
+        "min_margin": min_margin,
+        "content_bbox": [left, top, right, bottom],
+        "margins": margins,
+        "padding": padding,
+        "padded_width": padded.width,
+        "padded_height": padded.height,
+    }
+
+
+def save_prepared_vision_image(
+    image: "Image.Image",
+    normalized_path: str,
+    source_digest: str,
+    suffix: str,
+) -> str:
+    if CONFIG is None or not getattr(CONFIG, "output_dir", None):
+        return ""
+    digest = hashlib.sha256((normalized_path + source_digest + suffix).encode("utf-8")).hexdigest()
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(normalized_path).stem).strip("._") or "image"
+    file_name = f"{safe_stem}_{suffix}_{digest[:12]}.png"
+    prepared_dir = CONFIG.output_dir / "_vision_prepared"
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    path = prepared_dir / file_name
+    image.convert("RGB").save(path)
+    return f"/outputs/_vision_prepared/{file_name}"
+
+
+def prepare_vision_payload_bytes(
+    host_path: Path,
+    normalized_path: str,
+    mime: str,
+) -> tuple[bytes, str, dict[str, Any]]:
+    try:
+        from PIL import Image
+
+        with Image.open(host_path) as image:
+            original = image.convert("RGBA")
+        source_digest = sha256_file(host_path)
+        original_width, original_height = original.size
+        padded, padding_info = add_padding_if_needed(original)
+        transform: dict[str, Any] = {
+            "applied": bool(padding_info.get("applied")),
+            "source_width": original_width,
+            "source_height": original_height,
+            "padding": padding_info,
+        }
+
+        if CONFIG is not None and getattr(CONFIG, "tile_small_images_for_vision", False):
+            max_side = max(1, int(getattr(CONFIG, "vision_tile_max_side", 128)))
+            grid = max(2, min(int(getattr(CONFIG, "vision_tile_grid", 5)), 10))
+            if max(original_width, original_height) <= max_side:
+                tiled_bytes, tile_info = build_tiled_vision_image(
+                    padded,
+                    source_digest,
+                    normalized_path,
+                    grid,
+                )
+                transform.update(tile_info)
+                transform["applied"] = True
+                transform["max_side"] = max_side
+                return tiled_bytes, "image/png", transform
+            transform["reason"] = "image_not_small"
+            transform["max_side"] = max_side
+
+        if padding_info.get("applied"):
+            virtual_path = save_prepared_vision_image(
+                padded,
+                normalized_path,
+                source_digest,
+                "padded",
+            )
+            transform["transform"] = "pad_to_min_margin"
+            transform["sent_width"] = padded.width
+            transform["sent_height"] = padded.height
+            transform["virtual_path"] = virtual_path
+            buffer = BytesIO()
+            padded.save(buffer, format="PNG")
+            return buffer.getvalue(), "image/png", transform
+
+        original_bytes = host_path.read_bytes()
+        return original_bytes, mime, transform
+    except Exception as exc:
+        original_bytes = host_path.read_bytes()
+        return original_bytes, mime, {"applied": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+
 @tool
 def inspect_sandbox_image(
     path: str,
     question: str,
     max_output_tokens: int = 1200,
 ) -> dict[str, Any]:
-    """Inspect an image under /input or /outputs using a vision-capable OpenAI model."""
+    """
+    Inspect an image under /input or /outputs using a vision-capable OpenAI model.
+
+    Image detail is fixed to OpenAI `original` internally and is not exposed as
+    a tool argument.
+    """
     if CONFIG is None:
         return {"ok": False, "error": "runner_config_missing"}
     try:
         normalized, host_path = resolve_readable_virtual_path(path)
+        image_detail = "original"
         if not host_path.is_file():
             return {"ok": False, "path": normalized, "error": "not_a_file"}
         if host_path.stat().st_size > 20 * 1024 * 1024:
@@ -1572,13 +2188,19 @@ def inspect_sandbox_image(
             return {"ok": False, "path": normalized, "error": f"unsupported_mime:{mime}"}
 
         max_output_tokens = max(200, min(max_output_tokens, 4000))
-        data_url = (
-            f"data:{mime};base64,"
-            + base64.b64encode(host_path.read_bytes()).decode("ascii")
+        payload_bytes, sent_mime, vision_transform = prepare_vision_payload_bytes(
+            host_path,
+            normalized,
+            mime,
         )
+        data_url = (
+            f"data:{sent_mime};base64,"
+            + base64.b64encode(payload_bytes).decode("ascii")
+        )
+        vision_model = active_vision_model_name()
         client = OpenAI()
         response = client.responses.create(
-            model=openai_model_name(CONFIG.deep_model),
+            model=vision_model,
             input=[
                 {
                     "role": "user",
@@ -1592,7 +2214,11 @@ def inspect_sandbox_image(
                                 f"Question: {question}"
                             ),
                         },
-                        {"type": "input_image", "image_url": data_url},
+                        {
+                            "type": "input_image",
+                            "image_url": data_url,
+                            "detail": image_detail,
+                        },
                     ],
                 }
             ],
@@ -1603,8 +2229,11 @@ def inspect_sandbox_image(
             "ok": True,
             "path": normalized,
             "mime": mime,
+            "sent_mime": sent_mime,
             "bytes": host_path.stat().st_size,
-            "model": openai_model_name(CONFIG.deep_model),
+            "model": vision_model,
+            "detail": image_detail,
+            "vision_transform": vision_transform,
             "answer": text,
         }
     except Exception as exc:
@@ -3157,22 +3786,23 @@ def inspect_self_check_artifacts(max_chars: int = 16000) -> dict[str, Any]:
         return {"ok": False, "error": "runner_config_missing"}
 
     output_dir = CONFIG.output_dir
+    self_check_dir = output_dir / "subtasks"
     script_candidates = sorted(
         [
             path
-            for path in output_dir.glob("self_check.*")
+            for path in self_check_dir.glob("self_check.*")
             if path.name not in {"self_check_plan.md", "self_check_report.md"}
             and path.is_file()
         ],
         key=lambda path: path.name.lower(),
     )
     paths = [
-        "/outputs/self_check_plan.md",
+        "/outputs/subtasks/self_check_plan.md",
         *[
             "/outputs/" + path.relative_to(output_dir).as_posix()
             for path in script_candidates[:10]
         ],
-        "/outputs/self_check_report.md",
+        "/outputs/subtasks/self_check_report.md",
     ]
     inspections = [
         read_sandbox_file.invoke(
@@ -3180,10 +3810,18 @@ def inspect_self_check_artifacts(max_chars: int = 16000) -> dict[str, Any]:
         )
         for path in paths
     ]
-    plan_exists = (output_dir / "self_check_plan.md").exists()
-    report_exists = (output_dir / "self_check_report.md").exists()
+    plan_exists = (self_check_dir / "self_check_plan.md").exists()
+    report_exists = (self_check_dir / "self_check_report.md").exists()
+    latest_policy = (
+        DEEP_AGENT_EVALUATIONS[-1].get("profile", {}).get("self_check_policy", "script")
+        if DEEP_AGENT_EVALUATIONS
+        else "script"
+    )
+    script_required = latest_policy == "script"
     return {
-        "ok": plan_exists and report_exists and bool(script_candidates),
+        "ok": plan_exists and report_exists and (not script_required or bool(script_candidates)),
+        "self_check_policy": latest_policy,
+        "script_required": script_required,
         "plan_exists": plan_exists,
         "report_exists": report_exists,
         "script_candidates": [path.name for path in script_candidates],
@@ -3220,6 +3858,20 @@ def request_parent_review(
                 "images, PDFs, or other helper files in request_parent_review."
             ),
         }
+    preflight_findings = validate_review_artifact_preflight(normalized_artifacts)
+    if preflight_findings:
+        return {
+            "ok": False,
+            "review_requested": False,
+            "error": "review_preflight_failed",
+            "findings": preflight_findings,
+            "message": (
+                "Review artifacts are not ready. Fix the findings, rerun any "
+                "required self-check, update the report, then call "
+                "request_parent_review again. Do not submit placeholder or "
+                "pending self-check reports."
+            ),
+        }
     request = {
         "attempt": len(DEEP_AGENT_EVALUATIONS) + 1,
         "artifacts": normalized_artifacts,
@@ -3250,6 +3902,7 @@ def default_deep_agent_profile() -> DeepAgentProfile:
         skill_sources=CONFIG.skill_sources,
         image=CONFIG.image,
         deep_model=CONFIG.deep_model,
+        vision_model=CONFIG.vision_model,
         deep_recursion_limit=CONFIG.deep_recursion_limit,
         max_review_rounds=CONFIG.max_review_rounds,
     )
@@ -3264,11 +3917,13 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "Profile-specific instructions:\n"
             f"{profile.system_prompt.strip()}\n\n"
         )
-    toolset_lines = [
-        f"- {toolset}: {TOOLSET_DESCRIPTIONS[toolset]} "
-        f"({', '.join(TOOLSET_TOOL_NAMES[toolset])})"
-        for toolset in profile.toolsets
-    ]
+    toolset_lines: list[str] = []
+    for toolset in profile.toolsets:
+        names = list(TOOLSET_TOOL_NAMES[toolset])
+        if profile.result_mode == "inline" and toolset == "review":
+            names = []
+        suffix = f"({', '.join(names)})" if names else "(disabled for inline result mode)"
+        toolset_lines.append(f"- {toolset}: {TOOLSET_DESCRIPTIONS[toolset]} {suffix}")
     toolset_block = (
         "Available custom toolsets for this profile:\n"
         + "\n".join(toolset_lines)
@@ -3291,7 +3946,8 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
     if "image_inspect" in profile.toolsets:
         image_text = (
             "Use inspect_sandbox_image for focused visual review after creating "
-            "crops, contact sheets, plots, or screenshots. "
+            "crops, contact sheets, plots, or screenshots. The tool uses "
+            "OpenAI image detail='original' internally for all vision reads. "
         )
     site_text = ""
     if "site_crawl" in profile.toolsets:
@@ -3321,18 +3977,83 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
             "HTTP 429 or Too Many Requests appears, back off and report the "
             "limitation rather than increasing request volume. "
         )
+    if profile.result_mode == "inline":
+        output_text = (
+            "Return the final answer directly; use /outputs only for temporary helper "
+            "files if needed. "
+        )
+    else:
+        output_text = "Write final artifacts under /outputs. "
     if profile.input_access == "all":
-        input_text = "Read task inputs only from /input and write final artifacts under /outputs. "
+        input_text = "Read task inputs only from /input. " + output_text
     elif profile.input_access == "skills_only":
         input_text = (
             "No user task input files are mounted in this profile. /input contains "
-            "profile skills only; do not treat it as task evidence. Write final "
-            "artifacts under /outputs. "
+            "profile skills only; do not treat it as task evidence. " + output_text
         )
     else:
         input_text = (
-            "No user task input files are mounted in this profile. Write final "
-            "artifacts under /outputs. "
+            "No user task input files are mounted in this profile. " + output_text
+        )
+    if profile.result_mode == "inline":
+        completion_contract = (
+            "This profile uses inline result mode. Do not create final reviewed "
+            "artifacts unless they are purely temporary helper files, and do not call "
+            "request_parent_review. Return the final answer directly in your last "
+            "message. Keep it concise but include the answer, confidence, evidence "
+            "used, uncertainty/limitations, and a short self-check checklist. "
+        )
+    elif profile.self_check_policy == "script":
+        completion_contract = (
+            "Before requesting parent review, you must perform an autonomous self-check. "
+            "This self-check is task-specific and you must design it yourself; do not "
+            "wait for a prebuilt validator. Required self-check artifacts: "
+            "`/outputs/subtasks/self_check_plan.md`, one executable check script such as "
+            "`/outputs/subtasks/self_check.py` or `/outputs/subtasks/self_check.js`, and "
+            "`/outputs/subtasks/self_check_report.md`. The plan must explain what you will verify "
+            "against the user task. The script must inspect the generated artifacts and, "
+            "when relevant, execute code, parse files, load workbooks, validate CSV/JSON, "
+            "or run smoke tests using available local tools. If a headless browser is "
+            "available for HTML tasks, use it; otherwise run the strongest available "
+            "syntax/reference checks and state the limitation. Execute the self-check "
+            "script with the `execute` tool. If it fails, fix the artifact and rerun the "
+            "self-check before requesting review. The report must include command(s) run, "
+            "pass/fail status, checked files, limitations, and remaining known issues. "
+            "When describing checks for active HTML content in Markdown artifacts, escape "
+            "raw tag examples such as `&lt;script&gt;`; do not write literal script tags "
+            "because the output gate rejects active-content strings. Do not submit a "
+            "placeholder or PENDING self-check report; request_parent_review will reject it. "
+            "When you believe the expected artifacts are ready for review, you must "
+            "call request_parent_review with the final artifact paths, a concise summary of "
+            "what you produced, and any known issues. Include `/outputs/subtasks/self_check_plan.md` "
+            "and `/outputs/subtasks/self_check_report.md` in the review request artifacts list, but "
+            "do not include the executable self-check script because code is not an allowed "
+            "export format. Call review after creating or updating "
+            "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
+            "for this attempt and respond concisely with the paths awaiting review. "
+            "If this invocation contains parent correction feedback from a previous "
+            "review, fix the issues first, rerun self-check, then call "
+            "request_parent_review again."
+        )
+    elif profile.self_check_policy == "checklist":
+        completion_contract = (
+            "Before requesting parent review, perform a lightweight autonomous "
+            "checklist self-check. Create `/outputs/subtasks/self_check_plan.md` "
+            "and `/outputs/subtasks/self_check_report.md`, but do not create or "
+            "execute a separate self-check script unless the task explicitly needs "
+            "one. The report must state pass/fail status, checked evidence/files, "
+            "limitations, and remaining known issues. When expected artifacts are "
+            "ready, call request_parent_review with the final artifact paths plus "
+            "`/outputs/subtasks/self_check_plan.md` and "
+            "`/outputs/subtasks/self_check_report.md`. After the review request "
+            "tool returns, stop work."
+        )
+    else:
+        completion_contract = (
+            "This profile does not require self-check artifacts. When expected "
+            "artifacts are ready, call request_parent_review with the final artifact "
+            "paths, a concise summary, and known issues. After the review request "
+            "tool returns, stop work."
         )
     return (
         profile_block
@@ -3349,31 +4070,7 @@ def build_deep_agent_system_prompt(profile: DeepAgentProfile) -> str:
         + site_text
         + browser_text
         + "Cite inspected file paths and any uncertainty in your artifacts. "
-        "Before requesting parent review, you must perform an autonomous self-check. "
-        "This self-check is task-specific and you must design it yourself; do not "
-        "wait for a prebuilt validator. Required self-check artifacts: "
-        "`/outputs/self_check_plan.md`, one executable check script such as "
-        "`/outputs/self_check.py` or `/outputs/self_check.js`, and "
-        "`/outputs/self_check_report.md`. The plan must explain what you will verify "
-        "against the user task. The script must inspect the generated artifacts and, "
-        "when relevant, execute code, parse files, load workbooks, validate CSV/JSON, "
-        "or run smoke tests using available local tools. If a headless browser is "
-        "available for HTML tasks, use it; otherwise run the strongest available "
-        "syntax/reference checks and state the limitation. Execute the self-check "
-        "script with the `execute` tool. If it fails, fix the artifact and rerun the "
-        "self-check before requesting review. The report must include command(s) run, "
-        "pass/fail status, checked files, limitations, and remaining known issues. "
-        "When you believe the expected artifacts are ready for review, you must "
-        "call request_parent_review with the final artifact paths, a concise summary of "
-        "what you produced, and any known issues. Include `/outputs/self_check_plan.md` "
-        "and `/outputs/self_check_report.md` in the review request artifacts list, but "
-        "do not include the executable self-check script because code is not an allowed "
-        "export format. Call review after creating or updating "
-        "the artifacts and completing the self-check, not before. After the review request tool returns, stop work "
-        "for this attempt and respond concisely with the paths awaiting review. "
-        "If this invocation contains parent correction feedback from a previous "
-        "review, fix the issues first, rerun self-check, then call "
-        "request_parent_review again."
+        + completion_contract
     )
 
 
@@ -3395,6 +4092,8 @@ def deep_agent_tools_for_profile(profile: DeepAgentProfile) -> list[Any]:
     selected: list[Any] = []
     seen_names: set[str] = set()
     for toolset in profile.toolsets:
+        if profile.result_mode == "inline" and toolset == "review":
+            continue
         for item in tools_by_toolset[toolset]:
             name = getattr(item, "name", None) or getattr(item, "__name__", str(item))
             if name in seen_names:
@@ -3404,24 +4103,38 @@ def deep_agent_tools_for_profile(profile: DeepAgentProfile) -> list[Any]:
     return selected
 
 
-def graceful_finalize_thresholds(recursion_limit: int) -> dict[str, int]:
-    finalize_model_calls = max(8, min(30, recursion_limit // 4))
-    warning_model_calls = max(4, int(finalize_model_calls * 0.75))
-    finalize_tool_calls = max(8, min(24, recursion_limit // 5))
-    warning_tool_calls = max(4, int(finalize_tool_calls * 0.75))
-    warning_message_count = max(12, int(recursion_limit * 0.55))
-    finalize_message_count = max(
-        warning_message_count + 4,
-        int(recursion_limit * 0.70),
-    )
-    return {
+def graceful_finalize_thresholds(
+    recursion_limit: int,
+    overrides: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """Choose conservative finalize thresholds before LangGraph's hard limit.
+
+    LangGraph's recursion_limit counts graph supersteps, not only visible model
+    or tool calls. Deep Agents add filesystem, todo, summarization, and tool
+    patching nodes, so visible message counts need to trigger finalization well
+    before the hard recursion limit.
+    """
+    safe_limit = max(10, recursion_limit)
+    finalize_model_calls = max(6, min(30, int(safe_limit * 0.16)))
+    warning_model_calls = max(4, int(finalize_model_calls * 0.70))
+    finalize_tool_calls = max(6, min(16, int(safe_limit * 0.12)))
+    warning_tool_calls = max(4, int(finalize_tool_calls * 0.70))
+    finalize_message_count = max(20, min(60, int(safe_limit * 0.38)))
+    warning_message_count = max(12, int(finalize_message_count * 0.70))
+    thresholds = {
         "warning_model_calls": warning_model_calls,
         "finalize_model_calls": finalize_model_calls,
         "warning_tool_calls": warning_tool_calls,
         "finalize_tool_calls": finalize_tool_calls,
         "warning_message_count": warning_message_count,
         "finalize_message_count": finalize_message_count,
+        "strict_finalize_after_model_calls": 2,
     }
+    for key, value in (overrides or {}).items():
+        if key not in GRACEFUL_FINALIZE_CONFIG_FIELDS:
+            raise ValueError(f"Unsupported graceful finalize override: {key}")
+        thresholds[key] = value
+    return thresholds
 
 
 def execute_deep_agent_task(
@@ -3442,12 +4155,30 @@ def execute_deep_agent_task(
         return {"ok": False, "error": "runner_config_missing"}
     effective_image = profile.image or CONFIG.image
     effective_model = profile.deep_model or CONFIG.deep_model
+    effective_vision_model = profile.vision_model or CONFIG.vision_model or effective_model
     effective_recursion_limit = profile.deep_recursion_limit or CONFIG.deep_recursion_limit
     effective_max_review_rounds = profile.max_review_rounds or CONFIG.max_review_rounds
     effective_skill_sources = profile.skill_sources or []
     effective_input_dir = profile_input_dir(profile)
     try:
-        effective_expected_artifacts = normalize_tool_expected_artifacts(expected_artifacts)
+        effective_expected_artifacts = normalize_tool_expected_artifacts(
+            expected_artifacts,
+            allow_empty=profile.result_mode == "inline",
+        )
+        if profile.result_mode == "inline" and effective_expected_artifacts:
+            return {
+                "ok": False,
+                "error": "inline_profile_does_not_accept_expected_artifacts",
+                "message": (
+                    "This profile returns an inline result. Call it with "
+                    "expected_artifacts=[] and do not run output gate."
+                ),
+                "profile": {
+                    "id": profile.id,
+                    "tool_name": profile.tool_name,
+                    "result_mode": profile.result_mode,
+                },
+            }
     except Exception as exc:
         return {
             "ok": False,
@@ -3480,17 +4211,29 @@ def execute_deep_agent_task(
     latest_cleanup_path = log_dir / "cleanup_report.json"
     latest_evaluation_path = log_dir / "parent_tool_evaluation.json"
 
-    task_with_contract = (
-        "Expected review/export artifacts for this invocation:\n"
-        + "\n".join(f"- {path}" for path in effective_expected_artifacts)
-        + "\n\nAllowed review/export extensions: "
-        + ALLOWED_EXPORT_EXTENSIONS_TEXT
-        + "\nDo not pass helper scripts, images, PDFs, or other non-allowed files "
-        "to request_parent_review. If structured data is needed as a reviewed artifact, "
-        "write CSV/XLSX/JSON/YAML or include it in a Markdown report.\n\n"
-        "Task instructions:\n"
-        + task
-    )
+    if profile.result_mode == "inline":
+        task_with_contract = (
+            "This invocation uses inline result mode.\n"
+            "- Expected review/export artifacts: none.\n"
+            "- Do not create final reviewed files unless they are temporary helper files.\n"
+            "- Do not call request_parent_review.\n"
+            "- Return the final answer directly in your last message with confidence, "
+            "evidence, uncertainty/limitations, and a short self-check checklist.\n\n"
+            "Task instructions:\n"
+            + task
+        )
+    else:
+        task_with_contract = (
+            "Expected review/export artifacts for this invocation:\n"
+            + "\n".join(f"- {path}" for path in effective_expected_artifacts)
+            + "\n\nAllowed review/export extensions: "
+            + ALLOWED_EXPORT_EXTENSIONS_TEXT
+            + "\nDo not pass helper scripts, images, PDFs, or other non-allowed files "
+            "to request_parent_review. If structured data is needed as a reviewed artifact, "
+            "write CSV/XLSX/JSON/YAML or include it in a Markdown report.\n\n"
+            "Task instructions:\n"
+            + task
+        )
 
     deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
     latest_deep_prompt_path.write_text(task_with_contract, encoding="utf-8")
@@ -3526,13 +4269,18 @@ def execute_deep_agent_task(
         getattr(item, "name", None) or getattr(item, "__name__", str(item))
         for item in selected_deep_tools
     ]
-    graceful_finalize_config = graceful_finalize_thresholds(effective_recursion_limit)
+    graceful_finalize_config = graceful_finalize_thresholds(
+        effective_recursion_limit,
+        profile.graceful_finalize,
+    )
 
     deep_error: dict[str, Any] | None = None
+    inline_result = ""
     DEEP_AGENT_TRACE.clear()
-    global ACTIVE_DEEP_AGENT_TOOLSETS
+    global ACTIVE_DEEP_AGENT_TOOLSETS, ACTIVE_DEEP_AGENT_VISION_MODEL
     try:
         ACTIVE_DEEP_AGENT_TOOLSETS = set(profile.toolsets)
+        ACTIVE_DEEP_AGENT_VISION_MODEL = effective_vision_model
         deep_agent = create_deep_agent(
             model=effective_model,
             tools=selected_deep_tools,
@@ -3543,21 +4291,34 @@ def execute_deep_agent_task(
                 GracefulFinalizeMiddleware(
                     profile_id=profile.id,
                     expected_artifacts=effective_expected_artifacts,
+                    result_mode=profile.result_mode,
+                    self_check_policy=profile.self_check_policy,
                     **graceful_finalize_config,
                 )
             ],
         )
-        deep_result = deep_agent.invoke(
-            {"messages": [{"role": "user", "content": task_with_contract}]},
-            config={
-                "configurable": {
-                    "thread_id": f"deep-agent-{safe_tool_name(profile.id)}-task"
-                },
-                "recursion_limit": effective_recursion_limit,
+        latest_messages: list[Any] = []
+        stream_config = {
+            "configurable": {
+                "thread_id": f"deep-agent-{safe_tool_name(profile.id)}-task"
             },
-        )
-        messages = deep_result["messages"]
-        DEEP_AGENT_TRACE.extend(trace_messages(messages, content_limit=2600))
+            "recursion_limit": effective_recursion_limit,
+        }
+        for chunk in deep_agent.stream(
+            {"messages": [{"role": "user", "content": task_with_contract}]},
+            config=stream_config,
+            stream_mode="values",
+        ):
+            if isinstance(chunk, dict) and chunk.get("messages"):
+                latest_messages = list(chunk["messages"])
+                DEEP_AGENT_TRACE[:] = trace_messages(latest_messages, content_limit=2600)
+                latest_deep_trace_path.write_text(
+                    json.dumps(DEEP_AGENT_TRACE, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        if latest_messages:
+            inline_result = content_text(getattr(latest_messages[-1], "content", ""))
+            DEEP_AGENT_TRACE[:] = trace_messages(latest_messages, content_limit=2600)
         deep_trace_path.write_text(
             json.dumps(DEEP_AGENT_TRACE, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -3568,16 +4329,23 @@ def execute_deep_agent_task(
         )
     except Exception as exc:
         deep_error = {"type": exc.__class__.__name__, "message": str(exc)[:2000]}
+        error_trace: dict[str, Any] | list[dict[str, Any]]
+        error_trace = (
+            {"error": deep_error, "partial_trace": DEEP_AGENT_TRACE}
+            if DEEP_AGENT_TRACE
+            else {"error": deep_error}
+        )
         deep_trace_path.write_text(
-            json.dumps({"error": deep_error}, ensure_ascii=False, indent=2),
+            json.dumps(error_trace, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         latest_deep_trace_path.write_text(
-            json.dumps({"error": deep_error}, ensure_ascii=False, indent=2),
+            json.dumps(error_trace, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     finally:
         ACTIVE_DEEP_AGENT_TOOLSETS = set()
+        ACTIVE_DEEP_AGENT_VISION_MODEL = ""
         workspace_dir = backend.workspace_dir
         backend.cleanup()
         workspace_exists = workspace_dir.exists()
@@ -3603,13 +4371,18 @@ def execute_deep_agent_task(
             encoding="utf-8",
         )
 
-    artifact_check = check_expected_artifacts(effective_expected_artifacts)
+    artifact_check = (
+        {"artifacts": [], "ok": True, "missing": []}
+        if profile.result_mode == "inline"
+        else check_expected_artifacts(effective_expected_artifacts)
+    )
     cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
     attempt_review_requests = DEEP_REVIEW_REQUESTS[review_start:]
+    self_check_dir = CONFIG.output_dir / "subtasks"
     self_check_scripts = sorted(
         [
-            path.name
-            for path in CONFIG.output_dir.glob("self_check.*")
+            path.relative_to(CONFIG.output_dir).as_posix()
+            for path in self_check_dir.glob("self_check.*")
             if path.name not in {"self_check_plan.md", "self_check_report.md"}
             and path.is_file()
         ]
@@ -3622,10 +4395,13 @@ def execute_deep_agent_task(
             "tool_name": profile.tool_name,
             "description": profile.description,
             "toolsets": profile.toolsets,
+            "result_mode": profile.result_mode,
+            "self_check_policy": profile.self_check_policy,
             "available_tools": selected_deep_tool_names,
             "graceful_finalize": graceful_finalize_config,
             "image": effective_image,
             "deep_model": effective_model,
+            "vision_model": effective_vision_model,
             "deep_recursion_limit": effective_recursion_limit,
             "skill_sources": effective_skill_sources,
             "input_access": profile.input_access,
@@ -3647,19 +4423,34 @@ def execute_deep_agent_task(
         "cleanup": cleanup,
         "review_requested": bool(attempt_review_requests),
         "review_requests": attempt_review_requests,
+        "inline_result": inline_result if profile.result_mode == "inline" else "",
         "self_check": {
-            "plan_exists": (CONFIG.output_dir / "self_check_plan.md").exists(),
-            "report_exists": (CONFIG.output_dir / "self_check_report.md").exists(),
+            "plan_exists": (self_check_dir / "self_check_plan.md").exists(),
+            "report_exists": (self_check_dir / "self_check_report.md").exists(),
             "script_candidates": self_check_scripts,
         },
+        "salvage": build_unreviewed_artifact_salvage(
+            profile=profile,
+            effective_expected_artifacts=effective_expected_artifacts,
+            artifact_check=artifact_check,
+            deep_error=deep_error,
+            review_requested=bool(attempt_review_requests),
+            self_check_dir=self_check_dir,
+        ),
         "deep_tool_calls": [
             name for item in DEEP_AGENT_TRACE for name in item.get("tool_calls", [])
         ],
+        "skill_usage": extract_skill_usage_from_trace(
+            DEEP_AGENT_TRACE,
+            effective_skill_sources,
+        ),
     }
     evaluation["ok"] = (
         artifact_check["ok"]
         and deep_error is None
         and cleanup.get("cleanup_ok") is True
+        and (profile.result_mode == "inline" or bool(attempt_review_requests))
+        and (profile.result_mode != "inline" or bool(inline_result.strip()))
     )
     evaluation_path.write_text(
         json.dumps(evaluation, ensure_ascii=False, indent=2),
@@ -3697,19 +4488,35 @@ def make_deep_agent_profile_tool(profile: DeepAgentProfile) -> Any:
         return execute_deep_agent_task(task, expected_artifacts, profile)
 
     run_profile_deep_agent.__name__ = profile.tool_name
+    available_tools = ", ".join(tool_names_for_profile(profile)) or "none"
+    if profile.result_mode == "inline":
+        mode_contract = (
+            "This profile returns an inline result. Call it with "
+            "expected_artifacts=[]; it will not request parent review and the "
+            "parent must not run output gate for this call. Inspect the returned "
+            "inline_result and retry only if it materially fails the task."
+        )
+    else:
+        mode_contract = (
+            "This profile returns reviewed artifacts. expected_artifacts must be "
+            "files under /outputs using only output-gate allowed extensions: "
+            ".csv, .html, .json, .md, .xlsx, .yaml, .yml. Run output gate only "
+            "after the tool reports review_requested=true."
+        )
     run_profile_deep_agent.__doc__ = (
         f"{profile.description}\n\n"
         f"Available toolsets: {', '.join(profile.toolsets)}. "
-        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}.\n\n"
-        "Run this sandboxed Deep Agent profile for allowed /outputs artifacts. "
-        "expected_artifacts must be files under /outputs using only output-gate "
-        "allowed extensions: .csv, .html, .json, .md, .xlsx, .yaml, .yml. "
+        f"Available custom tools: {available_tools}. "
+        f"result_mode={profile.result_mode}; "
+        f"self_check_policy={profile.self_check_policy}.\n\n"
+        f"{mode_contract} "
         "Do not request .py, .js, .png, .pdf, .docx, .pptx, .xlsm, or directory "
         "artifacts as review/export artifacts."
     )
     tool_description = (
         f"{profile.description} Available toolsets: {', '.join(profile.toolsets)}. "
-        f"Available custom tools: {', '.join(tool_names_for_toolsets(profile.toolsets))}."
+        f"Available custom tools: {available_tools}. "
+        f"result_mode={profile.result_mode}; self_check_policy={profile.self_check_policy}."
     )
     return tool(profile.tool_name, description=tool_description)(run_profile_deep_agent)
 
@@ -3786,35 +4593,45 @@ def run_parent_agent() -> dict[str, Any]:
         tools=parent_tools,
         system_prompt=(
             "You are a parent HITL reviewer and orchestrator. The Deep Agent does the "
-            "implementation and must explicitly request parent review by calling its "
-            "request_parent_review tool. Do not edit files yourself and do not perform the "
-            f"implementation yourself. Required workflow: (1) call {deep_tool_instruction}, "
-            f"passing the configured final artifacts as expected_artifacts and only "
-            f"output-gate allowed paths ({ALLOWED_EXPORT_EXTENSIONS_TEXT}); do not add "
-            "root-level self-check files to expected_artifacts, "
-            "(2) check whether its result has review_requested=true, (3) if review was "
-            "requested, call run_output_gate with no explicit artifact override so the "
-            "latest request_parent_review artifact list is gated, including self-check "
-            "plan/report files, before reading any produced files, (4) inspect the gate "
-            "manifest and only read clean "
-            "exports with inspect_exported_artifacts, read_exported_file, or list_exported_files. "
-            "Do not read raw /outputs in production mode. If the gate rejects files, use "
+            "implementation. Do not edit files yourself and do not perform the "
+            f"implementation yourself. Required workflow: (1) choose and call {deep_tool_instruction}. "
+            "The selected tool description states its result_mode. For result_mode=inline, "
+            "pass expected_artifacts=[], do not run output gate, inspect the returned "
+            "inline_result directly, and close when ok=true and the inline result materially "
+            "answers the user task; retry with concise correction instructions only if a "
+            "material issue remains and attempts remain. For result_mode=artifact, pass the "
+            f"configured final artifacts as expected_artifacts using only output-gate allowed "
+            f"paths ({ALLOWED_EXPORT_EXTENSIONS_TEXT}); do not add root-level self-check files "
+            "to expected_artifacts. (2) For artifact-result calls, check whether the result "
+            "has review_requested=true. If review was requested, call run_output_gate with "
+            "no explicit artifact override so the latest request_parent_review artifact list "
+            "is gated, including any self-check plan/report files, before reading produced "
+            "files. (3) Inspect the gate manifest and only read clean exports with "
+            "inspect_exported_artifacts, read_exported_file, or list_exported_files. Do not "
+            "read raw /outputs in production mode. If the gate rejects files, use "
             "inspect_gate_manifest and list_quarantine_metadata to cite concrete findings, "
-            "then ask the Deep Agent to repair them. (5) If self-check report/plan are missing "
-            "from clean exports, the self-check did not execute, gate failures were ignored, "
-            "or the inspected clean artifact materially fails the user task, and at least one "
-            "Deep Agent attempt remains, "
-            f"call {deep_tool_instruction} again with concise correction instructions that include "
-            "your findings, (6) run the output gate and inspect again after every review "
-            "request, and close only when no material issues remain or no attempts remain. "
-            "If the Deep Agent does not request review, treat that as a material protocol "
-            f"issue; if attempts remain, call {deep_tool_instruction} again instructing it to "
-            "produce/update artifacts, run self-check, and call request_parent_review. "
+            "then ask the Deep Agent to repair them. (4) If required artifact files are "
+            "missing from clean exports, required self-check plan/report files are missing "
+            "for a profile that uses script/checklist self_check_policy, gate failures were "
+            "ignored, or the inspected clean artifact materially fails the user task, and "
+            f"at least one Deep Agent attempt remains, call {deep_tool_instruction} again with "
+            "concise correction instructions that include your findings. (5) Run output gate "
+            "and inspect again after every artifact-result review request, and close only "
+            "when no material issues remain or no attempts remain. If an artifact-result "
+            "Deep Agent does not request review, treat that as a material protocol issue; "
+            "if the tool result includes salvage.available=true, do not run output gate "
+            "on those unreviewed files, but use the salvage summary to ask the next "
+            "Deep Agent attempt to reuse the existing /outputs candidates, finish or "
+            "repair self-check artifacts, and call request_parent_review promptly. "
+            f"if attempts remain, call {deep_tool_instruction} again instructing it to produce/update "
+            "artifacts, run the profile-appropriate self-check, and call request_parent_review. "
             f"{attempts_instruction} "
             "In the final response, report attempts used, files inspected, material findings, "
-            "gate status, self-check status, remaining issues if any, whether the last Deep "
-            "Agent attempt requested review, and clean export paths. Keep claims tied to "
-            "gate manifest and inspected clean-export evidence."
+            "gate status when applicable, self-check status when applicable, inline_result "
+            "status when applicable, remaining issues if any, whether the last Deep Agent "
+            "attempt requested review for artifact-result profiles, and clean export paths "
+            "when applicable. Keep claims tied to gate manifest, inspected clean-export "
+            "evidence, or the returned inline_result depending on the selected profile."
         ),
     )
     parent_result = parent_agent.invoke(
@@ -3860,8 +4677,19 @@ def run_parent_agent() -> dict[str, Any]:
                     "id": profile.id,
                     "tool_name": profile.tool_name,
                     "description": profile.description,
+                    "toolsets": profile.toolsets,
+                    "input_access": profile.input_access,
+                    "result_mode": profile.result_mode,
+                    "self_check_policy": profile.self_check_policy,
+                    "graceful_finalize": profile.graceful_finalize,
                     "image": profile.image or CONFIG.image,
                     "deep_model": profile.deep_model or CONFIG.deep_model,
+                    "vision_model": (
+                        profile.vision_model
+                        or CONFIG.vision_model
+                        or profile.deep_model
+                        or CONFIG.deep_model
+                    ),
                     "skill_sources": profile.skill_sources,
                 }
                 for profile in CONFIG.deep_agent_profiles
@@ -3871,8 +4699,13 @@ def run_parent_agent() -> dict[str, Any]:
                     "id": "default",
                     "tool_name": "run_deep_agent_task",
                     "description": "Default sandboxed Deep Agent worker.",
+                    "toolsets": default_deep_agent_profile().toolsets,
+                    "input_access": "all",
+                    "result_mode": "artifact",
+                    "self_check_policy": "script",
                     "image": CONFIG.image,
                     "deep_model": CONFIG.deep_model,
+                    "vision_model": CONFIG.vision_model or CONFIG.deep_model,
                     "skill_sources": CONFIG.skill_sources,
                 }
             ],
@@ -3923,8 +4756,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generic parent-agent runner: stage inputs, delegate one task to a Deep Agent "
-            "through a tool, wait for a Deep Agent review request, inspect produced artifacts, "
-            "and optionally ask for bounded repairs."
+            "through a tool, inspect reviewed artifacts or inline results, and optionally "
+            "ask for bounded repairs."
         )
     )
     prompt_group = parser.add_mutually_exclusive_group(required=True)
@@ -3939,7 +4772,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-artifact",
         action="append",
-        required=True,
+        default=[],
         help="Expected output path under /outputs. Repeat for multiple artifacts.",
     )
     parser.add_argument(
@@ -4023,6 +4856,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--parent-model", default="openai:gpt-5.2")
     parser.add_argument("--deep-model", default="openai:gpt-5.2")
+    parser.add_argument(
+        "--vision-model",
+        default="",
+        help=(
+            "Optional model for inspect_sandbox_image/read_sandbox_file image vision. "
+            "Defaults to the active Deep Agent model. A profile-level vision_model "
+            "overrides this value."
+        ),
+    )
+    parser.add_argument(
+        "--tile-small-images-for-vision",
+        action="store_true",
+        help=(
+            "Experimental: when inspect_sandbox_image sends a small image to vision, "
+            "tile it into a repeated grid first. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--vision-tile-max-side",
+        type=int,
+        default=128,
+        help="Maximum image side in pixels for --tile-small-images-for-vision.",
+    )
+    parser.add_argument(
+        "--vision-tile-grid",
+        type=int,
+        default=5,
+        help="Grid size for --tile-small-images-for-vision. Default 5 makes 25 copies.",
+    )
     parser.add_argument("--parent-recursion-limit", type=int, default=12)
     parser.add_argument("--deep-recursion-limit", type=int, default=80)
     parser.add_argument(
@@ -4055,8 +4917,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_console_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def main() -> None:
     global CONFIG
+    configure_console_encoding()
     args = parse_args()
 
     load_dotenv(ROOT / ".env.local", override=False)
@@ -4091,9 +4964,7 @@ def main() -> None:
         args.deep_agent_profile_dir,
     )
     materialize_deep_agent_profiles(deep_agent_profiles, input_dir, skill_sources)
-    expected_artifacts = [
-        normalize_expected_artifact(path) for path in args.expected_artifact
-    ]
+    expected_artifacts = [normalize_expected_artifact(path) for path in args.expected_artifact]
     host_os = resolve_host_os(args.host_os)
 
     CONFIG = RunnerConfig(
@@ -4113,6 +4984,7 @@ def main() -> None:
         wsl_distro=args.wsl_distro,
         parent_model=args.parent_model,
         deep_model=args.deep_model,
+        vision_model=args.vision_model,
         parent_recursion_limit=args.parent_recursion_limit,
         deep_recursion_limit=args.deep_recursion_limit,
         max_review_rounds=max(1, args.max_review_rounds),
@@ -4129,6 +5001,9 @@ def main() -> None:
         egress_proxy_url=args.egress_proxy_url,
         egress_proxy_signing_secret=args.egress_proxy_signing_secret,
         xlsx_dangerous_formula_action=args.xlsx_dangerous_formula_action,
+        tile_small_images_for_vision=args.tile_small_images_for_vision,
+        vision_tile_max_side=args.vision_tile_max_side,
+        vision_tile_grid=args.vision_tile_grid,
         deep_agent_profiles=deep_agent_profiles,
     )
 

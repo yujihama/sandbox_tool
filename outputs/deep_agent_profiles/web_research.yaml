@@ -1,6 +1,7 @@
 id: web_research
 tool_name: run_web_research_agent
 description: Unified public website research agent using crawler-first retrieval with browser fallback for forms, JavaScript, and interactive pages.
+self_check_policy: checklist
 toolsets:
   - review
   - site_crawl

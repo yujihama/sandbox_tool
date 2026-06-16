@@ -1,0 +1,4 @@
+interface:
+  display_name: "Table Image Extraction"
+  short_description: "Guide extraction of tables from images."
+  default_prompt: "Use $table-image-extraction to extract a table from an image accurately."

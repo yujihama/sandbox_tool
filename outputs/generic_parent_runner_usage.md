@@ -11,9 +11,10 @@ The runner does:
 - Ask the parent agent to call `run_deep_agent_task`, or the most appropriate
   profile-specific Deep Agent tool when profiles are configured.
 - Run the Deep Agent in the Podman sandbox.
-- Give the Deep Agent a `request_parent_review` HITL tool.
-- Require the Deep Agent to create and run task-specific self-check artifacts
-  before requesting parent review.
+- Give artifact-result Deep Agent profiles a `request_parent_review` HITL tool.
+- Let profile configuration choose artifact review mode or inline result mode.
+- Let profile configuration choose scripted, checklist-only, or no self-check
+  artifacts.
 - Give the parent output-gate tools for final artifacts and clean export
   inspection.
 - Optionally give the parent raw file-inspection tools for `/input` and
@@ -60,25 +61,36 @@ The runner uses a three-zone artifact layout under `--output-dir`:
 - `gate_logs/`: deterministic gate manifests.
 - `runner_logs/`: parent/deep traces and evaluation metadata.
 
-The Deep Agent is instructed to call `request_parent_review` after it has produced
-or updated the expected artifacts and completed self-check. The required
-self-check artifacts are:
+Artifact-result profiles are instructed to call `request_parent_review` after
+they have produced or updated the expected artifacts and completed the
+profile-appropriate self-check. Scripted and checklist self-check policies use:
 
-- `/outputs/self_check_plan.md`
-- `/outputs/self_check_report.md`
+- `/outputs/subtasks/self_check_plan.md`
+- `/outputs/subtasks/self_check_report.md`
 
-The Deep Agent designs and executes checks itself for the task, but executable
-self-check scripts are not final export artifacts. The parent calls
-`run_output_gate` for declared final artifacts, then reads generic file facts
-from `/exports`. It decides whether the artifact still materially fails the user
-task and, if so, sends corrective instructions back to the Deep Agent. The
-parent is still not allowed to edit files directly.
+When `self_check_policy=script`, the Deep Agent designs and executes checks
+itself for the task, but executable self-check scripts are not final export
+artifacts. When `self_check_policy=checklist`, it writes the plan/report without
+an extra executable check unless the task explicitly needs one. Inline-result
+profiles return the answer directly, do not call `request_parent_review`, and do
+not run output gate. The parent is still not allowed to edit files directly.
 
 For image-understanding tasks, the Deep Agent can call `read_sandbox_file` with
 a `question` on an image path, or call `inspect_sandbox_image` directly after it
 creates crops, contact sheets, plots, or screenshots. This keeps file processing
 inside the sandbox while making visual reading explicit and traceable as a tool
-call. The parent can use the same tools during review.
+call. The parent can use the same tools during review. By default, image vision
+uses the active Deep Agent model. Use `--vision-model` or profile-level
+`vision_model` when the vision read should use a different model from the Deep
+Agent reasoning loop. `inspect_sandbox_image` always sends image inputs with
+OpenAI image `detail="original"`; this is fixed in the tool implementation, not
+controlled by agent prompts or skills. The tool does not expose `detail` as an
+agent-callable argument. Before sending an image, the tool adds white padding
+when visible content is closer than about 100px to an edge, so tight crops are not
+sent flush against the image boundary. For temporary small-image experiments,
+`--tile-small-images-for-vision` makes `inspect_sandbox_image` send small images
+as an internally generated 5x5 PNG tile while leaving the agent-callable schema
+unchanged.
 
 ## Command Shape
 
@@ -144,6 +156,7 @@ docker compose --env-file .env.local exec agent-app \
 - `--deep-agent-profile-dir`: repeatable directory containing `.json`, `.yaml`,
   or `.yml` profile files. Files are loaded in sorted order.
 - `--expected-artifact`: repeatable expected artifact path under `/outputs`.
+  Required for artifact-result tasks; omit it for inline-only profile runs.
 - `--output-dir`: host output directory under this workspace's `outputs/`.
   This is now the run root; raw output is stored in `raw_outputs/`, clean output
   in `clean_exports/`, and logs in `runner_logs/` and `gate_logs/`.
@@ -164,6 +177,18 @@ docker compose --env-file .env.local exec agent-app \
 - `--podman-bin`: native Podman executable for `--host-os linux`.
 - `--selinux-relabel`: add Podman bind mount `relabel=private`; useful on
   SELinux-enabled RedHat hosts.
+- `--vision-model`: optional model for `inspect_sandbox_image` and image
+  questions through `read_sandbox_file`; defaults to the active Deep Agent
+  model. A profile-level `vision_model` overrides this value. Image detail is
+  not configurable; `inspect_sandbox_image` always uses `detail="original"` and
+  does not expose a `detail` argument.
+- `--tile-small-images-for-vision`: experimental, default off. When enabled,
+  small images sent through `inspect_sandbox_image` are repeated into a PNG tile
+  before being sent to the vision model.
+- `--vision-tile-max-side`: maximum source image side for the tiling experiment;
+  default `128`.
+- `--vision-tile-grid`: tile grid size for the experiment; default `5`, which
+  creates 25 copies.
 - `--max-review-rounds`: maximum Deep Agent attempts the parent may request.
 - `--parent-recursion-limit`: parent agent graph recursion limit. Use a small value
   such as `6` for generate+inspect+final only; use a larger value such as `10-12`
@@ -215,6 +240,7 @@ skill_sources:
 include_global_skills: false
 image: localhost/python-data-sandbox:latest
 deep_model: openai:gpt-5.2
+vision_model: openai:gpt-5.5
 deep_recursion_limit: 120
 max_review_rounds: 2
 ```
@@ -236,8 +262,8 @@ Field behavior:
   network-enabled profile can read user `/input` files and later send derived
   values through browser/crawler tools. `skills_only` mounts only profile skill
   directories under `/input`, not task input files.
-- `image`, `deep_model`, `deep_recursion_limit`, and `max_review_rounds`
-  override the runner defaults only for that profile.
+- `image`, `deep_model`, `vision_model`, `deep_recursion_limit`, and
+  `max_review_rounds` override the runner defaults only for that profile.
 - `expose_to_parent: false` hides a profile when loading a profile directory.
   The profile can still be used by passing it explicitly with
   `--deep-agent-profile`.
@@ -347,8 +373,6 @@ python outputs/generic_parent_runner.py `
   --input "C:\Users\nyham\Downloads\test02.png=/input/test02.png" `
   --input "C:\Users\nyham\Downloads\test03.png=/input/test03.png" `
   --skill-source outputs/skills=/input/skills `
-  --expected-artifact /outputs/seal_surname_identification_report.md `
-  --expected-artifact /outputs/seal_surname_identification_summary.csv `
   --output-dir outputs/seal_surname_identification_with_skill `
   --max-review-rounds 2
 ```
@@ -360,3 +384,13 @@ helper script under `/input/skills/seal-surname-identification/scripts/`.
 Generated contact sheets or crops may still be helper files under `/outputs`,
 but they are not reviewed/exported artifacts unless raw parent inspection is
 explicitly enabled.
+
+The seal skill is intentionally adaptive: it starts from raw image inspection,
+then chooses preprocessing experiments when useful. For small, blurred, or
+uncertain seals, the helper supports `--variant-set adaptive`, which writes
+per-seal comparison variants under `/outputs/seal_processing/variants/` and a
+`seal_variant_contact_sheet.png`. The worker should compare those variants back
+to the raw crop instead of treating any single mask or transformed image as
+ground truth. The adaptive set includes raw upscales, red isolation, adaptive
+thresholding, CLAHE/equalized red emphasis, and morphology variants for
+dilation, closing, and erosion.
